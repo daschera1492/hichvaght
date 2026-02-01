@@ -60,16 +60,11 @@ jobs:
           sudo iptables -A FORWARD -i eth0 -o tailscale0 -m state --state RELATED,ESTABLISHED -j ACCEPT
           sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
-      - name: Restart tailscale
-        run: |
-          sudo tailscale up --restart
-          sudo tailscale set --advertise-exit-node
-
       - name: Tailscale status
         run: |
           tailscale status
 
-      - name: Keep runner alive (optional)
+      - name: Keep runner alive (5 hours)
         run: |
-          echo "Runner will stay alive..."
+          echo "Runner is ready. Keeping it alive..."
           sleep 18000
