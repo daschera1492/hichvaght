@@ -1,189 +1,119 @@
-name: Run Masoud EXE with Detailed Logs
+name: RDPMan
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-masoud:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 300
+    timeout-minutes: 3600
 
     steps:
-      - name: Prepare log folder
-        shell: powershell
+      - name: Configure Core RDP Settings
         run: |
-          New-Item -Path C:\app -ItemType Directory -Force | Out-Null
-          New-Item -Path C:\app\logs -ItemType Directory -Force | Out-Null
-          Write-Host "[OK] Prepared C:\app and C:\app\logs"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Add Windows Defender exclusions (BEFORE download)
-        shell: powershell
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # Allow incoming RDP
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
         run: |
-          Write-Host "[*] Configuring Windows Defender exclusions..."
-          try {
-            Add-MpPreference -ExclusionPath "C:\app" -ErrorAction Stop
-            Write-Host "[OK] Added folder exclusion: C:\app"
-            
-            Add-MpPreference -ExclusionProcess "masoud.exe" -ErrorAction Stop
-            Write-Host "[OK] Added process exclusion: masoud.exe"
-            
-            Write-Host "[OK] All Defender exclusions configured successfully"
-          } catch {
-            Write-Host "[!] Warning: Could not add exclusions: $($_.Exception.Message)"
-            Write-Host "[!] Continuing anyway... (might face blocking issues)"
+          $password = "*r96319631P-"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-      - name: Download ZIP with retries
-        shell: powershell
+      - name: Install Tailscale
         run: |
-          $url = 'https://github.com/masezahedi/MasoudApp/raw/main/Masoud-6.24.0-windows-x64.zip'
-          $out = 'C:\app\app.zip'
-          $maxAttempts = 3
-          $attempt = 0
-          $success = $false
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          while ($attempt -lt $maxAttempts -and -not $success) {
-            $attempt++
-            Write-Host "[*] Download attempt $attempt/$maxAttempts..."
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -ErrorAction Stop
-              if (Test-Path $out) {
-                $size = (Get-Item $out).Length
-                $sizeMB = [math]::Round($size/1MB, 2)
-                Write-Host "[OK] Downloaded successfully - Size: $sizeMB MB"
-                if ($size -gt 0) {
-                  $success = $true
-                } else {
-                  Write-Host "[ERR] File size is 0 bytes"
-                }
-              } else {
-                Write-Host "[ERR] File not found after download"
-              }
-            } catch {
-              Write-Host "[ERR] Attempt $attempt failed: $($_.Exception.Message)"
-            }
-            if (-not $success -and $attempt -lt $maxAttempts) { 
-              Write-Host "[*] Waiting 5 seconds before retry..."
-              Start-Sleep -Seconds 5 
-            }
-          }
-
-          if (-not $success) {
-            Write-Host "[ERR] ALL DOWNLOAD ATTEMPTS FAILED"
-            exit 1
-          }
-
-      - name: Extract ZIP
-        shell: powershell
+      - name: Establish Tailscale Connection
         run: |
-          $in = 'C:\app\app.zip'
-          $dest = 'C:\app'
-
-          if (-not (Test-Path $in)) {
-            Write-Host "[ERR] ZIP file not found: $in"
-            exit 1
-          }
-
-          Write-Host "[*] Extracting $in to $dest..."
-          Write-Host "[*] ZIP file info:"
-          Get-Item $in | Select-Object Name, Length, LastWriteTime | Format-Table
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          try {
-            Write-Host "[*] Using Expand-Archive to extract ZIP..."
-            Expand-Archive -Path $in -DestinationPath $dest -Force -ErrorAction Stop
-            Write-Host "[OK] Extraction completed successfully"
-            
-            $items = @(Get-ChildItem $dest -Recurse -ErrorAction SilentlyContinue)
-            Write-Host "[OK] Total items after extraction: $($items.Count)"
-            Write-Host "[*] Directory contents:"
-            Get-ChildItem $dest -Depth 1 | Format-Table Name, Length
-          } catch {
-            Write-Host "[ERR] Exception during extraction: $($_.Exception.Message)"
-            exit 1
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Find masoud.exe
-        shell: powershell
-        id: findexe
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host "[*] Searching for masoud.exe..."
-          $exe = Get-ChildItem -Path C:\app -Recurse -Filter "masoud.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          if (-not $exe) {
-            Write-Host "[ERR] masoud.exe not found!"
-            exit 1
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
-          
-          $path = $exe.FullName
-          Write-Host "[OK] Found masoud.exe at: $path"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "exePath=$path"
+          Write-Host "TCP connectivity successful!"
 
-      - name: Run masoud.exe
-        shell: powershell
+      # ------------------------------------------------
+      #   🔥 ADDED STEPS: Chrome + PsExec + Launch
+      # ------------------------------------------------
+
+      - name: Install Google Chrome
         run: |
-          $exePath = '${{ steps.findexe.outputs.exePath }}'
-          
-          if (-not (Test-Path $exePath)) {
-            Write-Host "[ERR] Executable not found at: $exePath"
-            exit 1
-          }
-          
-          Write-Host "[*] Running masoud.exe..."
-          Write-Host "[*] Path: $exePath"
-          try {
-            & $exePath *> C:\app\masoud_output.log
-            $exit = $LASTEXITCODE
-            
-            if ($exit -eq 0) {
-              Write-Host "[OK] Program executed successfully (exit code: 0)"
-            } else {
-              Write-Host "[!] Program finished with exit code: $exit"
-            }
-            
-            Write-Host ""
-            Write-Host "[*] Program output (first 100 lines):"
-            Write-Host "======================================"
-            Get-Content C:\app\masoud_output.log -TotalCount 100
-            Write-Host "======================================"
-            
-          } catch {
-            Write-Host "[ERR] Exception while running program: $($_.Exception.Message)"
-            exit 1
-          }
+          Invoke-WebRequest "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile chrome_installer.exe
+          Start-Process chrome_installer.exe -ArgumentList "/silent" -Wait
 
-      - name: Summary
-        shell: powershell
-        if: always()
+      - name: Download PsExec
         run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "        EXECUTION SUMMARY"
-          Write-Host "======================================"
-          Write-Host ""
-          
-          $items = @(Get-ChildItem C:\app -Recurse -ErrorAction SilentlyContinue)
-          Write-Host "[*] Total files in C:\app: $($items.Count)"
-          
-          if (Test-Path C:\app\masoud_output.log) {
-            $outputSize = (Get-Item C:\app\masoud_output.log).Length
-            $outputSizeKB = [math]::Round($outputSize/1KB, 2)
-            Write-Host "[*] Program output file size: $outputSizeKB KB"
-          }
-          
-          Write-Host ""
-          Write-Host "[*] Log files created:"
-          Get-ChildItem C:\app\logs -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host "    - $($_.Name)"
-          }
-          
-          Write-Host ""
-          Write-Host "[OK] Workflow completed"
+          Invoke-WebRequest "https://download.sysinternals.com/files/PSTools.zip" -OutFile PSTools.zip
+          Expand-Archive PSTools.zip -DestinationPath C:\PSTools
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: masoud-artifacts
-          path: |
-            C:\app\masoud_output.log
-            C:\app\Masoud-6.24.0-windows-x64
+      - name: Open Chrome in RDP Session
+        run: |
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          $url = "https://youtube.com"
+          
+          # Launch Chrome inside RDP session (Session 1)
+          C:\PSTools\PsExec.exe -accepteula -i 1 "$chrome" "$url"
+
+      # ------------------------------------------------
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
