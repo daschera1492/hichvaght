@@ -9,14 +9,17 @@ jobs:
 
     steps:
       - name: Setup SSH
+        shell: bash
         run: |
+          set -e
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p "${{ secrets.SERVER_PORT }}" "${{ secrets.SERVER_IP }}" >> ~/.ssh/known_hosts
 
       - name: SSH Command
+        shell: bash
         run: |
-          ssh -p ${{ secrets.SERVER_PORT }} \
-          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} \
-          "whoami && uname -a && uptime"
+          ssh -p "${{ secrets.SERVER_PORT }}" \
+            "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}" \
+            "whoami && uname -a && uptime"
