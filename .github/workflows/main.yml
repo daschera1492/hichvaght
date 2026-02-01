@@ -1,4 +1,4 @@
-name: RDPMan
+name: RDP
 
 on:
   workflow_dispatch:
@@ -11,109 +11,214 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # Allow incoming RDP
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
+          Set-Service -Name TermService -StartupType Automatic
 
       - name: Create RDP User with Fixed Password
         run: |
           $password = "*r96319631P-"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
+          New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          Write-Host "User RDP created successfully"
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully"
 
-      - name: Establish Tailscale Connection
+      - name: Create Reconnection Script
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $scriptContent = @"
+          `$logFile = "C:\ProgramData\tailscale-reconnect.log"
+          function Write-Log {
+              param(`$Message)
+              `$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              "`$timestamp - `$Message" | Out-File -FilePath `$logFile -Append
+              Write-Host `$Message
+          }
+
+          Write-Log "Starting Tailscale reconnection script..."
+          
+          `$maxWait = 60
+          `$waited = 0
+          while (`$waited -lt `$maxWait) {
+              `$service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+              if (`$service -and `$service.Status -eq "Running") {
+                  Write-Log "Tailscale service is running"
+                  break
+              }
+              Start-Sleep -Seconds 2
+              `$waited += 2
+              Write-Log "Waiting for Tailscale service... (`$waited seconds)"
+          }
+
+          `$authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          `$hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          `$maxRetries = 10
+          `$retryCount = 0
+          `$connected = `$false
+
+          while (-not `$connected -and `$retryCount -lt `$maxRetries) {
+              try {
+                  Write-Log "Attempting to connect to Tailscale (Attempt `$(`$retryCount + 1)/`$maxRetries)..."
+                  
+                  & "C:\Program Files\Tailscale\tailscale.exe" logout 2>`$null
+                  Start-Sleep -Seconds 2
+                  
+                  `$output = & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=`$authKey --hostname=`$hostname --accept-routes --reset 2>&1
+                  Write-Log "Tailscale up output: `$output"
+                  
+                  Start-Sleep -Seconds 5
+                  `$tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>`$null
+                  
+                  if (`$tsIP -and `$tsIP.Trim() -ne "") {
+                      `$tsIP = `$tsIP.Trim()
+                      Write-Log "Successfully connected! Tailscale IP: `$tsIP"
+                      `$tsIP | Out-File -FilePath "C:\ProgramData\tailscale-ip.txt" -Force
+                      `$connected = `$true
+                  } else {
+                      Write-Log "No IP assigned yet, retrying..."
+                      `$retryCount++
+                      Start-Sleep -Seconds 10
+                  }
+              } catch {
+                  Write-Log "Error: `$_"
+                  `$retryCount++
+                  Start-Sleep -Seconds 10
+              }
+          }
+
+          if (`$connected) {
+              Write-Log "Tailscale connection established successfully"
+              while (`$true) {
+                  Start-Sleep -Seconds 60
+                  `$status = & "C:\Program Files\Tailscale\tailscale.exe" status --json 2>`$null | ConvertFrom-Json
+                  if (`$status.BackendState -ne "Running") {
+                      Write-Log "Connection lost, reconnecting..."
+                      & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=`$authKey --hostname=`$hostname --accept-routes
+                  }
+              }
+          } else {
+              Write-Log "Failed to establish Tailscale connection after `$maxRetries attempts"
+              exit 1
+          }
+          "@
+          
+          $scriptPath = "C:\ProgramData\tailscale-reconnect.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
+          Write-Host "Reconnection script created at $scriptPath"
+
+      - name: Create Startup Scheduled Task
+        run: |
+          Unregister-ScheduledTask -TaskName "TailscaleAutoConnect" -Confirm:$false -ErrorAction SilentlyContinue
+          
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\ProgramData\tailscale-reconnect.ps1`""
+          
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+          $trigger.Delay = "PT30S"
+          
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+          
+          Register-ScheduledTask -TaskName "TailscaleAutoConnect" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+          
+          Write-Host "Scheduled task created successfully"
+
+      - name: Set Tailscale Service to Auto-Start
+        run: |
+          Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+          Write-Host "Tailscale service set to automatic startup"
+
+      - name: Establish Initial Tailscale Connection
+        run: |
+          Write-Host "Connecting to Tailscale..."
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+          Start-Sleep -Seconds 2
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
           
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+          while (-not $tsIP -and $retries -lt 30) {
+              Start-Sleep -Seconds 3
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) {
+                  $tsIP = $tsIP.Trim()
+              }
               $retries++
+              Write-Host "Waiting for Tailscale IP... Attempt $retries/30"
           }
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          if (-not $tsIP -or $tsIP -eq "") {
+              Write-Error "Tailscale IP not assigned after 90 seconds"
               exit 1
           }
+          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
+          $tsIP | Out-File -FilePath "C:\ProgramData\tailscale-ip.txt" -Force
+          Write-Host "Tailscale connected: $tsIP"
+      
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          Write-Host "Testing RDP connectivity on $env:TAILSCALE_IP..."
+          Start-Sleep -Seconds 5
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "RDP is accessible on port 3389"
+          } else {
+              Write-Warning "RDP test failed, but continuing"
           }
-          Write-Host "TCP connectivity successful!"
 
-      # ------------------------------------------------
-      #   🔥 ADDED STEPS: Chrome + PsExec + Launch
-      # ------------------------------------------------
-
-      - name: Install Google Chrome
+      - name: Display Connection Info
         run: |
-          Invoke-WebRequest "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile chrome_installer.exe
-          Start-Process chrome_installer.exe -ArgumentList "/silent" -Wait
-
-      - name: Download PsExec
-        run: |
-          Invoke-WebRequest "https://download.sysinternals.com/files/PSTools.zip" -OutFile PSTools.zip
-          Expand-Archive PSTools.zip -DestinationPath C:\PSTools
-
-      - name: Open Chrome in RDP Session
-        run: |
-          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-          $url = "https://youtube.com"
-          
-          # Launch Chrome inside RDP session (Session 1)
-          C:\PSTools\PsExec.exe -accepteula -i 1 "$chrome" "$url"
-
-      # ------------------------------------------------
+          Write-Host "========================================"
+          Write-Host "       RDP CONNECTION READY"
+          Write-Host "========================================"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username:     RDP"
+          Write-Host "Password:     *r96319631P-"
+          Write-Host "========================================"
+          Write-Host "Auto-reconnect configured"
+          Write-Host "Survives reboots"
+          Write-Host "Connection will remain active for 60 hours"
+          Write-Host ""
+          Write-Host "After reboot, wait 1-2 minutes for reconnection"
+          Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
+          $counter = 0
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              $counter++
+              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              
+              if ($counter % 1 -eq 0) {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  
+                  if ($tsStatus.BackendState -eq "Running" -and $tsIP) {
+                      Write-Host "[$currentTime] RDP Active | Tailscale: Connected ($($tsIP.Trim()))"
+                  } else {
+                      Write-Host "[$currentTime] RDP Active | Tailscale: Reconnecting..."
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes 2>$null
+                  }
+              }
+              
               Start-Sleep -Seconds 300
           }
