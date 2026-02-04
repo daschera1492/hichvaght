@@ -1,0 +1,64 @@
+name: Ubuntu Tailscale Auto Exit Node (5h)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'   # اجرای خودکار هر 4 ساعت
+
+jobs:
+  tailscale-exit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298   # 5 ساعت
+
+    steps:
+      - name: Update system
+        run: sudo apt update -y
+
+      - name: Install prerequisites
+        run: sudo apt install -y curl lsb-release iptables
+
+      - name: Add Tailscale GPG key
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg \
+          | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+      - name: Add Tailscale repository
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list \
+          | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+      - name: Install Tailscale
+        run: |
+          sudo apt update
+          sudo apt install -y tailscale
+
+      - name: Enable IP forwarding
+        run: |
+          echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+          sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+      - name: Start tailscaled
+        run: sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale (AUTO)
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --advertise-exit-node \
+            --tags=tag:exit-node \
+            --hostname=github-exit
+
+      - name: Configure iptables (NAT)
+        run: |
+          sudo iptables -A FORWARD -i tailscale0 -o eth0 -j ACCEPT
+          sudo iptables -A FORWARD -i eth0 -o tailscale0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+      - name: Tailscale status
+        run: tailscale status
+
+      - name: Keep runner alive (5 hours)
+        run: |
+          echo "Exit Node is active. Keeping runner alive..."
+          sleep 18000
