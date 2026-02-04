@@ -3,7 +3,7 @@ name: Ubuntu Tailscale Auto Exit Node (5h)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'   # اجرای خودکار هر 4 ساعت
+    - cron: '0 */4 * * *'   # اجرای خودکار هر 4 ساعت
 
 jobs:
   tailscale-exit:
@@ -46,7 +46,7 @@ jobs:
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --advertise-exit-node \
-            --tags=tag:exit-node \
+            --advertise-tags=tag:exit-node \
             --hostname=github-exit
 
       - name: Configure iptables (NAT)
