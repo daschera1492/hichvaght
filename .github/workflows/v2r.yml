@@ -28,11 +28,11 @@ jobs:
 
           # اجرای اسکریپت با sudo (نکته: فاصله بین sudo و ./install.sh)
           sudo ./install.sh <<EOF
-y
-admin
-admin_pass_2026
-2053
-EOF
+          y
+          admin
+          admin_pass_2026
+          2053
+          EOF
 
       - name: Get Connection Info
         run: |
