@@ -1,4 +1,4 @@
-name: Ultimate 2026 VPN Server (3x-ui + Reality + XHTTP)
+name: Ultimate 2026 VPN (Docker Version)
 on: workflow_dispatch
 
 jobs:
@@ -13,33 +13,31 @@ jobs:
 
       - name: Enable BBR Speed Booster
         run: |
-          # فعال‌سازی الگوریتم BBR برای کاهش تاخیر و افزایش سرعت دانلود 
+          # فعال‌سازی BBR برای افزایش سرعت دانلود و پایداری در شبکه‌های ضعیف
           echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
           echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
           sudo sysctl -p
 
-      - name: Install 3x-ui Panel (Fixed Version)
+      - name: Install 3x-ui Panel via Docker
         run: |
-          # دانلود اسکریپت نصب و اجرا با دسترسی کامل روت 
-          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
-          chmod +x install.sh
-          sudo ./install.sh <<EOF
-          y
-          admin
-          admin_pass_2026
-          2053
-          EOF
+          # اجرای پنل در داکر برای جلوگیری از تداخل با سیستم مدیریت سرویس گیت‌هاب
+          sudo docker run -d --name 3x-ui --network=host \
+            -e XRAY_VMESS_AEAD_FORCED=false \
+            -e XUI_USERNAME=admin \
+            -e XUI_PASSWORD=admin_pass_2026 \
+            -e XUI_PORT=2053 \
+            ghcr.io/mhsanaei/3x-ui:latest
 
       - name: Get Connection Info
         run: |
           TS_IP=$(tailscale ip -4)
           echo "===================================================="
-          echo "Panel is ready!"
-          echo "Tailscale IP: $TS_IP"
-          echo "Access Link: http://$TS_IP:2053"
+          echo "Server Started Successfully!"
+          echo "Panel IP: $TS_IP"
+          echo "Panel URL: http://$TS_IP:2053"
           echo "Username: admin"
           echo "Password: admin_pass_2026"
           echo "===================================================="
 
       - name: Keep Server Alive
-        run: sleep 6h # سرور به مدت ۶ ساعت برای استفاده شما فعال می‌ماند
+        run: sleep 6h # Runner فعال می‌ماند
