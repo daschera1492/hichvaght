@@ -1,0 +1,42 @@
+name: Ultimate 2026 VPN Server (3x-ui + Reality + XHTTP)
+on: workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gha-vpn-server
+
+      - name: Enable BBR Speed Booster
+        run: |
+          echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: Install 3x-ui (Sanaei Version)
+        run: |
+          # نصب غیرتعاملی پنل با پورت 2053 و یوزر/پسورد دلخواه
+          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<EOF
+          y
+          admin
+          admin_pass_2026
+          2053
+          EOF
+
+      - name: Get Connection Info
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "===================================================="
+          echo "Panel is ready!"
+          echo "Tailscale IP: $TS_IP"
+          echo "Access Link: http://$TS_IP:2053"
+          echo "Username: admin"
+          echo "Password: admin_pass_2026"
+          echo "===================================================="
+
+      - name: Keep Server Alive
+        run: sleep 6h # سرور به مدت ۶ ساعت فعال می‌ماند
