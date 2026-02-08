@@ -24,7 +24,7 @@ jobs:
           sudo docker run -d --name 3x-ui --network=host \
             -e XRAY_VMESS_AEAD_FORCED=false \
             -e XUI_USERNAME=admin \
-            -e XUI_PASSWORD=admin_pass_2026 \
+            -e XUI_PASSWORD=13691369 \
             -e XUI_PORT=2053 \
             ghcr.io/mhsanaei/3x-ui:latest
 
