@@ -4,31 +4,35 @@ on: workflow_dispatch
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
+          # هشدار: authkey deprecated هست، ولی فعلاً کار می‌کنه
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
           hostname: gha-vpn-server
 
       - name: Enable BBR Speed Booster
         run: |
-          # فعال‌سازی الگوریتم BBR برای کاهش تاخیر و افزایش سرعت دانلود 
+          # بهینه‌سازی هسته لینوکس برای افزایش سرعت TCP
           echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
           echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
           sudo sysctl -p
 
-      - name: Install 3x-ui Panel (Fixed Version)
+      - name: Install 3x-ui Panel (Fixed Root Error)
         run: |
-          # دانلود اسکریپت نصب و اجرا با دسترسی کامل روت 
+          # دانلود اسکریپت نصب 3x-ui
           curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
-          chmod +x install.sh
-          sudo./install.sh <<EOF
-          y
-          admin
-          admin_pass_2026
-          2053
-          EOF
+          sudo chmod +x install.sh
+
+          # اجرای اسکریپت با sudo (نکته: فاصله بین sudo و ./install.sh)
+          sudo ./install.sh <<EOF
+y
+admin
+admin_pass_2026
+2053
+EOF
 
       - name: Get Connection Info
         run: |
@@ -42,4 +46,4 @@ jobs:
           echo "===================================================="
 
       - name: Keep Server Alive
-        run: sleep 6h # سرور به مدت ۶ ساعت برای استفاده شما فعال می‌ماند
+        run: sleep 6h # سرور تا ۶ ساعت فعال می‌ماند
