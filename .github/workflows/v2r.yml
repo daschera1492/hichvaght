@@ -23,7 +23,7 @@ jobs:
           # دانلود اسکریپت نصب و اجرا با دسترسی کامل روت 
           curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
           chmod +x install.sh
-          sudo./install.sh <<EOF
+          sudo ./install.sh <<EOF
           y
           admin
           admin_pass_2026
