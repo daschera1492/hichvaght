@@ -13,14 +13,14 @@ jobs:
 
       - name: Enable BBR Speed Booster
         run: |
-          # بهینه‌سازی هسته لینوکس برای سرعت دانلود بالاتر
+          # فعال‌سازی الگوریتم BBR برای کاهش تاخیر و افزایش سرعت دانلود 
           echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
           echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
           sudo sysctl -p
 
-      - name: Install 3x-ui Panel
+      - name: Install 3x-ui Panel (Fixed Version)
         run: |
-          # دانلود و نصب پنل با دسترسی روت و ورودی‌های خودکار
+          # دانلود اسکریپت نصب و اجرا با دسترسی کامل روت 
           curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
           chmod +x install.sh
           sudo./install.sh <<EOF
@@ -42,4 +42,4 @@ jobs:
           echo "===================================================="
 
       - name: Keep Server Alive
-        run: sleep 6h # اکشن تا ۶ ساعت فعال می‌ماند
+        run: sleep 6h # سرور به مدت ۶ ساعت برای استفاده شما فعال می‌ماند
