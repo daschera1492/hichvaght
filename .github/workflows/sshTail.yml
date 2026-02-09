@@ -1,7 +1,7 @@
 name: Tailscale SSH VPN Test
 
 on:
-  workflow_dispatch: # اجرای دستی از پنل گیت‌هاب
+  workflow_dispatch: # اجرای دستی
 
 jobs:
   tailscale-vpn:
@@ -11,7 +11,7 @@ jobs:
         run: sudo apt update -y
 
       - name: Install prerequisites
-        run: sudo apt install -y curl lsb-release iptables
+        run: sudo apt install -y curl lsb-release iptables jq
 
       - name: Install Tailscale
         run: |
@@ -35,38 +35,44 @@ jobs:
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --advertise-exit-node \
             --ssh \
-            --hostname=github-vpn-test \
-            --accept-routes
+            --hostname=github-vpn-test
 
       - name: Create VPN User
         run: |
-          # ایجاد یک یوزر برای اتصال SSH در نرم‌افزارهای VPN
           sudo useradd -m -s /bin/bash vpnuser
           echo "vpnuser:vpnpassword" | sudo chpasswd
           echo "User 'vpnuser' created with password 'vpnpassword'"
 
       - name: Configure SSH for Password Authentication
         run: |
-          # فعال‌سازی ورود با پسورد برای استفاده در اپلیکیشن‌های موبایل
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo systemctl restart ssh
 
       - name: Start Tailscale Funnel
         run: |
-          # هدایت ترافیک پورت 443 اینترنت به پورت 22 داخلی
-          sudo tailscale funnel --bg 443 22
-          echo "Tailscale Funnel is starting on port 443..."
+          # ابتدا پورت داخلی را به سرویس معرفی می‌کنیم
+          sudo tailscale serve --bg tcp:22
+          # سپس فانل را روی پورت 443 فعال می‌کنیم
+          sudo tailscale funnel --bg 443 on
+          echo "Tailscale Funnel is starting on port 443 and pointing to SSH (22)..."
 
       - name: Show Connection Details
         run: |
           echo "--------------------------------------------------"
           echo "VPN Configuration Details:"
-          echo "Host: $(tailscale status --json | jq -r '.Self.DNSName')"
+          # دریافت آدرس DNS اختصاصی سرور
+          DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "Host: $DNS_NAME"
           echo "Port: 443"
           echo "Username: vpnuser"
           echo "Password: vpnpassword"
           echo "--------------------------------------------------"
-          echo "This job will keep running for 5 hours for your test."
-          
+          echo "Instructions:"
+          echo "1. Use the Host above in Netmod/HTTP Custom."
+          echo "2. Set connection port to 443."
+          echo "3. Use the credentials provided."
+          echo "--------------------------------------------------"
+
       - name: Keep Alive
-        run: sleep 18000 # نگه داشتن جاب به مدت ۵ ساعت برای تست
+        run: sleep 18000
