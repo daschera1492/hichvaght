@@ -49,28 +49,29 @@ jobs:
           echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config.d/vpn.conf
           sudo systemctl restart ssh
 
-      - name: Start Tailscale Funnel (New Syntax)
+      - name: Start Tailscale Funnel (Validated 2026 Syntax)
         run: |
-          # در نسخه 1.94+، دستور مستقیم برای فوروارد کردن TCP به این صورت است:
-          # ابتدا هرگونه تنظیم قبلی را پاک می‌کنیم تا تداخلی نباشد
-          sudo tailscale serve reset --yes || true
+          # پاک کردن هرگونه تنظیم قبلی بدون سوال پرسیدن
+          sudo tailscale serve reset --force || sudo tailscale serve reset || true
           
-          # تنظیم فانل برای گوش دادن روی پورت 443 و ارسال به پورت 22 محلی در لایه TCP
+          # در ورژن های جدید، برای TCP Raw (مثل SSH) باید از فرمت زیر استفاده کرد:
+          # پورت 443 را باز کن و ترافیک خام TCP را به پورت 22 (SSH) بفرست
           sudo tailscale funnel --bg 443 tcp 22
           
-          echo "Tailscale Funnel is now active on 443 -> TCP 22"
+          echo "Waiting for Funnel to initialize..."
+          sleep 10
 
       - name: Show Connection Details
         run: |
           echo "--------------------------------------------------"
-          echo "VPN Configuration Details:"
+          echo "VPN Configuration Details (Netmod/SSH):"
           DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "Host: $DNS_NAME"
           echo "Port: 443"
           echo "Username: vpnuser"
           echo "Password: vpnpassword"
           echo "--------------------------------------------------"
-          echo "Current Funnel Status:"
+          echo "Funnel Status Check:"
           sudo tailscale funnel status
           echo "--------------------------------------------------"
 
