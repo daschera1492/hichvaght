@@ -52,7 +52,7 @@ jobs:
           
           # فوروارد کردن ترافیک خام TCP از پورت 443 اینترنت به پورت 22 محلی
           # در نسخه‌های جدید 2025/2026 از این نحو استفاده می‌شود
-          sudo tailscale funnel --bg 443 tcp 22
+          sudo tailscale funnel --bg --tcp 443 22
           
           echo "Waiting for Funnel to initialize..."
           sleep 15
