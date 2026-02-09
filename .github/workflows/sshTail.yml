@@ -1,77 +1,74 @@
-name: Tailscale SSH VPN Test
+name: VLESS VPN via Tailscale Funnel
 
 on:
   workflow_dispatch:
 
 jobs:
-  tailscale-vpn:
+  vless-vpn:
     runs-on: ubuntu-latest
     steps:
       - name: Update system
-        run: sudo apt update -y
+        run: sudo apt update -y && sudo apt install -y jq curl
 
-      - name: Install prerequisites
-        run: sudo apt install -y curl lsb-release iptables jq
+      - name: Install Xray (V2Ray Core)
+        run: |
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+      - name: Generate VPN Credentials
+        id: credentials
+        run: |
+          UUID=$(xray uuid)
+          echo "UUID=$UUID" >> $GITHUB_ENV
+          echo "UUID generated: $UUID"
+
+      - name: Configure Xray Server (VLESS + WS)
+        run: |
+          cat <<EOF | sudo tee /usr/local/etc/xray/config.json
+          {
+            "inbounds":,
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "/vless-ws"}
+              }
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+          sudo systemctl restart xray
 
       - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Enable IP forwarding
-        run: |
-          echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
-          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
-          sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+        run: curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Connect to Tailscale
         run: |
-          # نکته: --ssh حذف شد تا با پورت 22 محلی و Funnel تداخل پیدا نکند
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --advertise-exit-node \
-            --hostname=github-vpn-test \
+            --hostname=github-vless-node \
             --accept-risk=lose-ssh
 
-      - name: Create VPN User
+      - name: Start Tailscale Funnel (TLS Forwarding)
         run: |
-          sudo useradd -m -s /bin/bash vpnuser
-          echo "vpnuser:vpnpassword" | sudo chpasswd
-          sudo usermod -aG sudo vpnuser
-
-      - name: Configure Local SSH for Funnel
-        run: |
-          # اجازه دادن به احراز هویت با پسورد برای پورت محلی
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-
-      - name: Start Tailscale Funnel (TCP Forwarding)
-        run: |
-          # پاکسازی تنظیمات قبلی (نحو صحیح reset)
           sudo tailscale serve reset
-          
-          # فوروارد کردن ترافیک خام TCP از پورت 443 اینترنت به پورت 22 محلی
-          # در نسخه‌های جدید 2025/2026 از این نحو استفاده می‌شود
-          sudo tailscale funnel --bg --tcp 443 22
-          
-          echo "Waiting for Funnel to initialize..."
+          # فوروارد کردن پورت 443 اینترنت به پورت 8080 محلی (Xray)
+          # خودِ Tailscale لایه TLS را با گواهی معتبر هندل می‌کند
+          sudo tailscale funnel --bg --tcp 443 8080
           sleep 15
 
-      - name: Show Connection Details
+      - name: Show V2Ray Config URL
         run: |
-          echo "--------------------------------------------------"
-          echo "CONNECTION GUIDE (SSH Over Funnel):"
-          # گرفتن آدرس DNS اختصاصی نود
           DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
-          echo "Command: ssh -p 443 vpnuser@$DNS_NAME"
-          echo "Host: $DNS_NAME"
-          echo "Port: 443"
-          echo "User: vpnuser"
-          echo "Pass: vpnpassword"
+          # ساخت لینک VLESS برای کلاینت
+          VLESS_LINK="vless://${{ env.UUID }}@$DNS_NAME:443?encryption=none&security=tls&type=ws&path=%2Fvless-ws#GitHub-VLESS-VPN"
+          echo "--------------------------------------------------"
+          echo "IMPORT THIS CONFIG INTO V2RAY / NEKORAY:"
+          echo ""
+          echo "$VLESS_LINK"
+          echo ""
           echo "--------------------------------------------------"
           echo "Funnel Status:"
           sudo tailscale funnel status
-          echo "--------------------------------------------------"
 
-      - name: Keep Alive
-        run: sleep 18000 # 5 Hours
+      - name: Keep Runner Alive
+        run: sleep 18000
