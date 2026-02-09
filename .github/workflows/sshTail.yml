@@ -12,7 +12,8 @@ jobs:
 
       - name: Install Xray (V2Ray Core)
         run: |
-          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          # اضافه کردن sudo برای رفع خطای دسترسی
+          curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | sudo bash -s -- install
 
       - name: Generate VPN Credentials
         id: credentials
@@ -23,9 +24,14 @@ jobs:
 
       - name: Configure Xray Server (VLESS + WS)
         run: |
+          # ایجاد کانفیگ کامل و صحیح Xray
           cat <<EOF | sudo tee /usr/local/etc/xray/config.json
           {
-            "inbounds":,
+            "inbounds": [{
+              "port": 8080,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "${{ env.UUID }}"}],
                 "decryption": "none"
               },
               "streamSettings": {
@@ -50,25 +56,30 @@ jobs:
 
       - name: Start Tailscale Funnel (TLS Forwarding)
         run: |
-          sudo tailscale serve reset
+          sudo tailscale serve reset --yes || true
+          
           # فوروارد کردن پورت 443 اینترنت به پورت 8080 محلی (Xray)
-          # خودِ Tailscale لایه TLS را با گواهی معتبر هندل می‌کند
-          sudo tailscale funnel --bg --tcp 443 8080
-          sleep 15
+          # استفاده از پروتکل tcp برای جلوگیری از تداخل لایه 7
+          sudo tailscale funnel --bg 443 tcp 8080
+          
+          echo "Waiting for Funnel to initialize..."
+          sleep 20
 
       - name: Show V2Ray Config URL
         run: |
           DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
-          # ساخت لینک VLESS برای کلاینت
+          # ساخت لینک VLESS با تنظیمات صحیح TLS (چون Funnel خودش TLS را هندل می‌کند)
           VLESS_LINK="vless://${{ env.UUID }}@$DNS_NAME:443?encryption=none&security=tls&type=ws&path=%2Fvless-ws#GitHub-VLESS-VPN"
+          
           echo "--------------------------------------------------"
-          echo "IMPORT THIS CONFIG INTO V2RAY / NEKORAY:"
+          echo "IMPORT THIS CONFIG INTO V2RAYN / NEKORAY:"
           echo ""
           echo "$VLESS_LINK"
           echo ""
           echo "--------------------------------------------------"
           echo "Funnel Status:"
           sudo tailscale funnel status
+          echo "--------------------------------------------------"
 
       - name: Keep Runner Alive
         run: sleep 18000
