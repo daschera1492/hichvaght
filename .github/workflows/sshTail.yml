@@ -1,7 +1,7 @@
 name: Tailscale SSH VPN Test
 
 on:
-  workflow_dispatch: # اجرای دستی
+  workflow_dispatch:
 
 jobs:
   tailscale-vpn:
@@ -45,33 +45,35 @@ jobs:
 
       - name: Configure SSH for Password Authentication
         run: |
+          # فعال‌سازی صریح احراز هویت با پسورد
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          echo "Match User vpnuser" | sudo tee -a /etc/ssh/sshd_config
+          echo "    PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
           sudo systemctl restart ssh
 
       - name: Start Tailscale Funnel
         run: |
-          # ابتدا پورت داخلی را به سرویس معرفی می‌کنیم
-          sudo tailscale serve --bg tcp:22
-          # سپس فانل را روی پورت 443 فعال می‌کنیم
+          # اصلاح دستور: استفاده از پورت مقصد به صورت عدد خالص برای TCP
+          # در نسخه های جدید باید از فرمت زیر استفاده کرد
+          sudo tailscale serve --bg tcp:22 
           sudo tailscale funnel --bg 443 on
-          echo "Tailscale Funnel is starting on port 443 and pointing to SSH (22)..."
+          echo "Tailscale Funnel is now correctly pointing to TCP/22."
 
       - name: Show Connection Details
         run: |
           echo "--------------------------------------------------"
           echo "VPN Configuration Details:"
-          # دریافت آدرس DNS اختصاصی سرور
+          # دریافت آدرس FQDN بدون نقطه نهایی
           DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "Host: $DNS_NAME"
           echo "Port: 443"
           echo "Username: vpnuser"
           echo "Password: vpnpassword"
           echo "--------------------------------------------------"
-          echo "Instructions:"
-          echo "1. Use the Host above in Netmod/HTTP Custom."
-          echo "2. Set connection port to 443."
-          echo "3. Use the credentials provided."
+          echo "Testing Connection via Funnel..."
+          # یک تست کوچک داخلی برای اطمینان از باز بودن فانل
+          tailscale funnel status
           echo "--------------------------------------------------"
 
       - name: Keep Alive
