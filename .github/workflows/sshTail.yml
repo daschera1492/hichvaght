@@ -15,10 +15,7 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt update
-          sudo apt install -y tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Enable IP forwarding
         run: |
@@ -26,54 +23,55 @@ jobs:
           echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
           sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 
-      - name: Start tailscaled
-        run: sudo systemctl enable --now tailscaled
-
       - name: Connect to Tailscale
         run: |
+          # نکته: --ssh حذف شد تا با پورت 22 محلی و Funnel تداخل پیدا نکند
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --advertise-exit-node \
-            --ssh \
-            --hostname=github-vpn-test
+            --hostname=github-vpn-test \
+            --accept-risk=lose-ssh
 
       - name: Create VPN User
         run: |
           sudo useradd -m -s /bin/bash vpnuser
           echo "vpnuser:vpnpassword" | sudo chpasswd
+          sudo usermod -aG sudo vpnuser
 
-      - name: Configure SSH for Password Authentication
+      - name: Configure Local SSH for Funnel
         run: |
+          # اجازه دادن به احراز هویت با پسورد برای پورت محلی
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config.d/vpn.conf
           sudo systemctl restart ssh
 
-      - name: Start Tailscale Funnel (Validated 2026 Syntax)
+      - name: Start Tailscale Funnel (TCP Forwarding)
         run: |
-          # پاک کردن هرگونه تنظیم قبلی بدون سوال پرسیدن
-          sudo tailscale serve reset --force || sudo tailscale serve reset || true
+          # پاکسازی تنظیمات قبلی (نحو صحیح reset)
+          sudo tailscale serve reset
           
-          # در ورژن های جدید، برای TCP Raw (مثل SSH) باید از فرمت زیر استفاده کرد:
-          # پورت 443 را باز کن و ترافیک خام TCP را به پورت 22 (SSH) بفرست
+          # فوروارد کردن ترافیک خام TCP از پورت 443 اینترنت به پورت 22 محلی
+          # در نسخه‌های جدید 2025/2026 از این نحو استفاده می‌شود
           sudo tailscale funnel --bg 443 tcp 22
           
           echo "Waiting for Funnel to initialize..."
-          sleep 10
+          sleep 15
 
       - name: Show Connection Details
         run: |
           echo "--------------------------------------------------"
-          echo "VPN Configuration Details (Netmod/SSH):"
+          echo "CONNECTION GUIDE (SSH Over Funnel):"
+          # گرفتن آدرس DNS اختصاصی نود
           DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "Command: ssh -p 443 vpnuser@$DNS_NAME"
           echo "Host: $DNS_NAME"
           echo "Port: 443"
-          echo "Username: vpnuser"
-          echo "Password: vpnpassword"
+          echo "User: vpnuser"
+          echo "Pass: vpnpassword"
           echo "--------------------------------------------------"
-          echo "Funnel Status Check:"
+          echo "Funnel Status:"
           sudo tailscale funnel status
           echo "--------------------------------------------------"
 
       - name: Keep Alive
-        run: sleep 18000
+        run: sleep 18000 # 5 Hours
