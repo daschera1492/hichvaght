@@ -1,0 +1,72 @@
+name: Tailscale SSH VPN Test
+
+on:
+  workflow_dispatch: # اجرای دستی از پنل گیت‌هاب
+
+jobs:
+  tailscale-vpn:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update system
+        run: sudo apt update -y
+
+      - name: Install prerequisites
+        run: sudo apt install -y curl lsb-release iptables
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt update
+          sudo apt install -y tailscale
+
+      - name: Enable IP forwarding
+        run: |
+          echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+          sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+      - name: Start tailscaled
+        run: sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --advertise-exit-node \
+            --ssh \
+            --hostname=github-vpn-test \
+            --accept-routes
+
+      - name: Create VPN User
+        run: |
+          # ایجاد یک یوزر برای اتصال SSH در نرم‌افزارهای VPN
+          sudo useradd -m -s /bin/bash vpnuser
+          echo "vpnuser:vpnpassword" | sudo chpasswd
+          echo "User 'vpnuser' created with password 'vpnpassword'"
+
+      - name: Configure SSH for Password Authentication
+        run: |
+          # فعال‌سازی ورود با پسورد برای استفاده در اپلیکیشن‌های موبایل
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+      - name: Start Tailscale Funnel
+        run: |
+          # هدایت ترافیک پورت 443 اینترنت به پورت 22 داخلی
+          sudo tailscale funnel --bg 443 22
+          echo "Tailscale Funnel is starting on port 443..."
+
+      - name: Show Connection Details
+        run: |
+          echo "--------------------------------------------------"
+          echo "VPN Configuration Details:"
+          echo "Host: $(tailscale status --json | jq -r '.Self.DNSName')"
+          echo "Port: 443"
+          echo "Username: vpnuser"
+          echo "Password: vpnpassword"
+          echo "--------------------------------------------------"
+          echo "This job will keep running for 5 hours for your test."
+          
+      - name: Keep Alive
+        run: sleep 18000 # نگه داشتن جاب به مدت ۵ ساعت برای تست
