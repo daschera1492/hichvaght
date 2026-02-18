@@ -1,4 +1,4 @@
-name: Ubuntu Tailscale High-Speed Exit Node & Peer Relay (5h)
+name: Ubuntu Tailscale High-Speed Exit Node (Legacy Auth)
 
 on:
   workflow_dispatch:
@@ -9,11 +9,6 @@ jobs:
   tailscale-exit:
     runs-on: ubuntu-latest
     timeout-minutes: 298   # 5 ساعت
-    
-    # اضافه کردن دسترسی برای استفاده از هویت گیت‌هاب (OIDC) بدون نیاز به Auth Key
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
       - name: Update system
@@ -22,12 +17,10 @@ jobs:
       - name: Install prerequisites
         run: sudo apt install -y curl lsb-release iptables
 
-      - name: Install Tailscale (Latest GA Version)
+      - name: Install Latest Tailscale (GA Version)
         run: |
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt update
-          sudo apt install -y tailscale
+          # نصب مستقیم آخرین نسخه پایدار برای اطمینان از وجود قابلیت Peer Relay [۴۷]
+          curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Enable IP forwarding
         run: |
@@ -35,17 +28,15 @@ jobs:
           echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
           sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 
-      - name: Start tailscaled
-        run: sudo systemctl enable --now tailscaled
-
-      - name: Connect to Tailscale (Using Peer Relay & Identity Federation)
-        # در این نسخه نیازی به TAILSCALE_AUTH_KEY نیست اگر در پنل تنظیمات را انجام داده باشید
+      - name: Connect to Tailscale (Auth Key + Peer Relay)
         run: |
+          # استفاده از روش قدیمی Auth Key همراه با قابلیت جدید Peer Relay [۵۸]
           sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --advertise-exit-node \
             --advertise-peer-relay \
             --advertise-tags=tag:exit-node \
-            --hostname=github-exit-relay \
+            --hostname=github-exit-fast \
             --accept-dns=false
 
       - name: Configure iptables (NAT)
@@ -59,5 +50,5 @@ jobs:
 
       - name: Keep runner alive (5 hours)
         run: |
-          echo "Exit Node & Peer Relay are active. Speed is now up to 15x faster via Relay."
+          echo "Exit Node is active with Peer Relay enabled (Up to 15x faster)."
           sleep 18000
