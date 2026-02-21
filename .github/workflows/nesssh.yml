@@ -1,14 +1,14 @@
-name: Ubuntu Tailscale Auto Exit Node (5h)
+name: Ubuntu Tailscale Auto Exit Node (5h - Tehran Time)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'   # اجرای خودکار هر 4 ساعت
+    - cron: '0 */4 * * *'   # اجرا هر 4 ساعت
 
 jobs:
   tailscale-exit:
     runs-on: ubuntu-latest
-    timeout-minutes: 298   # 5 ساعت
+    timeout-minutes: 298   # حدود 5 ساعت
 
     steps:
       - name: Update system
@@ -41,13 +41,19 @@ jobs:
       - name: Start tailscaled
         run: sudo systemctl enable --now tailscaled
 
+      - name: Generate Tehran time hostname
+        run: |
+          HOSTNAME="server-$(TZ=Asia/Tehran date +'%H-%M')"
+          echo "Using hostname: $HOSTNAME"
+          echo "HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
+
       - name: Connect to Tailscale (AUTO)
         run: |
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --advertise-exit-node \
             --advertise-tags=tag:exit-node \
-            --hostname=github-exit
+            --hostname=$HOSTNAME
 
       - name: Configure iptables (NAT)
         run: |
