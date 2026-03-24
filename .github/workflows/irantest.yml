@@ -1,37 +1,31 @@
-name: Iran Connectivity Check
+name: Check External Access to IP
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-sites:
+  check-ip:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check Iranian websites availability
+      - name: Test connectivity
         run: |
-          sites=(
-            "https://www.varzesh3.com"
-            "https://www.time.ir"
-            "https://www.farsnews.ir"
-            "https://seyagh.com"
-            "https://www.aparat.com"
-          )
+          IP="87.107.105.90"
 
-          for site in "${sites[@]}"; do
-            echo "=============================="
-            echo "Checking $site ..."
-            
-            status=$(curl -o /dev/null -s -w "%{http_code}" \
-              --connect-timeout 5 \
-              --max-time 10 \
-              $site || echo "000")
+          echo "==== PING TEST ===="
+          if ping -c 2 -W 2 $IP > /dev/null; then
+            echo "✅ Ping OK"
+          else
+            echo "❌ Ping FAILED"
+          fi
 
-            if [ "$status" = "000" ]; then
-              echo "❌ $site TIMEOUT / BLOCKED"
-            elif [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
-              echo "✅ $site ACCESSIBLE (HTTP $status)"
-            else
-              echo "⚠️ $site ERROR (HTTP $status)"
-            fi
+          echo "==== TCP TEST ===="
+          for port in 22 80 443; do
+            echo "Checking port $port ..."
+            timeout 5 bash -c "</dev/tcp/$IP/$port" \
+              && echo "✅ Port $port OPEN" \
+              || echo "❌ Port $port CLOSED or FILTERED"
           done
+
+          echo "==== HTTP TEST ===="
+          curl -I --connect-timeout 5 http://$IP || echo "❌ HTTP FAILED"
