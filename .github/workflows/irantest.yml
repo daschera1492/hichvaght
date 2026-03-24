@@ -5,12 +5,41 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: chisel-runner
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 ساعت
+    timeout-minutes: 360
 
     steps:
+      - name: Check connectivity first
+        id: check
+        run: |
+          echo "Checking connectivity..."
+
+          curl -m 5 -s https://www.time.ir > /dev/null
+          TIME_OK=$?
+
+          curl -m 5 -s https://www.varzesh3.com > /dev/null
+          VARZESH_OK=$?
+
+          if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "Internet OK"
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "Internet NOT OK"
+          fi
+
+      - name: Stop if no connectivity
+        if: steps.check.outputs.ok != 'true'
+        run: |
+          echo "Skipping runner (no access)"
+          exit 0
+
       - name: Install dependencies
         run: |
           sudo apt update
@@ -23,28 +52,7 @@ jobs:
           chmod +x chisel_1.11.5_linux_amd64
           mv chisel_1.11.5_linux_amd64 chisel
 
-      - name: Check connectivity and run chisel
+      - name: Run chisel
         run: |
-          check_site() {
-            curl -m 5 -s https://www.time.ir > /dev/null
-            TIME_OK=$?
-
-            curl -m 5 -s https://www.varzesh3.com > /dev/null
-            VARZESH_OK=$?
-
-            if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
-              return 0
-            else
-              return 1
-            fi
-          }
-
-          echo "Checking connectivity..."
-
-          if check_site; then
-            echo "Internet OK → starting chisel"
-            timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
-          else
-            echo "Internet NOT OK → exiting"
-            exit 1
-          fi
+          echo "Starting chisel..."
+          timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
