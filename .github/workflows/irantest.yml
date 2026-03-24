@@ -1,31 +1,48 @@
-name: Check External Access to IP
+name: chisel-runner
 
 on:
+  schedule:
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
-  check-ip:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 ساعت
 
     steps:
-      - name: Test connectivity
+      - name: Install dependencies
         run: |
-          IP="87.107.105.90"
+          sudo apt update
+          sudo apt install -y curl wget
 
-          echo "==== PING TEST ===="
-          if ping -c 2 -W 2 $IP > /dev/null; then
-            echo "✅ Ping OK"
+      - name: Download chisel
+        run: |
+          wget https://github.com/jpillora/chisel/releases/latest/download/chisel_linux_amd64.gz
+          gunzip chisel_linux_amd64.gz
+          chmod +x chisel_linux_amd64
+          mv chisel_linux_amd64 chisel
+
+      - name: Run script
+        run: |
+          bash << 'EOF'
+          check_site() {
+            curl -m 5 -s https://www.time.ir > /dev/null
+            TIME_OK=$?
+
+            curl -m 5 -s https://www.varzesh3.com > /dev/null
+            VARZESH_OK=$?
+
+            if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          if check_site; then
+            timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
           else
-            echo "❌ Ping FAILED"
+            exit 1
           fi
-
-          echo "==== TCP TEST ===="
-          for port in 22 80 443; do
-            echo "Checking port $port ..."
-            timeout 5 bash -c "</dev/tcp/$IP/$port" \
-              && echo "✅ Port $port OPEN" \
-              || echo "❌ Port $port CLOSED or FILTERED"
-          done
-
-          echo "==== HTTP TEST ===="
-          curl -I --connect-timeout 5 http://$IP || echo "❌ HTTP FAILED"
+          EOF
