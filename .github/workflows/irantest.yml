@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 ساعت
+    timeout-minutes: 360  # 6 ساعت
 
     steps:
       - name: Check connectivity first
@@ -20,21 +20,18 @@ jobs:
         run: |
           echo "Checking connectivity..."
 
-          # بررسی time.ir
           if curl -m 5 -s https://www.time.ir > /dev/null; then
             TIME_OK=0
           else
             TIME_OK=1
           fi
 
-          # بررسی varzesh3.com
           if curl -m 5 -s https://www.varzesh3.com > /dev/null; then
             VARZESH_OK=0
           else
             VARZESH_OK=1
           fi
 
-          # خروجی برای مراحل بعدی
           if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
             echo "ok=true" >> $GITHUB_OUTPUT
             echo "Internet OK"
@@ -43,25 +40,18 @@ jobs:
             echo "Internet NOT OK"
           fi
 
-      - name: Stop if no connectivity
-        if: steps.check.outputs.ok != 'true'
+      - name: Run chisel only if connectivity OK
+        if: steps.check.outputs.ok == 'true'
         run: |
-          echo "Skipping runner (no access)"
-          exit 0
-
-      - name: Install dependencies
-        run: |
+          echo "Installing dependencies..."
           sudo apt update
-          sudo apt install -y curl wget
+          sudo apt install -y curl wget gzip
 
-      - name: Download chisel
-        run: |
+          echo "Downloading chisel..."
           wget https://github.com/jpillora/chisel/releases/download/v1.11.5/chisel_1.11.5_linux_amd64.gz
           gunzip chisel_1.11.5_linux_amd64.gz
           chmod +x chisel_1.11.5_linux_amd64
           mv chisel_1.11.5_linux_amd64 chisel
 
-      - name: Run chisel
-        run: |
-          echo "Starting chisel..."
+          echo "Starting chisel for 6 hours..."
           timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
