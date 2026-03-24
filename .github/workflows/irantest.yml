@@ -18,14 +18,13 @@ jobs:
 
       - name: Download chisel
         run: |
-          wget https://github.com/jpillora/chisel/releases/latest/download/chisel_linux_amd64.gz
-          gunzip chisel_linux_amd64.gz
-          chmod +x chisel_linux_amd64
-          mv chisel_linux_amd64 chisel
+          wget https://github.com/jpillora/chisel/releases/download/v1.11.5/chisel_1.11.5_linux_amd64.gz
+          gunzip chisel_1.11.5_linux_amd64.gz
+          chmod +x chisel_1.11.5_linux_amd64
+          mv chisel_1.11.5_linux_amd64 chisel
 
-      - name: Run script
+      - name: Check connectivity and run chisel
         run: |
-          bash << 'EOF'
           check_site() {
             curl -m 5 -s https://www.time.ir > /dev/null
             TIME_OK=$?
@@ -40,9 +39,12 @@ jobs:
             fi
           }
 
+          echo "Checking connectivity..."
+
           if check_site; then
+            echo "Internet OK → starting chisel"
             timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
           else
+            echo "Internet NOT OK → exiting"
             exit 1
           fi
-          EOF
