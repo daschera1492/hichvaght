@@ -2,8 +2,6 @@ name: Iran Connectivity Check
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"  # هر یک ساعت (اختیاری)
 
 jobs:
   check-sites:
@@ -21,13 +19,19 @@ jobs:
           )
 
           for site in "${sites[@]}"; do
+            echo "=============================="
             echo "Checking $site ..."
             
-            status=$(curl -o /dev/null -s -w "%{http_code}" --connect-timeout 5 $site)
+            status=$(curl -o /dev/null -s -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              $site || echo "000")
 
-            if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
-              echo "✅ $site is ACCESSIBLE (HTTP $status)"
+            if [ "$status" = "000" ]; then
+              echo "❌ $site TIMEOUT / BLOCKED"
+            elif [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
+              echo "✅ $site ACCESSIBLE (HTTP $status)"
             else
-              echo "❌ $site is NOT accessible (HTTP $status)"
+              echo "⚠️ $site ERROR (HTTP $status)"
             fi
           done
