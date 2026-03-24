@@ -2,7 +2,7 @@ name: chisel-runner
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360   # 6 ساعت
 
     steps:
       - name: Check connectivity first
@@ -20,12 +20,21 @@ jobs:
         run: |
           echo "Checking connectivity..."
 
-          curl -m 5 -s https://www.time.ir > /dev/null
-          TIME_OK=$?
+          # بررسی time.ir
+          if curl -m 5 -s https://www.time.ir > /dev/null; then
+            TIME_OK=0
+          else
+            TIME_OK=1
+          fi
 
-          curl -m 5 -s https://www.varzesh3.com > /dev/null
-          VARZESH_OK=$?
+          # بررسی varzesh3.com
+          if curl -m 5 -s https://www.varzesh3.com > /dev/null; then
+            VARZESH_OK=0
+          else
+            VARZESH_OK=1
+          fi
 
+          # خروجی برای مراحل بعدی
           if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
             echo "ok=true" >> $GITHUB_OUTPUT
             echo "Internet OK"
