@@ -1,0 +1,83 @@
+name: MasterDnsVPN Auto Deploy
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *' # هر 6 ساعت یکبار اجرا می‌شود
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # حداکثر زمان مجاز برای یک رانر (نزدیک 6 ساعت)
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Update and Install Tools
+        run: |
+          sudo apt update
+          sudo apt install -y curl jq
+
+      - name: Get Public IP
+        id: ip
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "IP=$RUNNER_IP" >> $GITHUB_OUTPUT
+          echo "Runner Public IP: $RUNNER_IP"
+
+      - name: Sync Cloudflare DNS
+        run: |
+          ZONE_NAME="forwario.ir"
+          RECORD_NAME="ms.forwario.ir"
+          
+          # 1. پیدا کردن Zone ID
+          ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$ZONE_NAME" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+          
+          # 2. پیدا کردن Record ID برای ns.masezahedi.eu.cc
+          RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$RECORD_NAME" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+          
+          if [ "$RECORD_ID" == "null" ]; then
+            echo "Error: Record $RECORD_NAME not found in Cloudflare!"
+            exit 1
+          fi
+
+          # 3. آپدیت کردن رکورد به آی‌پی جدید رانر
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"${{ steps.ip.outputs.IP }}\",\"ttl\":120,\"proxied\":false}"
+          
+          echo "Cloudflare DNS updated to ${{ steps.ip.outputs.IP }}"
+
+      - name: Install MasterDnsVPN
+        run: |
+          # دانلود اسکریپت نصب
+          curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
+          chmod +x install.sh
+          
+          # پاسخ خودکار به سوالات اسکریپت:
+          # ورودی اول: m.forwario.ir (دامنه سرویس)
+          # ورودی دوم: ${{ secrets.VPN_ENCRYPT_KEY }} (کلید ثابت شما)
+          echo -e "m.forwario.ir\n${{ secrets.VPN_ENCRYPT_KEY }}" | sudo ./install.sh
+
+      - name: System Status & Logs
+        run: |
+          echo "--------------------------------------------------"
+          echo "Server Domain: m.forwario.ir"
+          echo "Resolver IP: ${{ steps.ip.outputs.IP }} (ns.masezahedi.eu.cc)"
+          echo "Encrypt Key: ${{ secrets.VPN_ENCRYPT_KEY }}"
+          echo "--------------------------------------------------"
+          # نمایش وضعیت سرویس‌های نصب شده (اختیاری)
+          sudo systemctl status bind9 --no-pager || true
+          sudo systemctl status masterdnsvpn --no-pager || true
+
+      - name: Keep Runner Alive
+        run: |
+          echo "Runner is active. Connection will stay open for ~5.5 hours."
+          # خواب مصنوعی برای باز نگه داشتن رانر
+          sleep 20000
