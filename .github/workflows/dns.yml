@@ -1,4 +1,4 @@
-name: MasterDnsVPN Persistent Deploy (Pinggy Loop)
+name: MasterDnsVPN Persistent Deploy (Pinggy Fixed)
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
       - name: Install MasterDnsVPN Server
         run: |
-          # نصب خودکار سرور با دامنه و کلید شما [۱۹۸، ۴۵۲]
+          # نصب خودکار سرور با دامنه و کلید شما از بخش Secrets [۱۹۸، ۳۷۴]
           curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
           chmod +x install.sh
           echo -e "m.forwario.ir\n${{ secrets.VPN_ENCRYPT_KEY }}" | sudo ./install.sh
@@ -35,49 +35,52 @@ jobs:
           RECORD_NAME="ms.forwario.ir"
           PINGGY_TOKEN="AqVBx1RzeEI+" # توکن پینگی شما [۲۸۲]
 
-          # ۱. پیدا کردن Zone ID کلودفلر [۹، ۳۶۹]
+          # ۱. پیدا کردن Zone ID کلودفلر (اصلاح شده با  برای حل خطای jq) [۹، ۳۶۹]
           ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$ZONE_NAME" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
             -H "Content-Type: application/json" | jq -r '.result.id')
+          
+          if [ "$ZONE_ID" == "null" ]; then echo "❌ Zone ID not found!"; exit 1; fi
 
-          # ۲. پیدا کردن Record ID برای ms.forwario.ir
+          # ۲. پیدا کردن Record ID برای ms.forwario.ir (اصلاح شده با ) [۹، ۳۶۹]
           RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$RECORD_NAME" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
             -H "Content-Type: application/json" | jq -r '.result.id')
+          
+          if [ "$RECORD_ID" == "null" ]; then echo "❌ Record ID not found!"; exit 1; fi
 
           echo "🚀 Starting MasterDnsVPN with 50-minute rotation loop..."
 
-          # شروع حلقه تکرار برای دور زدن محدودیت ۶۰ دقیقه‌ای پینگی [۲۸۷، ۳۸۱]
           while true; do
             echo "🌐 Opening new Pinggy Tunnel..."
             
-            # اجرای تونل پینگی در پس‌زمینه [۳۶۵، ۳۷۷]
+            # اجرای تونل پینگی برای پورت ۵۳ در پس‌زمینه [۳۶۵، ۳۷۷]
             ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
               -R0:localhost:53 ${PINGGY_TOKEN}udp@free.pinggy.io > pinggy.log 2>&1 &
             TUNNEL_PID=$!
 
-            sleep 15 # زمان برای برقراری تونل
+            sleep 20 # زمان کافی برای برقراری تونل
             
-            # استخراج آدرس و آی‌پی جدید [۳۶۷، ۳۶۹]
+            # استخراج آدرس و آی‌پی جدید سرور پینگی [۳۶۷، ۳۶۹]
             PINGGY_URL=$(grep -oP '\S+\.pinggy\.link' pinggy.log | head -1)
             if [ -z "$PINGGY_URL" ]; then
-              echo "❌ Failed to get URL, retrying..."
+              echo "❌ Failed to get URL from Pinggy, retrying..."
               kill $TUNNEL_PID
               continue
             fi
             
             NEW_IP=$(dig +short $PINGGY_URL | head -1)
-            echo "🔗 New IP: $NEW_IP (URL: $PINGGY_URL)"
+            echo "🔗 Tunnel Active: $PINGGY_URL -> IP: $NEW_IP"
 
-            # ۳. آپدیت رکورد A در کلودفلر (با TTL 60 ثانیه برای انتشار سریع) [۱۹۸، ۳۸۱]
+            # ۳. آپدیت رکورد A در کلودفلر (proxied حتماً باید false باشد) [۱۹۸، ۳۶۸]
             curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
               -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
               -H "Content-Type: application/json" \
               --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"$NEW_IP\",\"ttl\":60,\"proxied\":false}"
             
-            echo "✅ DNS Updated. Server is active for the next 50 minutes."
+            echo "✅ Cloudflare DNS Updated. Next rotation in 50 minutes."
 
-            # انتظار به مدت ۵۰ دقیقه قبل از چرخش آدرس [۳۸۱]
+            # انتظار به مدت ۵۰ دقیقه قبل از باز کردن تونل جدید [۳۸۱]
             sleep 3000 
 
             echo "🔄 50 minutes passed. Rotating tunnel..."
