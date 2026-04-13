@@ -1,83 +1,86 @@
-name: MasterDnsVPN Auto Deploy
+name: MasterDnsVPN Persistent Deploy (Pinggy Loop)
 
 on:
   workflow_dispatch:
   schedule:
-   # هر 6 ساعت یکبار اجرا می‌شود
+    - cron: '0 */5 * * *' # اجرای خودکار هر ۵ ساعت برای پوشش محدودیت ۶ ساعته رانر [۱۰۱، ۳۸۱]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # حداکثر زمان مجاز برای یک رانر (نزدیک 6 ساعت)
+    timeout-minutes: 355 # حداکثر زمان مجاز رانر [۱۰۱]
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Update and Install Tools
+      - name: Free Port 53 & Install Tools
         run: |
-          sudo apt update
-          sudo apt install -y curl jq
+          # آزاد کردن پورت ۵۳ برای جلوگیری از تداخل با سیستم [۲۳۷، ۳۶۴]
+          sudo systemctl disable --now systemd-resolved
+          sudo rm -f /etc/resolv.conf
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          sudo apt update && sudo apt install -y curl jq dnsutils ssh
 
-      - name: Get Public IP
-        id: ip
+      - name: Install MasterDnsVPN Server
         run: |
-          RUNNER_IP=$(curl -s https://api.ipify.org)
-          echo "IP=$RUNNER_IP" >> $GITHUB_OUTPUT
-          echo "Runner Public IP: $RUNNER_IP"
+          # نصب خودکار سرور با دامنه و کلید شما [۱۹۸، ۴۵۲]
+          curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
+          chmod +x install.sh
+          echo -e "m.forwario.ir\n${{ secrets.VPN_ENCRYPT_KEY }}" | sudo ./install.sh
 
-      - name: Sync Cloudflare DNS
+      - name: Start Persistent Tunnel Loop
         run: |
           ZONE_NAME="forwario.ir"
           RECORD_NAME="ms.forwario.ir"
-          
-          # 1. پیدا کردن Zone ID
+          PINGGY_TOKEN="AqVBx1RzeEI+" # توکن پینگی شما [۲۸۲]
+
+          # ۱. پیدا کردن Zone ID کلودفلر [۹، ۳۶۹]
           ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$ZONE_NAME" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-            -H "Content-Type: application/json" | jq -r '.result[0].id')
-          
-          # 2. پیدا کردن Record ID برای ns.masezahedi.eu.cc
+            -H "Content-Type: application/json" | jq -r '.result.id')
+
+          # ۲. پیدا کردن Record ID برای ms.forwario.ir
           RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$RECORD_NAME" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-            -H "Content-Type: application/json" | jq -r '.result[0].id')
-          
-          if [ "$RECORD_ID" == "null" ]; then
-            echo "Error: Record $RECORD_NAME not found in Cloudflare!"
-            exit 1
-          fi
+            -H "Content-Type: application/json" | jq -r '.result.id')
 
-          # 3. آپدیت کردن رکورد به آی‌پی جدید رانر
-          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"${{ steps.ip.outputs.IP }}\",\"ttl\":120,\"proxied\":false}"
-          
-          echo "Cloudflare DNS updated to ${{ steps.ip.outputs.IP }}"
+          echo "🚀 Starting MasterDnsVPN with 50-minute rotation loop..."
 
-      - name: Install MasterDnsVPN
-        run: |
-          # دانلود اسکریپت نصب
-          curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
-          chmod +x install.sh
-          
-          # پاسخ خودکار به سوالات اسکریپت:
-          # ورودی اول: m.forwario.ir (دامنه سرویس)
-          # ورودی دوم: ${{ secrets.VPN_ENCRYPT_KEY }} (کلید ثابت شما)
-          echo -e "m.forwario.ir\n${{ secrets.VPN_ENCRYPT_KEY }}" | sudo ./install.sh
+          # شروع حلقه تکرار برای دور زدن محدودیت ۶۰ دقیقه‌ای پینگی [۲۸۷، ۳۸۱]
+          while true; do
+            echo "🌐 Opening new Pinggy Tunnel..."
+            
+            # اجرای تونل پینگی در پس‌زمینه [۳۶۵، ۳۷۷]
+            ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+              -R0:localhost:53 ${PINGGY_TOKEN}udp@free.pinggy.io > pinggy.log 2>&1 &
+            TUNNEL_PID=$!
 
-      - name: System Status & Logs
-        run: |
-          echo "--------------------------------------------------"
-          echo "Server Domain: m.forwario.ir"
-          echo "Resolver IP: ${{ steps.ip.outputs.IP }} (ns.masezahedi.eu.cc)"
-          echo "Encrypt Key: ${{ secrets.VPN_ENCRYPT_KEY }}"
-          echo "--------------------------------------------------"
-          # نمایش وضعیت سرویس‌های نصب شده (اختیاری)
-          sudo systemctl status bind9 --no-pager || true
-          sudo systemctl status masterdnsvpn --no-pager || true
+            sleep 15 # زمان برای برقراری تونل
+            
+            # استخراج آدرس و آی‌پی جدید [۳۶۷، ۳۶۹]
+            PINGGY_URL=$(grep -oP '\S+\.pinggy\.link' pinggy.log | head -1)
+            if [ -z "$PINGGY_URL" ]; then
+              echo "❌ Failed to get URL, retrying..."
+              kill $TUNNEL_PID
+              continue
+            fi
+            
+            NEW_IP=$(dig +short $PINGGY_URL | head -1)
+            echo "🔗 New IP: $NEW_IP (URL: $PINGGY_URL)"
 
-      - name: Keep Runner Alive
-        run: |
-          echo "Runner is active. Connection will stay open for ~5.5 hours."
-          # خواب مصنوعی برای باز نگه داشتن رانر
-          sleep 20000
+            # ۳. آپدیت رکورد A در کلودفلر (با TTL 60 ثانیه برای انتشار سریع) [۱۹۸، ۳۸۱]
+            curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"$NEW_IP\",\"ttl\":60,\"proxied\":false}"
+            
+            echo "✅ DNS Updated. Server is active for the next 50 minutes."
+
+            # انتظار به مدت ۵۰ دقیقه قبل از چرخش آدرس [۳۸۱]
+            sleep 3000 
+
+            echo "🔄 50 minutes passed. Rotating tunnel..."
+            kill $TUNNEL_PID
+            sleep 5
+          done
