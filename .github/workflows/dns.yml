@@ -3,7 +3,7 @@ name: MasterDnsVPN Auto Deploy
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *' # هر 6 ساعت یکبار اجرا می‌شود
+   # هر 6 ساعت یکبار اجرا می‌شود
 
 jobs:
   deploy:
