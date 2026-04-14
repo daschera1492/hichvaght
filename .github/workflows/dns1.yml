@@ -1,20 +1,93 @@
-- name: Install MasterDnsVPN
-  run: |
-    # دانلود اسکریپت
-    curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
-    chmod +x install.sh
-    
-    # آزاد کردن پورت 53 (حیاتی برای Runner گیت‌هاب)
-    sudo systemctl stop systemd-resolved
-    sudo systemctl disable systemd-resolved
-    
-    # اجرای اسکریپت و فرستادن جواب‌ها به ترتیب
-    # فرض بر این است که سوالات به ترتیب: دامنه، پورت و تایید نصب هستند
-    echo -e "v.yourdomain.com\n53\ny" | sudo ./install.sh
-    
-    # حالا کلید ساخته شده را از فایل می‌خوانیم تا در مراحل بعد از آن استفاده کنیم
-    # یا می‌توانیم کلید خودمان را در فایل بنویسیم
-    echo "YOUR_FIXED_KEY_HERE" > /home/runner/work/masterdnsvpn/masterdnsvpn/encrypt_key.txt
-    
-    # ری‌استارت سرویس برای اعمال کلید جدید
-    sudo systemctl restart masterdnsvpn
+name: MasterDnsVPN Persistent Deploy (Auto-Key)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Free Port 53 & Install Tools
+        run: |
+          # غیرفعال کردن سرویس پیش‌فرض DNS اوبونتو برای آزاد شدن پورت 53
+          sudo systemctl disable --now systemd-resolved
+          sudo rm -f /etc/resolv.conf
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          sudo apt update && sudo apt install -y curl jq dnsutils unzip
+
+      - name: Install MasterDnsVPN Server
+        run: |
+          curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
+          chmod +x install.sh
+          
+          # پاسخ به سوالات اسکریپت:
+          # ۱. دامنه تونل (m.forwario.ir)
+          # ۲. تایید نصب پیش‌نیازها و سرویس (y)
+          # نکته: کلید به صورت خودکار توسط خود اسکریپت ساخته می‌شود
+          echo -e "m.forwario.ir\ny\ny" | sudo ./install.sh
+          
+          echo "------------------------------------------------------"
+          echo "🚀 MASTER DNS VPN INSTALLED SUCCESSFULLY"
+          # استخراج کلید از فایل ساخته شده توسط اسکریپت برای نمایش در لاگ گیت‌هاب
+          if [ -f "encrypt_key.txt" ]; then
+            echo "🔑 YOUR ENCRYPTION KEY IS:"
+            cat encrypt_key.txt
+          else
+            echo "⚠️ Key file not found, check the installation logs above."
+          fi
+          echo "------------------------------------------------------"
+
+      - name: Install & Start Localtonet
+        run: |
+          wget https://localtonet.com/download/localtonet-linux-x64.zip
+          unzip localtonet-linux-x64.zip
+          chmod +x localtonet
+          
+          ZONE_NAME="forwario.ir"
+          RECORD_NAME="ms.forwario.ir" # این رکورد NS یا A اصلی شماست
+          LTONET_ADDR="ngch1k49ba.localto.net"
+          LTONET_TOKEN="BThSwYJOLoutmDay2rlsxWZRKPdvkFVg5"
+
+          # ۱. پیدا کردن Zone ID
+          ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$ZONE_NAME" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+          
+          if [ "$ZONE_ID" == "null" ]; then echo "❌ Zone ID not found!"; exit 1; fi
+
+          # ۲. پیدا کردن Record ID
+          RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$RECORD_NAME" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+          
+          if [ "$RECORD_ID" == "null" ]; then echo "❌ Record ID not found!"; exit 1; fi
+
+          # ۳. اجرای کلاینت لوکالتونت
+          ./localtonet authtoken $LTONET_TOKEN > localtonet.log 2>&1 &
+          
+          echo "🚀 Localtonet started. Syncing $LTONET_ADDR with $RECORD_NAME"
+
+          # حلقه برای نگه داشتن رانر و چک کردن آی‌پی
+          while true; do
+            NEW_IP=$(dig +short $LTONET_ADDR | head -1)
+            
+            if [[ "$NEW_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "🔗 Current Bridge IP: $NEW_IP"
+              
+              # آپدیت رکورد کلودفلر
+              curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"$NEW_IP\",\"ttl\":60,\"proxied\":false}"
+              
+              echo "✅ Cloudflare Updated."
+            else
+              echo "⚠️ DNS not resolved yet..."
+            fi
+            sleep 600 # هر ۱۰ دقیقه چک کن
+          done
