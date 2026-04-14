@@ -1,1 +1,20 @@
-
+- name: Install MasterDnsVPN
+  run: |
+    # دانلود اسکریپت
+    curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
+    chmod +x install.sh
+    
+    # آزاد کردن پورت 53 (حیاتی برای Runner گیت‌هاب)
+    sudo systemctl stop systemd-resolved
+    sudo systemctl disable systemd-resolved
+    
+    # اجرای اسکریپت و فرستادن جواب‌ها به ترتیب
+    # فرض بر این است که سوالات به ترتیب: دامنه، پورت و تایید نصب هستند
+    echo -e "v.yourdomain.com\n53\ny" | sudo ./install.sh
+    
+    # حالا کلید ساخته شده را از فایل می‌خوانیم تا در مراحل بعد از آن استفاده کنیم
+    # یا می‌توانیم کلید خودمان را در فایل بنویسیم
+    echo "YOUR_FIXED_KEY_HERE" > /home/runner/work/masterdnsvpn/masterdnsvpn/encrypt_key.txt
+    
+    # ری‌استارت سرویس برای اعمال کلید جدید
+    sudo systemctl restart masterdnsvpn
