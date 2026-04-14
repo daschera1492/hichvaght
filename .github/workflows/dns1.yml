@@ -25,22 +25,27 @@ jobs:
           curl -L https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh -o install.sh
           chmod +x install.sh
           
-          # پاسخ به سوالات اسکریپت:
-          # ۱. دامنه تونل (m.forwario.ir)
-          # ۲. تایید نصب پیش‌نیازها و سرویس (y)
-          # نکته: کلید به صورت خودکار توسط خود اسکریپت ساخته می‌شود
+          # پاسخ خودکار به سوالات
           echo -e "m.forwario.ir\ny\ny" | sudo ./install.sh
           
           echo "------------------------------------------------------"
           echo "🚀 MASTER DNS VPN INSTALLED SUCCESSFULLY"
-          # استخراج کلید از فایل ساخته شده توسط اسکریپت برای نمایش در لاگ گیت‌هاب
-          if [ -f "encrypt_key.txt" ]; then
+          
+          # پیدا کردن مسیر دقیق فایل کلید و خواندن آن با sudo برای جلوگیری از خطای Permission
+          # اسکریپت معمولاً فایل را در مسیر اجرای خودش یا در /etc/masterdnsvpn می‌سازد
+          KEY_PATH=$(sudo find / -name "encrypt_key.txt" 2>/dev/null | head -n 1)
+          
+          if [ ! -z "$KEY_PATH" ]; then
             echo "🔑 YOUR ENCRYPTION KEY IS:"
-            cat encrypt_key.txt
+            sudo cat "$KEY_PATH"
+            # کپی کردن کلید به مسیر جاری رانر برای اطمینان
+            sudo cp "$KEY_PATH" ./encrypt_key.txt
+            sudo chmod 644 ./encrypt_key.txt
           else
-            echo "⚠️ Key file not found, check the installation logs above."
+            echo "⚠️ Key file not found in logs, check above for 'YOUR ENCRYPTION KEY' line."
           fi
           echo "------------------------------------------------------"
+          
 
       - name: Install & Start Localtonet
         run: |
