@@ -1,82 +1,40 @@
-name: VLESS VPN via Tailscale Funnel
+name: Deploy to Vercel
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main  # هر زمان کدی در شاخه اصلی پوش شود این اکشن اجرا می‌شود
 
 jobs:
-  vless-vpn:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Update system
-        run: sudo apt update -y && sudo apt install -y jq curl
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-      - name: Install Xray (V2Ray Core)
-        run: |
-          # نصب مستقیم با دسترسی ریشه
-          curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | sudo bash -s -- install
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
 
-      - name: Generate VPN Credentials
-        id: credentials
-        run: |
-          UUID=$(xray uuid)
-          echo "UUID=$UUID" >> $GITHUB_ENV
-          echo "UUID generated: $UUID"
+      - name: Install Vercel CLI
+        # نصب Vercel CLI دقیقا طبق داکیومنت
+        run: npm install -g vercel 
 
-      - name: Configure Xray Server (VLESS + WS)
-        run: |
-          # تنظیم Xray روی پورت 8080 به صورت خام (چون TLS را تیل‌اسکیل هندل می‌کند)
-          cat <<EOF | sudo tee /usr/local/etc/xray/config.json
-          {
-            "inbounds":,
-                "decryption": "none"
-              },
-              "streamSettings": {
-                "network": "ws",
-                "wsSettings": {"path": "/vless-ws"}
-              }
-            }],
-            "outbounds": [{"protocol": "freedom"}]
-          }
-          EOF
-          sudo systemctl restart xray
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
-      - name: Install Tailscale
-        run: curl -fsSL https://tailscale.com/install.sh | sh
+      - name: Build Project Artifacts
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
-      - name: Connect to Tailscale
-        run: |
-          sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=github-vless-node \
-            --accept-risk=lose-ssh
-
-      - name: Start Tailscale Funnel (Correct Syntax)
-        run: |
-          # پاکسازی بدون فلگ اضافی
-          sudo tailscale serve reset
-          
-          # سینتکس صحیح: هدایت ترافیک اینترنت (443) به پورت محلی (8080)
-          # در این حالت Tailscale گواهی SSL معتبر صادر می‌کند
-          sudo tailscale funnel --bg 8080
-          
-          echo "Waiting for Funnel to initialize..."
-          sleep 20
-
-      - name: Show Connection Details
-        run: |
-          DNS_NAME=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
-          # ساخت لینک VLESS استاندارد برای کلاینت
-          VLESS_LINK="vless://${{ env.UUID }}@$DNS_NAME:443?encryption=none&security=tls&type=ws&path=%2Fvless-ws#GitHub-VLESS"
-          
-          echo "--------------------------------------------------"
-          echo "CONFIG FOR V2RAYN / NEKORAY / V2RAYNG:"
-          echo ""
-          echo "$VLESS_LINK"
-          echo ""
-          echo "--------------------------------------------------"
-          echo "Funnel Status Check:"
-          sudo tailscale funnel status
-          echo "--------------------------------------------------"
-
-      - name: Keep Runner Alive
-        run: sleep 18000
+      - name: Deploy Project Artifacts to Vercel
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
