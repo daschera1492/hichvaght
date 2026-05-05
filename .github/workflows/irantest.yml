@@ -1,57 +1,48 @@
-name: chisel-runner
+name: Random Web Visitor
 
 on:
   schedule:
-   /* - cron: "*/4 * * * *" */
-  workflow_dispatch:
-
-concurrency:
-  group: chisel-runner
-  cancel-in-progress: true
+    # تنظیم شده برای هر ۲ ساعت (۱۲ بار در روز)
+    # اما با شرط داخلی، فقط حدود ۵۰٪ دفعات اجرا می‌شود تا به هدف ۴-۷ بار برسیم
+    - cron: '0 */2 * * *' 
+  workflow_dispatch: # امکان اجرای دستی برای تست
 
 jobs:
-  run:
+  browse:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 ساعت
-
     steps:
-      - name: Check connectivity first
-        id: check
+      - name: Check Random Chance and Delay
         run: |
-          echo "Checking connectivity..."
-
-          if curl -m 5 -s https://www.time.ir > /dev/null; then
-            TIME_OK=0
-          else
-            TIME_OK=1
+          # تولید عدد تصادفی بین ۱ تا ۱۰۰
+          CHANCE=$(( ( RANDOM % 100 )  + 1 ))
+          
+          # فقط اگر عدد زیر ۵۰ بود ادامه بده (تقریباً ۶ بار در روز از ۱۲ بار)
+          if [ $CHANCE -gt 50 ]; then
+            echo "Skipping this run to stay random."
+            exit 0
           fi
+          
+          # تاخیر تصادفی بین ۱ تا ۶۰ دقیقه قبل از شروع اصلی برای طبیعی شدن ساعت
+          DELAY=$(( ( RANDOM % 60 )  + 1 ))
+          echo "Waiting for $DELAY minutes before starting..."
+          sleep $(( DELAY * 60 ))
 
-          if curl -m 5 -s https://www.varzesh3.com > /dev/null; then
-            VARZESH_OK=0
-          else
-            VARZESH_OK=1
-          fi
-
-          if [ $TIME_OK -eq 0 ] && [ $VARZESH_OK -eq 0 ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
-            echo "Internet OK"
-          else
-            echo "ok=false" >> $GITHUB_OUTPUT
-            echo "Internet NOT OK"
-          fi
-
-      - name: Run chisel only if connectivity OK
-        if: steps.check.outputs.ok == 'true'
+      - name: Random Website Browsing
         run: |
-          echo "Installing dependencies..."
-          sudo apt update
-          sudo apt install -y curl wget gzip
-
-          echo "Downloading chisel..."
-          wget https://github.com/jpillora/chisel/releases/download/v1.11.5/chisel_1.11.5_linux_amd64.gz
-          gunzip chisel_1.11.5_linux_amd64.gz
-          chmod +x chisel_1.11.5_linux_amd64
-          mv chisel_1.11.5_linux_amd64 chisel
-
-          echo "Starting chisel for 6 hours..."
-          timeout 6h ./chisel client 87.107.105.90:9012 R:0.0.0.0:1080:socks
+          # لیست سایت‌ها
+          URLS=("https://maser-eight.vercel.app/" "https://github.com" )
+          
+          # بهم ریختن ترتیب لیست (Shuffle)
+          SHUFFLED_URLS=$(shuf -e "${URLS[@]}")
+          
+          for URL in $SHUFFLED_URLS; do
+            echo "Visiting: $URL"
+            
+            # استفاده از curl برای شبیه‌سازی بازدید (میتوانید از گزینه‌های User-Agent استفاده کنید)
+            curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" $URL > /dev/null
+            
+            # ماندن در سایت بین ۶۰ تا ۱۸۰ ثانیه (۱ الی ۳ دقیقه)
+            STAY_TIME=$(( ( RANDOM % 121 )  + 60 ))
+            echo "Staying for $STAY_TIME seconds..."
+            sleep $STAY_TIME
+          done
