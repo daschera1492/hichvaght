@@ -7,8 +7,8 @@ jobs:
     steps:
       - name: Install X-UI (Sanaei)
         run: |
-          # نصب پنل ثنایی به صورت سایلنت
-          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<EOF
+          # نصب با دسترسی sudo و تنظیمات خودکار
+          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | sudo bash <<EOF
           y
           admin
           admin
@@ -22,12 +22,14 @@ jobs:
           chmod +x cloudflared
 
           # اجرای تونل اول برای پنل (Port 2053)
-          echo "--- PANEL LINK ---"
+          echo "--- STARTING PANEL TUNNEL ---"
           nohup ./cloudflared tunnel --url http://localhost:2053 > panel_link.log 2>&1 &
-          sleep 5
-          grep -o 'https://[-a-z0-9.]*trycloudflare.com' panel_link.log
+          
+          # صبر برای ایجاد لینک و استخراج آن
+          sleep 10
+          echo "Your Panel URL is:"
+          grep -o 'https://[-a-z0-9.]*trycloudflare.com' panel_link.log | head -n 1
 
-          # ایجاد یک اینباند XHTTP در پنل به صورت خودکار (اختیاری - یا دستی انجام بده)
-          # اینجا فقط تونل دوم را برای پورت ۶۹۶۹ باز می‌کنیم
-          echo "--- VERCEL RELAY LINK ---"
+          # اجرای تونل دوم برای ورسل (Port 6969)
+          echo "--- STARTING VERCEL RELAY TUNNEL ---"
           ./cloudflared tunnel --url http://localhost:6969
