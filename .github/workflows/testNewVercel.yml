@@ -5,12 +5,17 @@ jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Xray
-        run: bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-          
+      - name: Install Xray (With Sudo)
+        run: |
+          # دانلود اسکریپت و اجرای مستقیم با sudo
+          curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o install-release.sh
+          chmod +x install-release.sh
+          sudo ./install-release.sh
+
       - name: Configure Xray (Match Image Settings)
         run: |
-          sudo echo '{
+          # ساخت فایل کانفیگ با استفاده از sudo tee برای اطمینان از دسترسی نوشتن
+          echo '{
             "log": { "loglevel": "warning" },
             "inbounds": [{
               "port": 6969,
@@ -37,9 +42,14 @@ jobs:
               }
             }],
             "outbounds": [{ "protocol": "freedom" }]
-          }' > /tmp/config.json
-          
-          sudo nohup xray -c /tmp/config.json &
+          }' | sudo tee /usr/local/etc/xray/config.json > /dev/null
+
+      - name: Start Xray Service
+        run: |
+          # اجرای سرویس ایکس‌ری
+          sudo systemctl start xray
+          # چک کردن وضعیت برای اطمینان از اجرا
+          sudo systemctl status xray | grep "active (running)"
 
       - name: Run Cloudflare Tunnel
         run: |
