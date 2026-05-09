@@ -1,18 +1,18 @@
-name: Xray Final Root Mode
+name: Xray Root Stealth Mode
 on: workflow_dispatch
 
 jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Preparation and Xray Setup
+      - name: Setup Xray Core
         run: |
-          # دانلود مستقیم باینری برای دور زدن محدودیت نصب
+          # دانلود مستقیم باینری برای حذف محدودیت روت در نصب
           wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip Xray-linux-64.zip
           chmod +x xray
           
-          # ساخت فایل کانفیگ در مسیر جاری
+          # ساخت کانفیگ با رعایت فریب react.dev
           cat <<EOF > config.json
           {
             "log": { "loglevel": "warning" },
@@ -25,23 +25,37 @@ jobs:
               },
               "streamSettings": {
                 "network": "ws",
-                "wsSettings": { "path": "/api" }
+                "wsSettings": { 
+                  "path": "/api",
+                  "headers": { "Host": "react.dev" }
+                }
               }
             }],
-            "outbounds": [{ "protocol": "freedom" }]
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "tag": "direct"
+              },
+              {
+                "protocol": "socks",
+                "tag": "decoy",
+                "settings": {
+                  "servers": [{ "address": "react.dev", "port": 6969 }]
+                }
+              }
+            ]
           }
           EOF
 
-          # اجرای Xray با دسترسی روت در پس‌زمینه
+          # اجرای ایکس‌ری با دسترسی روت
           sudo nohup ./xray -c config.json > xray.log 2>&1 &
           sleep 2
-          echo "--- Xray Status Check ---"
-          ps aux | grep xray
+          echo "--- Service Check ---"
+          sudo ps aux | grep xray
 
       - name: Run Cloudflare Tunnel
         run: |
-          # نصب و اجرای کلودفلر
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          echo "--- YOUR FINAL LINK IS BELOW ---"
+          echo "--- COPY THIS LINK TO VERCEL ---"
           sudo ./cloudflared tunnel --url http://127.0.0.1:6969
