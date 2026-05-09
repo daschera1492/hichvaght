@@ -1,20 +1,21 @@
-name: Xray Direct No-Install
+name: Xray Final Root Mode
 on: workflow_dispatch
 
 jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Download and Run Xray (Manual Mode)
+      - name: Preparation and Xray Setup
         run: |
-          # دانلود مستقیم باینری بدون نیاز به اسکریپت نصب
+          # دانلود مستقیم باینری برای دور زدن محدودیت نصب
           wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip Xray-linux-64.zip
           chmod +x xray
-
-          # ساخت کانفیگ
+          
+          # ساخت فایل کانفیگ در مسیر جاری
           cat <<EOF > config.json
           {
+            "log": { "loglevel": "warning" },
             "inbounds": [{
               "port": 6969,
               "protocol": "vless",
@@ -23,19 +24,24 @@ jobs:
                 "decryption": "none"
               },
               "streamSettings": {
-                "network": "xhttp",
-                "xhttpSettings": { "path": "/api", "mode": "auto" }
+                "network": "ws",
+                "wsSettings": { "path": "/api" }
               }
             }],
             "outbounds": [{ "protocol": "freedom" }]
           }
           EOF
 
-          # اجرا در پس‌زمینه
-          ./xray -c config.json &
+          # اجرای Xray با دسترسی روت در پس‌زمینه
+          sudo nohup ./xray -c config.json > xray.log 2>&1 &
+          sleep 2
+          echo "--- Xray Status Check ---"
+          ps aux | grep xray
 
       - name: Run Cloudflare Tunnel
         run: |
+          # نصب و اجرای کلودفلر
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          ./cloudflared tunnel --url http://127.0.0.1:6969
+          echo "--- YOUR FINAL LINK IS BELOW ---"
+          sudo ./cloudflared tunnel --url http://127.0.0.1:6969
