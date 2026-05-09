@@ -1,20 +1,20 @@
-name: Xray Final Debug
+name: Xray Direct No-Install
 on: workflow_dispatch
 
 jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Xray
+      - name: Download and Run Xray (Manual Mode)
         run: |
-          bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-          
-      - name: Run Xray with Direct Config
-        run: |
-          # ساخت کانفیگ در یک فایل ساده
+          # دانلود مستقیم باینری بدون نیاز به اسکریپت نصب
+          wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip Xray-linux-64.zip
+          chmod +x xray
+
+          # ساخت کانفیگ
           cat <<EOF > config.json
           {
-            "log": { "loglevel": "debug" },
             "inbounds": [{
               "port": 6969,
               "protocol": "vless",
@@ -30,17 +30,12 @@ jobs:
             "outbounds": [{ "protocol": "freedom" }]
           }
           EOF
-          
-          # اجرای Xray در پس‌زمینه و هدایت لاگ‌ها به فایل
-          sudo nohup xray -c config.json > xray.log 2>&1 &
-          sleep 3
-          echo "--- XRAY LOG START ---"
-          cat xray.log
-          echo "--- XRAY LOG END ---"
+
+          # اجرا در پس‌زمینه
+          ./xray -c config.json &
 
       - name: Run Cloudflare Tunnel
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          # اجرای تونل و نمایش لاگ‌ها به صورت زنده
           ./cloudflared tunnel --url http://127.0.0.1:6969
