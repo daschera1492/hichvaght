@@ -1,34 +1,49 @@
-name: GitHub Runner Proxy Hub
+name: Xray External Proxy Bridge
 on: workflow_dispatch
 
 jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install and Setup X-UI
-        run: |
-          # دانلود اسکریپت نصب
-          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
-          chmod +x install.sh
+      - name: Install Xray
+        run: bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
           
-          # اجرای نصب با sudo و ارسال ورودی‌ها به صورت مستقیم
-          printf "y\nadmin\nadmin\n2053\n" | sudo ./install.sh
-
-      - name: Install & Run Cloudflare Tunnels
+      - name: Configure Xray (Match Image Settings)
         run: |
-          # دانلود کلودفلرد
+          sudo echo '{
+            "log": { "loglevel": "warning" },
+            "inbounds": [{
+              "port": 6969,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{ "id": "e08044f5-0645-42bb-b18b-e64bcd3e1575" }],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {
+                  "path": "/api",
+                  "host": "mase.codol.ir",
+                  "mode": "auto",
+                  "extra": {
+                    "externalProxy": [
+                      {
+                        "dest": "react.dev",
+                        "port": 6969
+                      }
+                    ]
+                  }
+                }
+              }
+            }],
+            "outbounds": [{ "protocol": "freedom" }]
+          }' > /tmp/config.json
+          
+          sudo nohup xray -c /tmp/config.json &
+
+      - name: Run Cloudflare Tunnel
+        run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-
-          # اجرای تونل اول برای پنل (Port 2053)
-          echo "--- STARTING PANEL TUNNEL ---"
-          nohup ./cloudflared tunnel --url http://localhost:2053 > panel_link.log 2>&1 &
-          
-          # زمان برای ایجاد لینک
-          sleep 15
-          echo "Your Panel URL is:"
-          grep -o 'https://[-a-z0-9.]*trycloudflare.com' panel_link.log | head -n 1
-
-          # اجرای تونل دوم برای ورسل (Port 6969)
-          echo "--- STARTING VERCEL RELAY TUNNEL ---"
+          echo "--- TARGET FOR VERCEL ---"
           ./cloudflared tunnel --url http://localhost:6969
