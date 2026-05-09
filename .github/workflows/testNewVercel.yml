@@ -1,16 +1,33 @@
-name: Stable Proxy Test
+name: GitHub Runner Proxy Hub
 on: workflow_dispatch
 
 jobs:
-  test-server:
+  run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Run Server & Cloudflare Tunnel
+      - name: Install X-UI (Sanaei)
         run: |
-          echo "GitHub Runner is Alive via Cloudflare!" > index.html
-          nohup python3 -m http.server 8080 &
-          
-          # نصب و اجرای کلودفلر بدون نیاز به اکانت
+          # نصب پنل ثنایی به صورت سایلنت
+          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<EOF
+          y
+          admin
+          admin
+          2053
+          EOF
+
+      - name: Install & Run Cloudflare Tunnels
+        run: |
+          # دانلود کلودفلرد
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-          ./cloudflared tunnel --url http://localhost:8080
+
+          # اجرای تونل اول برای پنل (Port 2053)
+          echo "--- PANEL LINK ---"
+          nohup ./cloudflared tunnel --url http://localhost:2053 > panel_link.log 2>&1 &
+          sleep 5
+          grep -o 'https://[-a-z0-9.]*trycloudflare.com' panel_link.log
+
+          # ایجاد یک اینباند XHTTP در پنل به صورت خودکار (اختیاری - یا دستی انجام بده)
+          # اینجا فقط تونل دوم را برای پورت ۶۹۶۹ باز می‌کنیم
+          echo "--- VERCEL RELAY LINK ---"
+          ./cloudflared tunnel --url http://localhost:6969
