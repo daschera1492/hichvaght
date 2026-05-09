@@ -5,15 +5,14 @@ jobs:
   run-proxy:
     runs-on: ubuntu-latest
     steps:
-      - name: Install X-UI (Sanaei)
+      - name: Install and Setup X-UI
         run: |
-          # نصب با دسترسی sudo و تنظیمات خودکار
-          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh | sudo bash <<EOF
-          y
-          admin
-          admin
-          2053
-          EOF
+          # دانلود اسکریپت نصب
+          curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o install.sh
+          chmod +x install.sh
+          
+          # اجرای نصب با sudo و ارسال ورودی‌ها به صورت مستقیم
+          printf "y\nadmin\nadmin\n2053\n" | sudo ./install.sh
 
       - name: Install & Run Cloudflare Tunnels
         run: |
@@ -25,8 +24,8 @@ jobs:
           echo "--- STARTING PANEL TUNNEL ---"
           nohup ./cloudflared tunnel --url http://localhost:2053 > panel_link.log 2>&1 &
           
-          # صبر برای ایجاد لینک و استخراج آن
-          sleep 10
+          # زمان برای ایجاد لینک
+          sleep 15
           echo "Your Panel URL is:"
           grep -o 'https://[-a-z0-9.]*trycloudflare.com' panel_link.log | head -n 1
 
