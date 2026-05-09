@@ -1,0 +1,19 @@
+name: Simple Proxy Test
+on: workflow_dispatch # اجرای دستی
+
+jobs:
+  test-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Temporary Server
+        run: |
+          # ایجاد یک فایل تست
+          echo "GitHub Runner is Alive!" > index.html
+          # اجرای سرور در پس‌زمینه
+          nohup python3 -m http.server 8080 & 
+          # نصب wstunnel (فایلی که قبلاً بررسی کردیم)
+          curl -L https://github.com/erebe/wstunnel/releases/download/v10.5.5/wstunnel-x86_64-unknown-linux-musl -o wstunnel
+          chmod +x wstunnel
+          # اجرای تونل (فرض می‌کنیم از یک سرویس موقت برای تست استفاده می‌کنی)
+          # برای تست ساده، از یک سرویس مثل localtunnel استفاده می‌کنیم
+          npx localtunnel --port 8080
