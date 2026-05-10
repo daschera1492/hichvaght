@@ -6,7 +6,7 @@ jobs:
   establish-bridge:
     runs-on: ubuntu-latest
     steps:
-      - name: Connectivity Test
+      - name: TCP Connectivity Check
         run: |
-          # تست پینگ (ممکن است توسط دیتاسنتر مسدود باشد)
-          ping -c 4 87.107.12.8 || echo "Ping blocked"
+          # استفاده از nc (netcat) برای چک کردن باز بودن پورت TCP در سرور ایران [285، 522]
+          nc -zv -w 5 87.107.12.8 2333 || echo "Port is CLOSED or Filtered"
