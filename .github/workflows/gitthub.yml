@@ -1,6 +1,6 @@
 name: Ghost Bridge Operational
 on:
-  workflow_dispatch: # اجرای دستی برای پایداری بیشتر
+  workflow_dispatch:
 
 jobs:
   establish-bridge:
@@ -8,53 +8,70 @@ jobs:
     steps:
       - name: Environment Preparation
         run: |
-          sudo apt-get update && sudo apt-get install -y curl jq tar
+          sudo apt-get update && sudo apt-get install -y curl jq tar unzip
           
-          # دانلود دقیق نسخه GNU برای رانرهای x86_64 [1]
+          # ۱. دانلود و آماده‌سازی rathole
           curl -L "https://github.com/rathole-org/rathole/releases/download/dev-latest/rathole-dev-x86_64-unknown-linux-gnu.tar.gz" -o rathole_archive.tar.gz
-          
-          # استخراج در یک پوشه موقت برای جلوگیری از تداخل نام‌ها [2]
-          mkdir -p temp_rathole
-          tar -xzf rathole_archive.tar.gz -C temp_rathole
-          
-          # پیدا کردن فایل اجرایی واقعی و انتقال آن به روت
-          # فایل اجرایی معمولاً فاقد پسوند یا با نام rathole است
+          mkdir -p temp_rathole && tar -xzf rathole_archive.tar.gz -C temp_rathole
           find temp_rathole -type f -executable -exec mv {} ./rathole \;
-          
           chmod +x rathole
-          # تست کوتاه برای اطمینان از سالم بودن فایل قبل از اجرای اصلی
-          ./rathole --version || echo "File is still not executable"
 
-      - name: Network Signaling (Post Dynamic IP)
+          # ۲. دانلود و آماده‌سازی Xray-core (بخش جدید) [692، 728]
+          curl -L "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -o xray.zip
+          unzip -o xray.zip && chmod +x xray
+
+      - name: Network Signaling (Informative)
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          # استخراج آی‌پی عمومی رانر
           RUNNER_IP=$(curl -s https://ifconfig.me)
           echo "Runner IP: $RUNNER_IP"
-          
-          # آپدیت کردن Gist با آی‌پی جدید جهت اطلاع کلاینت در ایران [1]
+          # آپدیت Gist فقط برای مانیتورینگ زنده بودن رانر
           curl -X PATCH -H "Authorization: token $GH_TOKEN" \
                -H "Content-Type: application/json" \
-               -d "{\"files\": {\"connection.txt\": {\"content\": \"$RUNNER_IP\"}}}" \
+               -d "{\"files\": {\"connection.txt\": {\"content\": \"Runner active at $RUNNER_IP\"}}}" \
                https://api.github.com/gists/$GIST_ID
 
-      - name: Start Reverse Tunnel
+      - name: Start Xray and Reverse Tunnel
         run: |
-          # اصلاح فایل کانفیگ: bind_addr حذف و local_addr جایگزین شد [1, 2]
+          # ۳. ساخت کانفیگ Xray برای رانر (اینباند معادل X-UI) [15، 578]
+          cat <<EOF > xray_config.json
+          {
+            "inbounds": [{
+              "port": 443,
+              "listen": "127.0.0.1",
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "${{ secrets.VLESS_UUID }}"}],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {
+                  "mode": "packet-up",
+                  "path": "/api"
+                }
+              }
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+          
+          # ۴. اجرای Xray در پس‌زمینه [1]
+          ./xray -c xray_config.json &
+
+          # ۵. اجرای rathole برای اتصال به VPS
           cat <<EOF > client.toml
           [client]
-          remote_addr = "${{ secrets.VPS_IP }}:2333" # پورت اتصال به rathole سرور
-          
+          remote_addr = "${{ secrets.VPS_IP }}:2333"
           [client.services.vless]
           type = "tcp"
           token = "${{ secrets.RATHOLE_TOKEN }}"
-          local_addr = "127.0.0.1:443" # ترافیک دریافتی را به پورت 443 محلی می‌فرستد
+          local_addr = "127.0.0.1:443"
           EOF
           
-          # اجرای کلاینت
           ./rathole -c client.toml &
           
-          echo "Bridge is active. Connection logic: VPS:443 -> Runner -> Local:443"
+          echo "Ghost Bridge fully operational: VPS:443 -> Tunnel -> Runner:Xray"
           sleep 21000
