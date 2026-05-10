@@ -1,0 +1,47 @@
+name: Ghost Bridge Operational
+on:
+  workflow_dispatch: # اجرای دستی برای پایداری بیشتر
+
+jobs:
+  establish-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Environment Preparation
+        run: |
+          sudo apt-get update && sudo apt-get install -y curl jq
+          # دانلود rathole مخصوص لینوکس
+          curl -L https://github.com/rathole-org/rathole/releases/download/v0.5.0/rathole-x86_64-unknown-linux-musl.zip -o rathole.zip
+          unzip rathole.zip && chmod +x rathole
+
+      - name: Network Signaling (Post Dynamic IP)
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          # استخراج آی‌پی عمومی رانر
+          RUNNER_IP=$(curl -s https://ifconfig.me)
+          echo "Runner IP: $RUNNER_IP"
+          
+          # آپدیت کردن Gist با آی‌پی جدید جهت اطلاع کلاینت در ایران [1]
+          curl -X PATCH -H "Authorization: token $GH_TOKEN" \
+               -H "Content-Type: application/json" \
+               -d "{\"files\": {\"connection.txt\": {\"content\": \"$RUNNER_IP\"}}}" \
+               https://api.github.com/gists/$GIST_ID
+
+      - name: Start Reverse Tunnel
+        run: |
+          # ساخت فایل کانفیگ کلاینت rathole برای اتصال به VPS شما [2]
+          cat <<EOF > client.toml
+          [client]
+          remote_addr = "${{ secrets.VPS_IP }}:6969" # پورت rathole در سرور شما
+          [client.services.vless]
+          type = "tcp"
+          local_addr = "127.0.0.1:443" # پورت محلی که ترافیک را دریافت می‌کند
+          EOF
+          
+          # اجرای کلاینت در پس‌زمینه با قابلیت اتصال مجدد خودکار [3]
+          ./rathole -c client.toml &
+          
+          # زنده نگه داشتن جاب به مدت 6 ساعت (محدودیت گیت‌هاب) [595، 597]
+          echo "Bridge is active. Use the IP in Gist to connect."
+          sleep 21000 
