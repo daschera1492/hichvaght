@@ -6,72 +6,7 @@ jobs:
   establish-bridge:
     runs-on: ubuntu-latest
     steps:
-      - name: Environment Preparation
+      - name: Connectivity Test
         run: |
-          sudo apt-get update && sudo apt-get install -y curl jq tar unzip
-          
-          # ۱. دانلود و آماده‌سازی rathole
-          curl -L "https://github.com/rathole-org/rathole/releases/download/dev-latest/rathole-dev-x86_64-unknown-linux-gnu.tar.gz" -o rathole_archive.tar.gz
-          mkdir -p temp_rathole && tar -xzf rathole_archive.tar.gz -C temp_rathole
-          find temp_rathole -type f -executable -exec mv {} ./rathole \;
-          chmod +x rathole
-
-          # ۲. دانلود و آماده‌سازی Xray-core (بخش جدید) [692، 728]
-          curl -L "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -o xray.zip
-          unzip -o xray.zip && chmod +x xray
-
-      - name: Network Signaling (Informative)
-        env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-        run: |
-          RUNNER_IP=$(curl -s https://ifconfig.me)
-          echo "Runner IP: $RUNNER_IP"
-          # آپدیت Gist فقط برای مانیتورینگ زنده بودن رانر
-          curl -X PATCH -H "Authorization: token $GH_TOKEN" \
-               -H "Content-Type: application/json" \
-               -d "{\"files\": {\"connection.txt\": {\"content\": \"Runner active at $RUNNER_IP\"}}}" \
-               https://api.github.com/gists/$GIST_ID
-
-      - name: Start Xray and Reverse Tunnel
-        run: |
-          # ۳. ساخت کانفیگ Xray برای رانر (اینباند معادل X-UI) [15، 578]
-          cat <<EOF > xray_config.json
-          {
-            "inbounds": [{
-              "port": 443,
-              "listen": "127.0.0.1",
-              "protocol": "vless",
-              "settings": {
-                "clients": [{"id": "${{ secrets.VLESS_UUID }}"}],
-                "decryption": "none"
-              },
-              "streamSettings": {
-                "network": "xhttp",
-                "xhttpSettings": {
-                  "mode": "packet-up",
-                  "path": "/api"
-                }
-              }
-            }],
-            "outbounds": [{"protocol": "freedom"}]
-          }
-          EOF
-          
-          # ۴. اجرای Xray در پس‌زمینه [1]
-          ./xray -c xray_config.json &
-
-          # ۵. اجرای rathole برای اتصال به VPS
-          cat <<EOF > client.toml
-          [client]
-          remote_addr = "${{ secrets.VPS_IP }}:2333"
-          [client.services.vless]
-          type = "tcp"
-          token = "${{ secrets.RATHOLE_TOKEN }}"
-          local_addr = "127.0.0.1:443"
-          EOF
-          
-          ./rathole -c client.toml &
-          
-          echo "Ghost Bridge fully operational: VPS:443 -> Tunnel -> Runner:Xray"
-          sleep 21000
+          # تست پینگ (ممکن است توسط دیتاسنتر مسدود باشد)
+          ping -c 4 87.107.12.8 || echo "Ping blocked"
