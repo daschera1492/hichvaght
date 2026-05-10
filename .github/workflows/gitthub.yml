@@ -8,18 +8,22 @@ jobs:
     steps:
       - name: Environment Preparation
         run: |
-          sudo apt-get update && sudo apt-get install -y curl jq
+          sudo apt-get update && sudo apt-get install -y curl jq tar
           
-          # دانلود نسخه توسعه rathole که لینک دادید
-          curl -L "https://github.com/rathole-org/rathole/releases/download/dev-latest/rathole-dev-x86_64-unknown-linux-gnu.tar.gz" -o rathole.tar.gz
+          # دانلود دقیق نسخه GNU برای رانرهای x86_64 [1]
+          curl -L "https://github.com/rathole-org/rathole/releases/download/dev-latest/rathole-dev-x86_64-unknown-linux-gnu.tar.gz" -o rathole_archive.tar.gz
           
-          # استخراج فایل tar.gz (به جای unzip از دستور tar استفاده می‌کنیم)
-          tar -xzf rathole.tar.gz
+          # استخراج در یک پوشه موقت برای جلوگیری از تداخل نام‌ها [2]
+          mkdir -p temp_rathole
+          tar -xzf rathole_archive.tar.gz -C temp_rathole
           
-          # پیدا کردن فایل اجرایی rathole (ممکن است نامش rathole-dev باشد)
-          # و تغییر نام آن به rathole برای استفاده در مراحل بعدی
-          find . -name "rathole*" -type f -exec mv {} rathole \;
+          # پیدا کردن فایل اجرایی واقعی و انتقال آن به روت
+          # فایل اجرایی معمولاً فاقد پسوند یا با نام rathole است
+          find temp_rathole -type f -executable -exec mv {} ./rathole \;
+          
           chmod +x rathole
+          # تست کوتاه برای اطمینان از سالم بودن فایل قبل از اجرای اصلی
+          ./rathole --version || echo "File is still not executable"
 
       - name: Network Signaling (Post Dynamic IP)
         env:
