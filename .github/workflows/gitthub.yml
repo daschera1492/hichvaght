@@ -42,20 +42,19 @@ jobs:
 
       - name: Start Reverse Tunnel
         run: |
-          # ساخت فایل کانفیگ کلاینت rathole با توکن اجباری [252، 253]
+          # اصلاح فایل کانفیگ: bind_addr حذف و local_addr جایگزین شد [1, 2]
           cat <<EOF > client.toml
           [client]
-          remote_addr = "${{ secrets.VPS_IP }}:2333" # پورت rathole در سرور شما
+          remote_addr = "${{ secrets.VPS_IP }}:2333" # پورت اتصال به rathole سرور
           
           [client.services.vless]
           type = "tcp"
-          token = "${{ secrets.RATHOLE_TOKEN }}" # توکن امنیتی ست شد
-          bind_addr = "0.0.0.0:443" # رانر روی پورت 443 گوش می‌دهد [1]
-          local_addr = "127.0.0.1:443" # هدایت ترافیک به داخل تونل
+          token = "${{ secrets.RATHOLE_TOKEN }}"
+          local_addr = "127.0.0.1:443" # ترافیک دریافتی را به پورت 443 محلی می‌فرستد
           EOF
           
           # اجرای کلاینت
           ./rathole -c client.toml &
           
-          echo "Bridge is active with token security. Use the IP in Gist to connect."
-          sleep 21000 
+          echo "Bridge is active. Connection logic: VPS:443 -> Runner -> Local:443"
+          sleep 21000
