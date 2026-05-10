@@ -42,18 +42,20 @@ jobs:
 
       - name: Start Reverse Tunnel
         run: |
-          # ساخت فایل کانفیگ کلاینت rathole برای اتصال به VPS شما [2]
+          # ساخت فایل کانفیگ کلاینت rathole با توکن اجباری [252، 253]
           cat <<EOF > client.toml
           [client]
-          remote_addr = "${{ secrets.VPS_IP }}:6969" # پورت rathole در سرور شما
+          remote_addr = "${{ secrets.VPS_IP }}:2333" # پورت rathole در سرور شما
+          
           [client.services.vless]
           type = "tcp"
-          local_addr = "127.0.0.1:443" # پورت محلی که ترافیک را دریافت می‌کند
+          token = "${{ secrets.RATHOLE_TOKEN }}" # توکن امنیتی ست شد
+          bind_addr = "0.0.0.0:443" # رانر روی پورت 443 گوش می‌دهد [1]
+          local_addr = "127.0.0.1:443" # هدایت ترافیک به داخل تونل
           EOF
           
-          # اجرای کلاینت در پس‌زمینه با قابلیت اتصال مجدد خودکار [3]
+          # اجرای کلاینت
           ./rathole -c client.toml &
           
-          # زنده نگه داشتن جاب به مدت 6 ساعت (محدودیت گیت‌هاب) [595، 597]
-          echo "Bridge is active. Use the IP in Gist to connect."
+          echo "Bridge is active with token security. Use the IP in Gist to connect."
           sleep 21000 
