@@ -8,16 +8,18 @@ jobs:
     steps:
       - name: Environment Preparation
         run: |
-          sudo apt-get update && sudo apt-get install -y curl jq unzip
+          sudo apt-get update && sudo apt-get install -y curl jq
           
-          # استفاده از GitHub CLI برای دانلود مطمئن آخرین نسخه rathole [136، 139]
-          gh release download v0.5.0 --repo rathole-org/rathole --pattern "*x86_64-unknown-linux-musl.zip" --output rathole.zip
+          # دانلود نسخه توسعه rathole که لینک دادید
+          curl -L "https://github.com/rathole-org/rathole/releases/download/dev-latest/rathole-dev-x86_64-unknown-linux-gnu.tar.gz" -o rathole.tar.gz
           
-          # استخراج فایل
-          unzip -o rathole.zip
+          # استخراج فایل tar.gz (به جای unzip از دستور tar استفاده می‌کنیم)
+          tar -xzf rathole.tar.gz
+          
+          # پیدا کردن فایل اجرایی rathole (ممکن است نامش rathole-dev باشد)
+          # و تغییر نام آن به rathole برای استفاده در مراحل بعدی
+          find . -name "rathole*" -type f -exec mv {} rathole \;
           chmod +x rathole
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # استفاده از توکن داخلی برای دسترسی به API
 
       - name: Network Signaling (Post Dynamic IP)
         env:
