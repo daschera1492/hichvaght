@@ -3,7 +3,7 @@ name: Ubuntu Tailscale Auto Exit Node (5h - Tehran Time)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'   # اجرا هر 4 ساعت
+    - cron: '0 */3 * * *'   # اجرا هر 4 ساعت
 
 jobs:
   tailscale-exit:
