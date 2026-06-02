@@ -43,7 +43,28 @@ jobs:
           COUNTRY=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
           CITY=$(curl -s https://ipinfo.io/city)
 
-          # حذف فاصله و کاراکترهای غیرمجاز
+          # ساخت پرچم
+          if [ "$COUNTRY" = "us" ]; then
+            FLAG="🇺🇸"
+          elif [ "$COUNTRY" = "de" ]; then
+            FLAG="🇩🇪"
+          elif [ "$COUNTRY" = "nl" ]; then
+            FLAG="🇳🇱"
+          elif [ "$COUNTRY" = "gb" ]; then
+            FLAG="🇬🇧"
+          elif [ "$COUNTRY" = "fr" ]; then
+            FLAG="🇫🇷"
+          elif [ "$COUNTRY" = "ca" ]; then
+            FLAG="🇨🇦"
+          elif [ "$COUNTRY" = "jp" ]; then
+            FLAG="🇯🇵"
+          elif [ "$COUNTRY" = "sg" ]; then
+            FLAG="🇸🇬"
+          else
+            FLAG="🏳️"
+          fi
+
+          # تمیز کردن نام شهر
           CITY_CLEAN=$(echo "$CITY" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/ /-/g' \
