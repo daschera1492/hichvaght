@@ -56,7 +56,7 @@ jobs:
           END_TIME=$(TZ=Asia/Tehran date -d '+5 hour' +'%H-%M')
 
           # hostname نهایی
-          HOSTNAME="${CITY_CLEAN}-[${START_TIME}]-[${END_TIME}]"
+          HOSTNAME="${CITY_CLEAN}--${START_TIME}--${END_TIME}"
 
           echo "================================="
           echo "Country : $COUNTRY"
