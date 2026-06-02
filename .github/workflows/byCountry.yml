@@ -1,4 +1,3 @@
-```yaml id="a4d5g2"
 name: Ubuntu Tailscale Auto Exit Node
 
 on:
@@ -166,4 +165,3 @@ jobs:
           echo "======================================"
 
           sleep 18000
-```
