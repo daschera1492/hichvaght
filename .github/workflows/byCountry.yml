@@ -1,0 +1,183 @@
+```yaml
+name: Ubuntu Tailscale Auto Exit Node (Smart Naming)
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # هر 3 ساعت اجرا شود
+    - cron: '0 */3 * * *'
+
+jobs:
+  tailscale-exit:
+    runs-on: ubuntu-latest
+
+    # حدود 5 ساعت روشن بماند
+    timeout-minutes: 298
+
+    steps:
+
+      # ---------------------------
+      # Update System
+      # ---------------------------
+      - name: Update system
+        run: |
+          sudo apt update -y
+
+      # ---------------------------
+      # Install Packages
+      # ---------------------------
+      - name: Install prerequisites
+        run: |
+          sudo apt install -y \
+            curl \
+            jq \
+            lsb-release \
+            iptables
+
+      # ---------------------------
+      # Detect Server Location
+      # ---------------------------
+      - name: Detect server location
+        run: |
+
+          COUNTRY=$(curl -s https://ipinfo.io/country)
+          CITY=$(curl -s https://ipinfo.io/city)
+
+          # حذف فاصله‌ها
+          CITY_CLEAN=$(echo "$CITY" | tr ' ' '-')
+
+          # تبدیل کشور به پرچم
+          if [ "$COUNTRY" = "US" ]; then
+            FLAG="🇺🇸"
+          elif [ "$COUNTRY" = "DE" ]; then
+            FLAG="🇩🇪"
+          elif [ "$COUNTRY" = "NL" ]; then
+            FLAG="🇳🇱"
+          elif [ "$COUNTRY" = "GB" ]; then
+            FLAG="🇬🇧"
+          elif [ "$COUNTRY" = "FR" ]; then
+            FLAG="🇫🇷"
+          elif [ "$COUNTRY" = "CA" ]; then
+            FLAG="🇨🇦"
+          elif [ "$COUNTRY" = "JP" ]; then
+            FLAG="🇯🇵"
+          else
+            FLAG="🏳️"
+          fi
+
+          # ساعت شروع به وقت تهران
+          START_TIME=$(TZ=Asia/Tehran date +'%H:%M')
+
+          # ساعت پایان (5 ساعت بعد)
+          END_TIME=$(TZ=Asia/Tehran date -d '+5 hour' +'%H:%M')
+
+          # hostname نهایی
+          HOSTNAME="${FLAG}-${CITY_CLEAN}-${START_TIME}-${END_TIME}"
+
+          echo "Detected Country: $COUNTRY"
+          echo "Detected City: $CITY"
+          echo "Using Hostname: $HOSTNAME"
+
+          echo "HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
+
+      # ---------------------------
+      # Add Tailscale GPG Key
+      # ---------------------------
+      - name: Add Tailscale GPG key
+        run: |
+          curl -fsSL \
+          https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg \
+          | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+      # ---------------------------
+      # Add Tailscale Repository
+      # ---------------------------
+      - name: Add Tailscale repository
+        run: |
+          curl -fsSL \
+          https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list \
+          | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+      # ---------------------------
+      # Install Tailscale
+      # ---------------------------
+      - name: Install Tailscale
+        run: |
+          sudo apt update
+          sudo apt install -y tailscale
+
+      # ---------------------------
+      # Enable IP Forwarding
+      # ---------------------------
+      - name: Enable IP forwarding
+        run: |
+
+          echo 'net.ipv4.ip_forward = 1' \
+          | sudo tee /etc/sysctl.d/99-tailscale.conf
+
+          echo 'net.ipv6.conf.all.forwarding = 1' \
+          | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+
+          sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+      # ---------------------------
+      # Start tailscaled
+      # ---------------------------
+      - name: Start tailscaled
+        run: |
+          sudo systemctl enable --now tailscaled
+
+      # ---------------------------
+      # Connect to Tailscale
+      # ---------------------------
+      - name: Connect to Tailscale
+        run: |
+
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --advertise-exit-node \
+            --advertise-tags=tag:exit-node \
+            --hostname="$HOSTNAME"
+
+      # ---------------------------
+      # Configure NAT
+      # ---------------------------
+      - name: Configure iptables NAT
+        run: |
+
+          DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+          echo "Default Interface: $DEFAULT_IF"
+
+          sudo iptables -A FORWARD -i tailscale0 -o $DEFAULT_IF -j ACCEPT
+
+          sudo iptables -A FORWARD \
+            -i $DEFAULT_IF \
+            -o tailscale0 \
+            -m state --state RELATED,ESTABLISHED \
+            -j ACCEPT
+
+          sudo iptables -t nat -A POSTROUTING -o $DEFAULT_IF -j MASQUERADE
+
+      # ---------------------------
+      # Show Status
+      # ---------------------------
+      - name: Tailscale status
+        run: |
+          tailscale status
+
+      # ---------------------------
+      # Keep Runner Alive
+      # ---------------------------
+      - name: Keep runner alive
+        run: |
+
+          echo "======================================"
+          echo "Exit Node is ACTIVE"
+          echo "Hostname: $HOSTNAME"
+          echo "Keeping runner alive for 5 hours..."
+          echo "======================================"
+
+          sleep 18000
+```
