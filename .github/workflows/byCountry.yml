@@ -1,4 +1,3 @@
-```yaml
 name: Ubuntu Tailscale Auto Exit Node (Smart Naming)
 
 on:
@@ -180,4 +179,3 @@ jobs:
           echo "======================================"
 
           sleep 18000
-```
