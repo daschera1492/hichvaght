@@ -1,0 +1,23 @@
+name: KVM Probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe KVM
+        run: |
+          echo "=== /dev/kvm ==="
+          ls -l /dev/kvm 2>&1 || true
+          echo "=== cpu virt flags ==="
+          (grep -m1 -oE 'vmx|svm' /proc/cpuinfo && echo "-> virt flags PRESENT") || echo "-> NO vmx/svm in cpuinfo"
+          echo "=== model ==="
+          grep -m1 "model name" /proc/cpuinfo || true
+          echo "=== hypervisor ==="
+          (grep -m1 -oE 'hypervisor_vendor.*|model name.*' /proc/cpuinfo || true)
+          grep -m1 hypervisor /proc/cpuinfo || echo "no hypervisor line"
+          echo "=== result ==="
+          if [ -e /dev/kvm ]; then echo "KVM=PRESENT"; else echo "KVM=ABSENT"; fi
+          exit 1
