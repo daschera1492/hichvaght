@@ -1,0 +1,156 @@
+name: Android VM v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android-vm:
+    runs-on: ubuntu-latest
+    # حدود 5 ساعت (زیر سقف 6 ساعته GitHub)
+    timeout-minutes: 298
+
+    steps:
+      # -----------------------------------
+      # Hardware info
+      # -----------------------------------
+      - name: Show hardware
+        run: |
+          nproc
+          free -h
+          df -h /
+          lscpu | grep -iE "model name|vmx|svm" || echo "(no virt flags)"
+
+      # -----------------------------------
+      # Check KVM (شتاب سخت‌افزاری)
+      # -----------------------------------
+      - name: Check /dev/kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "KVM=YES" >> $GITHUB_ENV
+            ls -l /dev/kvm
+          else
+            echo "KVM=NO" >> $GITHUB_ENV
+            echo "KVM not available -> Android boots in software mode (TCG, slower)"
+          fi
+
+      # -----------------------------------
+      # Install packages
+      # -----------------------------------
+      - name: Install packages
+        run: |
+          sudo apt update -y
+          sudo apt install -y curl jq lsb-release qemu-system-x86 qemu-utils
+
+      # -----------------------------------
+      # Tailscale (same pattern as exit1.yml)
+      # -----------------------------------
+      - name: Add Tailscale GPG key
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+      - name: Add Tailscale repository
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+      - name: Install Tailscale
+        run: |
+          sudo apt update
+          sudo apt install -y tailscale
+
+      - name: Start tailscaled
+        run: |
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-android-${{ github.run_id }} --accept-routes
+          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          tailscale status
+
+      # -----------------------------------
+      # Cache ISO (هر بار دوباره دانلود نشود)
+      # -----------------------------------
+      - name: Cache Android ISO
+        id: cache-iso
+        uses: actions/cache@v4
+        with:
+          path: android.iso
+          key: android-x86-9.0-r2-${{ runner.os }}-v1
+
+      # -----------------------------------
+      # Download Android-x86 ISO (resume + retry + size check)
+      # -----------------------------------
+      - name: Download Android-x86 ISO
+        if: steps.cache-iso.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL="https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
+          EXPECT=965738496   # 921MB — سایز دقیق فایل
+          for i in $(seq 1 8); do
+            echo "=== download attempt $i ==="
+            # -C - : ادامه از جایی که قطع شده (کلید اصلی!)  -L : دنبال کردن redirect
+            if curl -fL -C - --retry 3 --retry-delay 5 --progress-bar -o android.iso "$URL"; then
+              echo "DOWNLOAD_OK attempt=$i"
+              break
+            fi
+            echo "attempt $i cut -> resuming next loop (partial file kept)"
+            sleep 5
+          done
+          ACTUAL=$(stat -c%s android.iso)
+          echo "size=$ACTUAL expected=$EXPECT"
+          if [ "$ACTUAL" != "$EXPECT" ]; then
+            echo "FATAL: size mismatch (partial/corrupt download)"
+            exit 1
+          fi
+          ls -lh android.iso
+          file android.iso
+
+      # -----------------------------------
+      # Boot Android VM (Live mode) + VNC
+      # -----------------------------------
+      - name: Boot Android VM
+        run: |
+          qemu-img create -f qcow2 android-disk.qcow2 16G
+          KVM_FLAG=""
+          if [ "$KVM" = "YES" ]; then KVM_FLAG="-enable-kvm -cpu host"; fi
+          nohup sudo qemu-system-x86_64 \
+            -m 4096 -smp 2 $KVM_FLAG \
+            -cdrom android.iso \
+            -drive file=android-disk.qcow2,format=qcow2,if=ide \
+            -boot d \
+            -usb -device usb-tablet \
+            -vga std \
+            -display vnc=127.0.0.1:1 \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            > qemu.log 2>&1 &
+          echo "QEMU_PID=$!" >> $GITHUB_ENV
+          sleep 25
+          echo "--- qemu.log ---"
+          tail -30 qemu.log
+          ss -tlnp 2>/dev/null | grep 5901 || echo "VNC not listening yet (still booting)"
+
+      # -----------------------------------
+      # Expose VNC only inside the tailnet
+      # -----------------------------------
+      - name: Expose VNC over Tailscale
+        run: |
+          sudo tailscale serve --bg --tcp 5901 tcp://127.0.0.1:5901 || true
+          sudo tailscale serve status || true
+
+      # -----------------------------------
+      # Keep alive + info
+      # -----------------------------------
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  ANDROID VM READY"
+          echo "  Tailscale IP : $TS_IP"
+          echo "  VNC address  : $TS_IP:5901"
+          echo "  (connect with any VNC client)"
+          echo "======================================"
+          while true; do
+            sleep 300
+            ts=$(tailscale ip -4 2>/dev/null || echo -)
+            q=$(pgrep -c qemu-system || echo 0)
+            echo "[$(date -u +%H:%M:%S)] alive | ts=$ts | qemu=$q"
+          done
