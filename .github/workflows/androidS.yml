@@ -1,4 +1,4 @@
-name: Android VM v2
+name: Android VM vs
 
 on:
   workflow_dispatch:
