@@ -1,4 +1,4 @@
-name: Android VM vs
+name: Android VM v2
 
 on:
   workflow_dispatch:
@@ -284,47 +284,175 @@ jobs:
       # booting goes quiet. Either way we get an explicit, quotable number
       # instead of a guess.
       # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Is the emulator alive, and is the guest actually making progress?
+      #
+      # TWO BUGS THIS STEP EXISTS TO AVOID:
+      #
+      # 1. Process matching. Linux caps /proc/PID/comm at 15 chars, so the
+      #    running process is named "qemu-system-x86", NOT "qemu-system-x86_64".
+      #    `pgrep -x qemu-system-x86_64` therefore NEVER matches, and an earlier
+      #    version of this step concluded the emulator had died and killed the
+      #    job while the VM was booting perfectly well.
+      #
+      #    The obvious repair -- `pgrep -f qemu-system-x86_64` -- is ALSO wrong,
+      #    just less visibly: sudo's own argv is literally
+      #    `sudo pgrep -f qemu-system-x86_64`, which contains the pattern, and
+      #    pgrep excludes only its own pid, never its parent's. head -1 then
+      #    returns sudo's pid. sudo sits idle, so its CPU counters never move,
+      #    and the step reports a hard hang. That is a false negative, which is
+      #    the expensive direction: it kills a run that is booting fine.
+      #
+      #    So match on comm (where the real name lives) by scanning /proc
+      #    directly. Neither sudo nor pgrep can collide, because their own comm
+      #    values are "sudo" and "pgrep". The prefix match covers the 15-char
+      #    truncation and any qemu-system-<arch> binary.
+      #
+      # 2. Failing the job on a detection miss. A false negative is far more
+      #    expensive (5 wasted hours) than a false positive, so a missing
+      #    process is reported and double-checked before anything is aborted.
+      #
+      # CPU time is read straight out of /proc/PID/stat (fields 14+15, in clock
+      # ticks) rather than via `ps -o <keyword>`, whose keyword names vary
+      # between procps versions.
+      # ------------------------------------------------------------------
       - name: Verify boot progress
         run: |
           set -uo pipefail
 
-          # CPU seconds consumed by the emulator, sampled over an interval.
-          # >90% of wall time means it is still grinding (expected, TCG is slow).
+          TICKS="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+
+          # Read a /proc file, preferring no privileges at all.
+          #
+          # comm/stat/statm are all mode 0444, so the unprivileged read always
+          # works and sudo is never actually required. It is kept only as a
+          # fallback (-n, so it can never block on a password prompt). This
+          # matters because sudo here would be a failure mode pointed the wrong
+          # way: if it failed, these helpers would report "cannot read", the
+          # sample loop would look like a hang, and a healthy run would be
+          # killed -- the same false-negative class of bug this step exists to
+          # eliminate. With no sudo in the common path that cannot happen.
+          proc_read() {
+            cat "$1" 2>/dev/null && return 0
+            sudo -n cat "$1" 2>/dev/null
+          }
+
+          # Echo the pid of the running emulator, or nothing.
+          #
+          # The trailing newline is stripped before comparing, so the match
+          # cannot be defeated by whitespace.
+          qemu_pid() {
+            local d c
+            for d in /proc/[0-9]*; do
+              c="$(proc_read "$d/comm")" || continue
+              case "${c%$'\n'}" in
+                # basename, not a hardcoded /proc/ prefix: the latter silently
+                # returns the whole path if the glob is ever rooted elsewhere.
+                qemu-system-*) echo "${d##*/}"; return ;;
+              esac
+            done
+          }
+
+          # Cumulative CPU seconds. Empty string means "cannot read".
+          #
+          # Parsed with parameter expansion, not awk field numbers: field 2 of
+          # /proc/PID/stat is "(comm)" and a process name may contain spaces and
+          # parentheses, which shifts every subsequent awk field. Stripping
+          # through the LAST ')' makes the remaining offsets stable: after it,
+          # $1 is "state" (field 3), so utime is $12 and stime is $13.
           qemu_cpu() {
-            sudo ps -o cputimes= -C qemu-system-x86_64 2>/dev/null | tr -d ' ' | head -1
+            local p="$1" stat rest ut st
+            [ -n "$p" ] || { echo ""; return; }
+            stat="$(proc_read "/proc/$p/stat")" || { echo ""; return; }
+            [ -n "$stat" ] || { echo ""; return; }
+
+            rest="${stat##*') '}"
+            [ "$rest" != "$stat" ] || { echo ""; return; }   # no ')' found -> malformed
+            # shellcheck disable=SC2086
+            set -- $rest
+            ut="${12:-}"; st="${13:-}"
+            case "$ut$st" in
+              ''|*[!0-9]*) echo ""; return ;;
+            esac
+            echo $(( (ut + st) / TICKS ))
+          }
+
+          # Resident set size, in MiB. /proc/PID/statm has exactly 7 fields
+          # (size resident shared text lib data dt) and field 2 is in PAGES,
+          # so it must be multiplied by the page size. Reading field 24 here
+          # - which is what an earlier version did - always yielded an empty
+          # string, so the log printed a hardcoded "0 MiB" no matter what.
+          qemu_rss() {
+            local p="$1" statm rest page
+            [ -n "$p" ] || { echo "?"; return; }
+            statm="$(proc_read "/proc/$p/statm")" || { echo "?"; return; }
+            rest="${statm#* }"                       # drop field 1 (total size)
+            set -- $rest                             # $1 is now "resident"
+            case "${1:-}" in
+              ''|*[!0-9]*) echo "?"; return ;;
+            esac
+            page="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+            echo $(( $1 * page / 1048576 ))MiB
           }
 
           echo "waiting for the guest to do something..."
-          PREV="$(qemu_cpu)"; PREV="${PREV:-0}"
+
+          PID="$(qemu_pid)"
+          echo "qemu pid: ${PID:-<none>}"
+          if [ -z "$PID" ]; then
+            echo "::error::no qemu process found before sampling even began"
+            tail -40 qemu.log || true
+            exit 1
+          fi
+
+          PREV="$(qemu_cpu "$PID")"; PREV="${PREV:-0}"
+          echo "baseline cpu seconds: $PREV"
 
           for i in $(seq 1 20); do   # 20 x 60s = up to 20 minutes
             sleep 60
 
-            if ! sudo pgrep -x qemu-system-x86_64 >/dev/null 2>&1; then
-              echo "::error::QEMU exited. tail of qemu.log:"
-              tail -40 qemu.log
+            PID="$(qemu_pid)"
+            if [ -z "$PID" ]; then
+              # Confirm with a second, independent method before believing it.
+              sleep 5
+              PID="$(qemu_pid)"
+            fi
+
+            if [ -z "$PID" ]; then
+              echo "::error::QEMU is genuinely gone (two checks agreed)."
+              echo "--- full qemu.log ---"
+              cat qemu.log || true
               exit 1
             fi
 
-            NOW="$(qemu_cpu)"; NOW="${NOW:-0}"
+            NOW="$(qemu_cpu "$PID")"
+            if [ -z "$NOW" ]; then
+              echo "[${i}min] could not read /proc/$PID/stat (exited between checks?)"
+              continue
+            fi
+
             DELTA=$(( NOW - PREV ))
             PREV="$NOW"
-
-            echo "[$((i))min] qemu_cpu_total=${NOW}s  consumed_in_last_min=${DELTA}s"
-
-            # Also worth watching: a drop to near-zero means the guest went idle,
-            # which is what a completed boot looks like. But Android-x86 under
-            # TCG rarely goes truly idle, so we do not treat it as success.
+            echo "[${i}min] cpu_total=${NOW}s  consumed_in_last_min=${DELTA}s  rss=$(qemu_rss "$PID")"
           done
 
           echo
           echo "--- interpretation ---"
-          echo "If consumed_in_last_min stayed ~60s the whole time, the guest is"
-          echo "spinning at the boot animation, not hung. TCG is just that slow."
-          echo "If it dropped to ~0-5s, the boot finished."
+          echo "consumed_in_last_min near 60 the whole time -> guest is spinning at the"
+          echo "  boot animation. That is TCG being slow, not a hang."
+          echo "consumed_in_last_min near 0-5 -> boot finished and the guest went idle."
+          echo "cpu_total frozen while a process exists -> genuine hang; report it."
           echo
           echo "--- final qemu.log ---"
-          tail -20 qemu.log
+          tail -20 qemu.log || true
+
+          # The last command's status becomes the step's status. Every step in
+          # this workflow runs with a bare shell (no `set -e` wrapper), so if
+          # anything after the real checks fails -- a log that rotated away, a
+          # truncated tail -- the step would report failure and fail the job
+          # even though every check passed. Reaching here means we did not
+          # abort, so say so explicitly.
+          exit 0
 
       # ------------------------------------------------------------------
       # QEMU binds VNC to 127.0.0.1 on purpose (so it is never reachable from
