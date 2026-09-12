@@ -1,4 +1,4 @@
-name: Android VM vs
+name: Android VM v2
 
 on:
   workflow_dispatch:
@@ -28,12 +28,18 @@ env:
 
   # --- display ------------------------------------------------------------
   # VNC display :1  ->  TCP 5901, bound to loopback, exposed only inside the
-  # tailnet via `tailscale serve`.
+  # tailnet via `tailscale serve` / socat.
+  #
+  # NO VNC PASSWORD, deliberately. Rationale:
+  #   - the port is only ever reachable from inside your tailnet, and the
+  #     tailnet ACL is the real access boundary, not the VNC password
+  #   - RFB (the VNC protocol) caps passwords at 8 characters, so anything
+  #     longer is silently truncated server-side -> "authentication failed"
+  #   - QEMU has no command-line flag for it; it must be set through the
+  #     monitor socket after boot, which is one more silent failure point
+  # Net effect: the password added breakage without adding a real boundary.
   VNC_DISPLAY: "1"
   VNC_PORT: "5901"
-  # Optional. Empty -> falls back to a default in the script below.
-  # VNC passwords are capped at 8 chars by the RFB protocol.
-  VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
 
   # --- ISO identity -------------------------------------------------------
   ISO_URL: "https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
@@ -208,9 +214,6 @@ jobs:
           set -euo pipefail
           qemu-img create -f qcow2 android-disk.qcow2 16G
 
-          VNC_PW="${VNC_PASSWORD:-android}"
-          echo "VNC_PW=$VNC_PW" >> "$GITHUB_ENV"
-
           # No -enable-kvm branch: KVM is never present here, and pretending
           # otherwise just hides which code path actually ran.
           nohup sudo qemu-system-x86_64 \
@@ -222,7 +225,7 @@ jobs:
             -boot d \
             -usb -device usb-tablet \
             -vga std \
-            -display "vnc=127.0.0.1:${VNC_DISPLAY},password=on" \
+            -display "vnc=127.0.0.1:${VNC_DISPLAY}" \
             -monitor "unix:/tmp/qemu-mon.sock,server,nowait" \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
             > qemu.log 2>&1 &
@@ -232,27 +235,6 @@ jobs:
           echo "--- qemu.log ---"
           tail -30 qemu.log
           ss -tlnp 2>/dev/null | grep "$VNC_PORT" || echo "VNC not listening yet (still booting)"
-
-      # ------------------------------------------------------------------
-      # Set the VNC password through the monitor socket.
-      # QEMU has no command-line flag for this, so the monitor is the only way.
-      # Best-effort: if it fails, the VM keeps booting and Tailscale ACLs are
-      # still the real access boundary.
-      # ------------------------------------------------------------------
-      - name: Set VNC password
-        run: |
-          SOCK=/tmp/qemu-mon.sock
-          for _ in $(seq 1 30); do
-            [ -S "$SOCK" ] && break
-            sleep 2
-          done
-          if [ -S "$SOCK" ]; then
-            printf 'change vnc password %s\n' "$VNC_PW" | socat - UNIX-CONNECT:"$SOCK" \
-              && echo "VNC password set" \
-              || echo "::warning::could not set VNC password, continuing without it"
-          else
-            echo "::warning::monitor socket never appeared, skipping VNC password"
-          fi
 
       # ------------------------------------------------------------------
       # QEMU binds VNC to 127.0.0.1 on purpose (so it is never reachable from
@@ -303,14 +285,13 @@ jobs:
             echo "|---|---|"
             echo "| **Tailscale IP** | \`${TS_IP}:${VNC_PORT}\` |"
             echo "| **MagicDNS** | \`${TS_NAME}:${VNC_PORT}\` |"
-            echo "| **VNC password** | \`${VNC_PW}\` |"
             echo "| Acceleration | TCG (\`$TCG_OPTS\`), cpu=\`$GUEST_CPU\` |"
             echo
-            echo "Connect any VNC client to either address above."
+            echo "Connect any VNC client to either address above. No password."
             echo "For usable speed: set color depth to 8-bit and encoding to Tight."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "::notice::VNC ready at ${TS_IP}:${VNC_PORT} (password: ${VNC_PW})"
+          echo "::notice::VNC ready at ${TS_IP}:${VNC_PORT} (no password)"
 
       # ------------------------------------------------------------------
       - name: Keep alive
@@ -320,7 +301,7 @@ jobs:
           echo ""
           echo "  Tailscale IP : ${TS_IP}:${VNC_PORT}"
           echo "  MagicDNS     : ${TS_NAME}:${VNC_PORT}"
-          echo "  VNC password : ${VNC_PW}"
+          echo "  Password     : (none)"
           echo ""
           echo "  Connect with any VNC client."
           echo "=============================================="
@@ -329,6 +310,6 @@ jobs:
             sleep 300
             ts="$(tailscale ip -4 2>/dev/null || echo -)"
             q="$(pgrep -c qemu-system || echo 0)"
-            echo "[$(date -u +%H:%M:%S)] alive | ${ts}:${VNC_PORT} | qemu=${q} | pw=${VNC_PW}"
+            echo "[$(date -u +%H:%M:%S)] alive | ${ts}:${VNC_PORT} | qemu=${q}"
             echo "   (tip: 8-bit color + Tight encoding for usable speed)"
           done
