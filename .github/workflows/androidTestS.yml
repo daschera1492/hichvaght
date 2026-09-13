@@ -164,13 +164,19 @@ jobs:
         run: |
           echo "--- groups of current user ---"
           id
-          echo "--- real qemu-system-x86_64 PID (not the sudo wrapper) ---"
-          REAL_PID=$(pgrep -f qemu-system-x86_64 | head -n1)
-          echo "REAL_PID=$REAL_PID (QEMU_PID env was $QEMU_PID)"
-          echo "--- open file descriptors of the real qemu process ---"
-          sudo ls -l /proc/$REAL_PID/fd 2>/dev/null | grep -i kvm && echo "KVM IS ACTIVELY IN USE" || echo "KVM NOT OPENED BY QEMU -> running on TCG (software)"
-          echo "--- full cmdline actually used ---"
-          sudo tr '\0' ' ' < /proc/$REAL_PID/cmdline 2>/dev/null; echo
+          echo "--- all processes matching qemu-system-x86_64 ---"
+          pgrep -a -f qemu-system-x86_64
+          echo "--- checking the REAL child (not the sudo wrapper) ---"
+          CHILD_PID=$(pgrep -P "$QEMU_PID" | head -n1)
+          if [ -z "$CHILD_PID" ]; then
+            echo "no child found under sudo PID $QEMU_PID -> sudo itself must be the real process"
+            CHILD_PID=$QEMU_PID
+          fi
+          echo "CHILD_PID=$CHILD_PID"
+          echo "--- cmdline of child ---"
+          sudo tr '\0' ' ' < /proc/$CHILD_PID/cmdline 2>/dev/null; echo
+          echo "--- fds of child ---"
+          sudo ls -l /proc/$CHILD_PID/fd 2>/dev/null | grep -i kvm && echo "KVM IS ACTIVELY IN USE" || echo "KVM NOT OPENED -> running on TCG (software)"
 
       # -----------------------------------
       # Keep alive + info
