@@ -3,92 +3,16 @@ name: Android VM vs
 on:
   workflow_dispatch:
 
-# ---------------------------------------------------------------------------
-# Tunables. Everything worth changing lives here so you never touch the steps.
-# ---------------------------------------------------------------------------
-env:
-  # --- guest sizing -------------------------------------------------------
-  # Standard ubuntu-latest runner = 4 vCPU.
-  # REVERTED to 2. The working baseline used -smp 2; 4 only pays off once
-  # MTTCG is proven stable here. Raise it AFTER a run boots successfully.
-  GUEST_MEM: 4096
-  GUEST_SMP: 2
-
-  # --- TCG acceleration ---------------------------------------------------
-  # !! DEFAULT IS EMPTY ON PURPOSE -- THIS IS THE KNOWN-WORKING BASELINE !!
-  #
-  # Empty means no -accel flag at all, which is exactly what the version that
-  # booted successfully used. Run it this way FIRST to confirm the revert
-  # actually fixed the hang before touching anything else.
-  #
-  # Then raise it ONE VALUE AT A TIME, one run each, and stop at the first
-  # value that hangs or slows down:
-  #
-  #   ""                    <- baseline, known to boot
-  #   "thread=multi"        <- should put the guest on all host cores. Pays off
-  #                            ONLY if the qemu process shows >100% CPU while
-  #                            booting; check with `top -b -n1 | grep qemu`.
-  #                            Note: MTTCG support for x86 guests is not
-  #                            guaranteed -- if unsupported, QEMU logs a
-  #                            warning and silently falls back to single.
-  #   "thread=multi,tb-size=1024"
-  #
-  # tb-size is NOT set by default: QEMU auto-sizes the translation cache from
-  # guest RAM, and forcing 1024 was an unjustified change.
-  TCG_OPTS: ""
-
-  # --- disk interface -----------------------------------------------------
-  # ide = the interface the working baseline used.
-  # virtio-blk is faster in theory but renames the disk (sda -> vda), and
-  # Android-x86's init is picky about where it expects its data partition.
-  # Try "virtio" only after everything else is stable.
-  DISK_IF: "ide"
-
-  # --- CPU model ----------------------------------------------------------
-  # LEFT EMPTY ON PURPOSE. Empty means "omit -cpu entirely" -> QEMU's default
-  # qemu64, which is exactly what the working baseline used.
-  #
-  # I previously set this to "Nehalem" reasoning that qemu64 lacks SSE4.2.
-  # That was theory over evidence: qemu64 was BOOTING FINE, and changing the
-  # CPU model under TCG is a known way to deadlock a Linux guest. Reverted.
-  #
-  # Only experiment with this after a successful boot, one value at a time:
-  #   Nehalem  -> adds SSE4.2, no AVX
-  #   max      -> exposes everything (AVX/AVX2 go through slow TCG helpers)
-  GUEST_CPU: ""
-
-  # --- display ------------------------------------------------------------
-  # VNC display :1  ->  TCP 5901, bound to loopback, exposed only inside the
-  # tailnet via `tailscale serve` / socat.
-  #
-  # NO VNC PASSWORD, deliberately. Rationale:
-  #   - the port is only ever reachable from inside your tailnet, and the
-  #     tailnet ACL is the real access boundary, not the VNC password
-  #   - RFB (the VNC protocol) caps passwords at 8 characters, so anything
-  #     longer is silently truncated server-side -> "authentication failed"
-  #   - QEMU has no command-line flag for it; it must be set through the
-  #     monitor socket after boot, which is one more silent failure point
-  # Net effect: the password added breakage without adding a real boundary.
-  VNC_DISPLAY: "1"
-  VNC_PORT: "5901"
-
-  # --- ISO identity -------------------------------------------------------
-  ISO_URL: "https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
-  ISO_SIZE: "965738496"
-  # Leave empty to skip hash verification. To enable: download the ISO once
-  # yourself, run `shasum -a 256 android-x86_64-9.0-r2.iso`, and paste it here.
-  # Do NOT trust a hash from a blog post -- verify it yourself.
-  ISO_SHA256: ""
-
 jobs:
   android-vm:
-    # Pinned on purpose: ubuntu-latest will roll to 26.04 and break
-    # `lsb_release -cs`-based Tailscale repo setup.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    # حدود 5 ساعت (زیر سقف 6 ساعته GitHub)
     timeout-minutes: 298
 
     steps:
-      # ------------------------------------------------------------------
+      # -----------------------------------
+      # Hardware info
+      # -----------------------------------
       - name: Show hardware
         run: |
           nproc
@@ -96,438 +20,148 @@ jobs:
           df -h /
           lscpu | grep -iE "model name|vmx|svm" || echo "(no virt flags)"
 
-      # ------------------------------------------------------------------
-      # GitHub-hosted runners never expose /dev/kvm. This is only here to
-      # prove it in the log so nobody wastes time hunting for a flag that
-      # would enable it. There isn't one.
+      # -----------------------------------
+      # Check KVM (شتاب سخت‌افزاری)
+      # -----------------------------------
       - name: Check /dev/kvm
         run: |
           if [ -e /dev/kvm ]; then
-            echo "KVM=YES" >> "$GITHUB_ENV"
+            echo "KVM=YES" >> $GITHUB_ENV
             ls -l /dev/kvm
           else
-            echo "KVM=NO" >> "$GITHUB_ENV"
-            echo "/dev/kvm absent -> Android boots under TCG (software emulation)."
-            echo "No QEMU flag can change this on a GitHub-hosted runner."
+            echo "KVM=NO" >> $GITHUB_ENV
+            echo "KVM not available -> Android boots in software mode (TCG, slower)"
           fi
 
-      # ------------------------------------------------------------------
+      # -----------------------------------
+      # Install packages
+      # -----------------------------------
       - name: Install packages
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq socat lsb-release qemu-system-x86 qemu-utils
+          sudo apt update -y
+          sudo apt install -y curl jq lsb-release qemu-system-x86 qemu-utils
 
-      # ------------------------------------------------------------------
-      # Tailscale
-      # ------------------------------------------------------------------
+      # -----------------------------------
+      # Tailscale (same pattern as exit1.yml)
+      # -----------------------------------
       - name: Add Tailscale GPG key
         run: |
-          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" \
-            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
 
       - name: Add Tailscale repository
         run: |
-          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list" \
-            | sudo tee /etc/apt/sources.list.d/tailscale.list
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
 
       - name: Install Tailscale
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y tailscale
+          sudo apt update
+          sudo apt install -y tailscale
 
       - name: Start tailscaled
         run: |
           sudo systemctl enable --now tailscaled
 
-      # --accept-dns=false   : the tailnet resolver must not interfere with
-      #                        the ISO download.
-      # --accept-routes      : DROPPED. It has no use here and only risks
-      #                        routing runner traffic through your subnets.
-      # TS_AUTHKEY via env  : keeps the key out of `ps` output for every
-      #                        other process on the runner.
       - name: Connect to Tailscale
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          set -euo pipefail
-          if [ -z "${TS_AUTHKEY:-}" ]; then
-            echo "::error::secret TAILSCALE_AUTH_KEY is empty -- add it in repo Settings > Secrets"
-            exit 1
-          fi
-
-          # Hand the key over as a 0600 file rather than argv. `tailscale up
-          # --authkey=...` exposes it in `ps` to every process on the runner,
-          # and sudo would strip an env var unless SETENV happens to be allowed.
-          KEYFILE="$(mktemp)"
-          chmod 600 "$KEYFILE"
-          printf '%s' "$TS_AUTHKEY" > "$KEYFILE"
-          echo "KEYFILE=$KEYFILE" >> "$GITHUB_ENV"
-
-          sudo tailscale up \
-            --auth-key="file:$KEYFILE" \
-            --hostname="gh-android-${{ github.run_id }}" \
-            --accept-dns=false
-
-          rm -f "$KEYFILE"
-
-          TS_IP="$(tailscale ip -4)"
-          TS_NAME="$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')"
-          echo "TS_IP=$TS_IP"     >> "$GITHUB_ENV"
-          echo "TS_NAME=$TS_NAME" >> "$GITHUB_ENV"
-
-          echo "--- tailscale status ---"
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-android-${{ github.run_id }} --accept-routes
+          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
           tailscale status
 
-          # relay vs direct decides more of your latency than any QEMU flag.
-          if tailscale status | grep -qiE 'relay|derp'; then
-            echo "::warning::connection is going through a DERP relay -- expect high latency"
-          fi
-
-      # ------------------------------------------------------------------
-      # ISO cache
-      # ------------------------------------------------------------------
-      # restore/save are separate actions on purpose. The plain actions/cache
-      # writes in a POST step, and this job is killed by timeout-minutes long
-      # before any post step runs -- so the cache was never actually saved.
-      # Saving explicitly right after the download fixes that.
-      - name: Restore ISO from cache
+      # -----------------------------------
+      # Cache ISO (هر بار دوباره دانلود نشود)
+      # -----------------------------------
+      - name: Cache Android ISO
         id: cache-iso
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: android.iso
-          key: android-x86-9.0-r2-${{ runner.os }}-v2
+          key: android-x86-9.0-r2-${{ runner.os }}-v1
 
+      # -----------------------------------
+      # Download Android-x86 ISO (resume + retry + size check)
+      # -----------------------------------
       - name: Download Android-x86 ISO
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
+          URL="https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
+          EXPECT=965738496   # 921MB — سایز دقیق فایل
           for i in $(seq 1 8); do
             echo "=== download attempt $i ==="
-            # -C -  resume from where it stopped (the important bit)
-            # -L    follow the SourceForge redirect
-            if curl -fL -C - --retry 3 --retry-delay 5 --connect-timeout 20 \
-                 --progress-bar -o android.iso "$ISO_URL"; then
+            # -C - : ادامه از جایی که قطع شده (کلید اصلی!)  -L : دنبال کردن redirect
+            if curl -fL -C - --retry 3 --retry-delay 5 --progress-bar -o android.iso "$URL"; then
               echo "DOWNLOAD_OK attempt=$i"
               break
             fi
-            echo "attempt $i interrupted -> keeping partial file, resuming"
+            echo "attempt $i cut -> resuming next loop (partial file kept)"
             sleep 5
           done
-
-          ACTUAL="$(stat -c%s android.iso)"
-          echo "size=$ACTUAL expected=$ISO_SIZE"
-          if [ "$ACTUAL" != "$ISO_SIZE" ]; then
-            echo "::error::size mismatch -- partial or corrupt download"
+          ACTUAL=$(stat -c%s android.iso)
+          echo "size=$ACTUAL expected=$EXPECT"
+          if [ "$ACTUAL" != "$EXPECT" ]; then
+            echo "FATAL: size mismatch (partial/corrupt download)"
             exit 1
           fi
-
-          if [ -n "$ISO_SHA256" ]; then
-            echo "$ISO_SHA256  android.iso" | sha256sum -c -
-          else
-            echo "NOTE: ISO_SHA256 is empty, size check only. See the env block."
-          fi
-
           ls -lh android.iso
           file android.iso
 
-      - name: Save ISO to cache
-        if: steps.cache-iso.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: android.iso
-          key: android-x86-9.0-r2-${{ runner.os }}-v2
-
-      # ------------------------------------------------------------------
-      # Boot
-      # ------------------------------------------------------------------
+      # -----------------------------------
+      # Boot Android VM (Live mode) + VNC
+      # بهینه‌سازی‌های سرعت:
+      #  - دیسک raw به‌جای qcow2 + cache=unsafe,aio=threads (I/O سریع‌تر)
+      #  - smp/mem واقعی متناسب با ران‌رهای فعلی گیت‌هاب (4 هسته/16GB)
+      #  - وقتی KVM نیست: accel=tcg,thread=multi تا شبیه‌سازی از چند هسته استفاده کنه
+      #  - گزینه‌های VNC (lossy/non-adaptive) برای واکنش سریع‌تر روی شبکه Tailscale
+      # -----------------------------------
       - name: Boot Android VM
         run: |
-          set -euo pipefail
-          qemu-img create -f qcow2 android-disk.qcow2 16G
+          CORES=$(nproc)
+          qemu-img create -f raw android-disk.img 16G
 
-          # Build the argument list with flags that are SAFE TO OMIT.
-          # Each optional flag is appended only when its env var is set, so an
-          # empty value reproduces the original command exactly. This is how
-          # the baseline gets restored without hand-editing this step.
-          ARGS=()
-          ARGS+=(-m "$GUEST_MEM" -smp "$GUEST_SMP")
-          [ -n "${TCG_OPTS:-}" ] && ARGS+=(-accel "tcg,$TCG_OPTS")
-          [ -n "${GUEST_CPU:-}" ] && ARGS+=(-cpu "$GUEST_CPU")
-          ARGS+=(-cdrom android.iso)
-          ARGS+=(-drive "file=android-disk.qcow2,format=qcow2,if=${DISK_IF}")
-          ARGS+=(-boot d -usb -device usb-tablet -vga std)
-          ARGS+=(-display "vnc=127.0.0.1:${VNC_DISPLAY}")
-          ARGS+=(-monitor "unix:/tmp/qemu-mon.sock,server,nowait")
-          ARGS+=(-netdev user,id=n0 -device virtio-net-pci,netdev=n0)
+          if [ "$KVM" = "YES" ]; then
+            MACHINE_FLAG="-machine pc,accel=kvm -cpu host"
+          else
+            MACHINE_FLAG="-machine pc,accel=tcg,thread=multi -cpu max"
+          fi
 
-          echo "--- effective qemu command ---"
-          printf 'qemu-system-x86_64 %s\n' "${ARGS[*]}"
-
-          nohup sudo qemu-system-x86_64 "${ARGS[@]}" > qemu.log 2>&1 &
-          echo "QEMU_PID=$!" >> "$GITHUB_ENV"
-
+          nohup sudo qemu-system-x86_64 \
+            -m 8192 -smp "$CORES" $MACHINE_FLAG \
+            -cdrom android.iso \
+            -drive file=android-disk.img,format=raw,if=ide,cache=unsafe,aio=threads,discard=unmap \
+            -boot d \
+            -usb -device usb-tablet \
+            -vga std \
+            -display vnc=127.0.0.1:1,lossy=on,non-adaptive=on \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            > qemu.log 2>&1 &
+          echo "QEMU_PID=$!" >> $GITHUB_ENV
           sleep 25
           echo "--- qemu.log ---"
           tail -30 qemu.log
-          ss -tlnp 2>/dev/null | grep "$VNC_PORT" || echo "VNC not listening yet (still booting)"
+          ss -tlnp 2>/dev/null | grep 5901 || echo "VNC not listening yet (still booting)"
 
-      # ------------------------------------------------------------------
-      # Is it alive, and is it actually making progress?
-      #
-      # The old version only checked that VNC was LISTENING -- true from the
-      # first second, because QEMU opens the port before the guest does
-      # anything. A hung boot therefore looked successful and the failure only
-      # showed up as a frozen screen much later.
-      #
-      # We now sample QEMU's own CPU time. A guest stuck at the Android logo
-      # with the CPU pinned near 100% is spinning; a guest that finished
-      # booting goes quiet. Either way we get an explicit, quotable number
-      # instead of a guess.
-      # ------------------------------------------------------------------
-      # ------------------------------------------------------------------
-      # Is the emulator alive, and is the guest actually making progress?
-      #
-      # TWO BUGS THIS STEP EXISTS TO AVOID:
-      #
-      # 1. Process matching. Linux caps /proc/PID/comm at 15 chars, so the
-      #    running process is named "qemu-system-x86", NOT "qemu-system-x86_64".
-      #    `pgrep -x qemu-system-x86_64` therefore NEVER matches, and an earlier
-      #    version of this step concluded the emulator had died and killed the
-      #    job while the VM was booting perfectly well.
-      #
-      #    The obvious repair -- `pgrep -f qemu-system-x86_64` -- is ALSO wrong,
-      #    just less visibly: sudo's own argv is literally
-      #    `sudo pgrep -f qemu-system-x86_64`, which contains the pattern, and
-      #    pgrep excludes only its own pid, never its parent's. head -1 then
-      #    returns sudo's pid. sudo sits idle, so its CPU counters never move,
-      #    and the step reports a hard hang. That is a false negative, which is
-      #    the expensive direction: it kills a run that is booting fine.
-      #
-      #    So match on comm (where the real name lives) by scanning /proc
-      #    directly. Neither sudo nor pgrep can collide, because their own comm
-      #    values are "sudo" and "pgrep". The prefix match covers the 15-char
-      #    truncation and any qemu-system-<arch> binary.
-      #
-      # 2. Failing the job on a detection miss. A false negative is far more
-      #    expensive (5 wasted hours) than a false positive, so a missing
-      #    process is reported and double-checked before anything is aborted.
-      #
-      # CPU time is read straight out of /proc/PID/stat (fields 14+15, in clock
-      # ticks) rather than via `ps -o <keyword>`, whose keyword names vary
-      # between procps versions.
-      # ------------------------------------------------------------------
-      - name: Verify boot progress
-        run: |
-          set -uo pipefail
-
-          TICKS="$(getconf CLK_TCK 2>/dev/null || echo 100)"
-
-          # Read a /proc file, preferring no privileges at all.
-          #
-          # comm/stat/statm are all mode 0444, so the unprivileged read always
-          # works and sudo is never actually required. It is kept only as a
-          # fallback (-n, so it can never block on a password prompt). This
-          # matters because sudo here would be a failure mode pointed the wrong
-          # way: if it failed, these helpers would report "cannot read", the
-          # sample loop would look like a hang, and a healthy run would be
-          # killed -- the same false-negative class of bug this step exists to
-          # eliminate. With no sudo in the common path that cannot happen.
-          proc_read() {
-            cat "$1" 2>/dev/null && return 0
-            sudo -n cat "$1" 2>/dev/null
-          }
-
-          # Echo the pid of the running emulator, or nothing.
-          #
-          # The trailing newline is stripped before comparing, so the match
-          # cannot be defeated by whitespace.
-          qemu_pid() {
-            local d c
-            for d in /proc/[0-9]*; do
-              c="$(proc_read "$d/comm")" || continue
-              case "${c%$'\n'}" in
-                # basename, not a hardcoded /proc/ prefix: the latter silently
-                # returns the whole path if the glob is ever rooted elsewhere.
-                qemu-system-*) echo "${d##*/}"; return ;;
-              esac
-            done
-          }
-
-          # Cumulative CPU seconds. Empty string means "cannot read".
-          #
-          # Parsed with parameter expansion, not awk field numbers: field 2 of
-          # /proc/PID/stat is "(comm)" and a process name may contain spaces and
-          # parentheses, which shifts every subsequent awk field. Stripping
-          # through the LAST ')' makes the remaining offsets stable: after it,
-          # $1 is "state" (field 3), so utime is $12 and stime is $13.
-          qemu_cpu() {
-            local p="$1" stat rest ut st
-            [ -n "$p" ] || { echo ""; return; }
-            stat="$(proc_read "/proc/$p/stat")" || { echo ""; return; }
-            [ -n "$stat" ] || { echo ""; return; }
-
-            rest="${stat##*') '}"
-            [ "$rest" != "$stat" ] || { echo ""; return; }   # no ')' found -> malformed
-            # shellcheck disable=SC2086
-            set -- $rest
-            ut="${12:-}"; st="${13:-}"
-            case "$ut$st" in
-              ''|*[!0-9]*) echo ""; return ;;
-            esac
-            echo $(( (ut + st) / TICKS ))
-          }
-
-          # Resident set size, in MiB. /proc/PID/statm has exactly 7 fields
-          # (size resident shared text lib data dt) and field 2 is in PAGES,
-          # so it must be multiplied by the page size. Reading field 24 here
-          # - which is what an earlier version did - always yielded an empty
-          # string, so the log printed a hardcoded "0 MiB" no matter what.
-          qemu_rss() {
-            local p="$1" statm rest page
-            [ -n "$p" ] || { echo "?"; return; }
-            statm="$(proc_read "/proc/$p/statm")" || { echo "?"; return; }
-            rest="${statm#* }"                       # drop field 1 (total size)
-            set -- $rest                             # $1 is now "resident"
-            case "${1:-}" in
-              ''|*[!0-9]*) echo "?"; return ;;
-            esac
-            page="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
-            echo $(( $1 * page / 1048576 ))MiB
-          }
-
-          echo "waiting for the guest to do something..."
-
-          PID="$(qemu_pid)"
-          echo "qemu pid: ${PID:-<none>}"
-          if [ -z "$PID" ]; then
-            echo "::error::no qemu process found before sampling even began"
-            tail -40 qemu.log || true
-            exit 1
-          fi
-
-          PREV="$(qemu_cpu "$PID")"; PREV="${PREV:-0}"
-          echo "baseline cpu seconds: $PREV"
-
-          for i in $(seq 1 20); do   # 20 x 60s = up to 20 minutes
-            sleep 60
-
-            PID="$(qemu_pid)"
-            if [ -z "$PID" ]; then
-              # Confirm with a second, independent method before believing it.
-              sleep 5
-              PID="$(qemu_pid)"
-            fi
-
-            if [ -z "$PID" ]; then
-              echo "::error::QEMU is genuinely gone (two checks agreed)."
-              echo "--- full qemu.log ---"
-              cat qemu.log || true
-              exit 1
-            fi
-
-            NOW="$(qemu_cpu "$PID")"
-            if [ -z "$NOW" ]; then
-              echo "[${i}min] could not read /proc/$PID/stat (exited between checks?)"
-              continue
-            fi
-
-            DELTA=$(( NOW - PREV ))
-            PREV="$NOW"
-            echo "[${i}min] cpu_total=${NOW}s  consumed_in_last_min=${DELTA}s  rss=$(qemu_rss "$PID")"
-          done
-
-          echo
-          echo "--- interpretation ---"
-          echo "consumed_in_last_min near 60 the whole time -> guest is spinning at the"
-          echo "  boot animation. That is TCG being slow, not a hang."
-          echo "consumed_in_last_min near 0-5 -> boot finished and the guest went idle."
-          echo "cpu_total frozen while a process exists -> genuine hang; report it."
-          echo
-          echo "--- final qemu.log ---"
-          tail -20 qemu.log || true
-
-          # The last command's status becomes the step's status. Every step in
-          # this workflow runs with a bare shell (no `set -e` wrapper), so if
-          # anything after the real checks fails -- a log that rotated away, a
-          # truncated tail -- the step would report failure and fail the job
-          # even though every check passed. Reaching here means we did not
-          # abort, so say so explicitly.
-          exit 0
-
-      # ------------------------------------------------------------------
-      # QEMU binds VNC to 127.0.0.1 on purpose (so it is never reachable from
-      # the public internet), which means the tailnet IP alone is not enough --
-      # something has to forward tailnet:5901 -> 127.0.0.1:5901.
-      #
-      # `tailscale serve` needs the feature to be permitted for the tailnet, so
-      # a silent failure there would leave you with a published address that
-      # nothing answers on. Hence the socat fallback plus a real reachability
-      # check on the tailnet interface.
+      # -----------------------------------
+      # Expose VNC only inside the tailnet
+      # -----------------------------------
       - name: Expose VNC over Tailscale
         run: |
-          set -euo pipefail
+          sudo tailscale serve --bg --tcp 5901 tcp://127.0.0.1:5901 || true
+          sudo tailscale serve status || true
 
-          if sudo tailscale serve --bg --tcp "$VNC_PORT" "tcp://127.0.0.1:$VNC_PORT" 2>/dev/null \
-             && sudo tailscale serve status 2>/dev/null | grep -q "$VNC_PORT"; then
-            echo "METHOD=tailscale-serve" >> "$GITHUB_ENV"
-            echo "tailscale serve is forwarding the port"
-            sudo tailscale serve status || true
-          else
-            echo "tailscale serve unavailable -> falling back to socat"
-            echo "METHOD=socat" >> "$GITHUB_ENV"
-            nohup sudo socat \
-              "TCP-LISTEN:${VNC_PORT},bind=${TS_IP},fork,reuseaddr" \
-              "TCP:127.0.0.1:${VNC_PORT}" > socat.log 2>&1 &
-            sleep 3
-            tail -5 socat.log || true
-          fi
-
-          echo "--- listeners on ${VNC_PORT} ---"
-          ss -tlnp 2>/dev/null | grep "$VNC_PORT" || true
-
-          # Prove the path end-to-end from the tailnet address, not loopback.
-          if timeout 5 bash -c "exec 3<>/dev/tcp/${TS_IP}/${VNC_PORT}" 2>/dev/null; then
-            echo "OK: ${TS_IP}:${VNC_PORT} is reachable"
-          else
-            echo "::error::${TS_IP}:${VNC_PORT} is NOT reachable -- VNC would fail for you"
-            exit 1
-          fi
-
-      # ------------------------------------------------------------------
-      - name: Publish connection details
-        run: |
-          {
-            echo "## Android VM is up"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| **Tailscale IP** | \`${TS_IP}:${VNC_PORT}\` |"
-            echo "| **MagicDNS** | \`${TS_NAME}:${VNC_PORT}\` |"
-            echo "| Acceleration | TCG (\`$TCG_OPTS\`), cpu=\`$GUEST_CPU\` |"
-            echo
-            echo "Connect any VNC client to either address above. No password."
-            echo "For usable speed: set color depth to 8-bit and encoding to Tight."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "::notice::VNC ready at ${TS_IP}:${VNC_PORT} (no password)"
-
-      # ------------------------------------------------------------------
+      # -----------------------------------
+      # Keep alive + info
+      # -----------------------------------
       - name: Keep alive
         run: |
-          echo "=============================================="
+          echo "======================================"
           echo "  ANDROID VM READY"
-          echo ""
-          echo "  Tailscale IP : ${TS_IP}:${VNC_PORT}"
-          echo "  MagicDNS     : ${TS_NAME}:${VNC_PORT}"
-          echo "  Password     : (none)"
-          echo ""
-          echo "  Connect with any VNC client."
-          echo "=============================================="
-
+          echo "  Tailscale IP : $TS_IP"
+          echo "  VNC address  : $TS_IP:5901"
+          echo "  (connect with any VNC client)"
+          echo "======================================"
           while true; do
             sleep 300
-            ts="$(tailscale ip -4 2>/dev/null || echo -)"
-            q="$(pgrep -c qemu-system || echo 0)"
-            echo "[$(date -u +%H:%M:%S)] alive | ${ts}:${VNC_PORT} | qemu=${q}"
-            echo "   (tip: 8-bit color + Tight encoding for usable speed)"
+            ts=$(tailscale ip -4 2>/dev/null || echo -)
+            q=$(pgrep -c qemu-system || echo 0)
+            echo "[$(date -u +%H:%M:%S)] alive | ts=$ts | qemu=$q"
           done
