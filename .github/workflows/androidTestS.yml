@@ -164,8 +164,13 @@ jobs:
         run: |
           echo "--- groups of current user ---"
           id
-          echo "--- open file descriptors of qemu process ---"
-          sudo ls -l /proc/$QEMU_PID/fd 2>/dev/null | grep -i kvm && echo "KVM IS ACTIVELY IN USE" || echo "KVM NOT OPENED BY QEMU -> running on TCG (software)"
+          echo "--- real qemu-system-x86_64 PID (not the sudo wrapper) ---"
+          REAL_PID=$(pgrep -f qemu-system-x86_64 | head -n1)
+          echo "REAL_PID=$REAL_PID (QEMU_PID env was $QEMU_PID)"
+          echo "--- open file descriptors of the real qemu process ---"
+          sudo ls -l /proc/$REAL_PID/fd 2>/dev/null | grep -i kvm && echo "KVM IS ACTIVELY IN USE" || echo "KVM NOT OPENED BY QEMU -> running on TCG (software)"
+          echo "--- full cmdline actually used ---"
+          sudo tr '\0' ' ' < /proc/$REAL_PID/cmdline 2>/dev/null; echo
 
       # -----------------------------------
       # Keep alive + info
