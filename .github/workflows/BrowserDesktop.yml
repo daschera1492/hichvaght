@@ -1,4 +1,4 @@
-name: BrowserDesktop
+name: Browser Desktop
 
 on:
   workflow_dispatch:
@@ -12,34 +12,56 @@ jobs:
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
 
       - name: Connect to Tailscale
         run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-browser-${{ github.run_id }}
-          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-browser-${{ github.run_id }} \
+            --accept-dns=false
+          for i in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "FATAL: Tailscale did not get an IP (check TAILSCALE_AUTH_KEY)"
+            tailscale status || true
+            exit 1
+          fi
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
           tailscale status
 
       - name: Start browser container
         run: |
-          # برای کروم: ایمیج را به lscr.io/linuxserver/chromium:latest عوض کنید
-          # برای دسکتاپ کامل: lscr.io/linuxserver/webtop:ubuntu-xfce
-          mkdir -p $PWD/config
+          mkdir -p "$PWD/config"
           docker run -d --name browser \
             --shm-size=1gb \
+            --security-opt seccomp=unconfined \
             -e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku \
-            -v $PWD/config:/config \
-            -p $TS_IP:3000:3000 \
+            -v "$PWD/config:/config" \
+            -p 3000:3000 \
+            -p 3001:3001 \
             lscr.io/linuxserver/firefox:latest
-          sleep 20
-          docker ps
-          docker logs browser --tail 20
+          for i in $(seq 1 30); do
+            if curl -ksf -o /dev/null https://localhost:3001; then
+              echo "UI is up after ~$((i*2))s"
+              break
+            fi
+            sleep 2
+          done
+          docker ps -a
+          docker logs browser --tail 30
 
       - name: Keep alive
         run: |
           echo "======================================"
           echo "  BROWSER READY"
-          echo "  Open: http://$TS_IP:3000"
-          echo "  (your device must be on the same tailnet)"
+          echo "  Open THIS (HTTPS, port 3001):"
+          echo "  https://$TS_IP:3001"
+          echo "  (do NOT use http or port 3000)"
+          echo "  Accept the self-signed certificate warning"
           echo "======================================"
           while true; do
             sleep 300
