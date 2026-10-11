@@ -1,4 +1,4 @@
-name: Browser Desktop
+name: BrowserDesktop
 
 on:
   workflow_dispatch:
