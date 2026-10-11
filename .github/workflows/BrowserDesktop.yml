@@ -1,0 +1,48 @@
+name: Browser Desktop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    steps:
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-browser-${{ github.run_id }}
+          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          tailscale status
+
+      - name: Start browser container
+        run: |
+          # برای کروم: ایمیج را به lscr.io/linuxserver/chromium:latest عوض کنید
+          # برای دسکتاپ کامل: lscr.io/linuxserver/webtop:ubuntu-xfce
+          mkdir -p $PWD/config
+          docker run -d --name browser \
+            --shm-size=1gb \
+            -e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku \
+            -v $PWD/config:/config \
+            -p $TS_IP:3000:3000 \
+            lscr.io/linuxserver/firefox:latest
+          sleep 20
+          docker ps
+          docker logs browser --tail 20
+
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  BROWSER READY"
+          echo "  Open: http://$TS_IP:3000"
+          echo "  (your device must be on the same tailnet)"
+          echo "======================================"
+          while true; do
+            sleep 300
+            st=$(docker inspect -f '{{.State.Status}}' browser 2>/dev/null || echo "gone")
+            echo "[$(date -u +%H:%M:%S)] alive | container=$st"
+          done
