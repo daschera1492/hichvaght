@@ -1,0 +1,108 @@
+name: Browser Desktop fav
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    steps:
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-browser-${{ github.run_id }} \
+            --accept-dns=false
+          for i in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "FATAL: Tailscale did not get an IP (check TAILSCALE_AUTH_KEY)"
+            tailscale status || true
+            exit 1
+          fi
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          tailscale status
+
+      # -----------------------------------
+      # policies.json: افزونه‌ها + بوکمارک‌ها
+      # برای بوکمارک جدید یک بلوک به Bookmarks اضافه کنید.
+      # -----------------------------------
+      - name: Create Firefox policies
+        run: |
+          mkdir -p "$PWD/policies"
+          cat > "$PWD/policies/policies.json" <<'EOF'
+          {
+            "policies": {
+              "DisableAppUpdate": true,
+              "Extensions": {
+                "Install": [
+                  "https://addons.mozilla.org/firefox/downloads/latest/cookie-editor/latest.xpi",
+                  "https://addons.mozilla.org/firefox/downloads/latest/hoxx-vpn-proxy/latest.xpi"
+                ]
+              },
+              "DisplayBookmarksToolbar": "always",
+              "Bookmarks": [
+                {
+                  "Title": "Cookie-Editor",
+                  "URL": "https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/",
+                  "Placement": "toolbar"
+                },
+                {
+                  "Title": "Hoxx VPN Proxy",
+                  "URL": "https://addons.mozilla.org/en-US/firefox/addon/hoxx-vpn-proxy/",
+                  "Placement": "toolbar"
+                }
+              ]
+            }
+          }
+          EOF
+          cat "$PWD/policies/policies.json"
+
+      - name: Start browser container
+        run: |
+          mkdir -p "$PWD/config"
+          docker run -d --name browser \
+            --shm-size=1gb \
+            --security-opt seccomp=unconfined \
+            -e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku \
+            -v "$PWD/config:/config" \
+            -v "$PWD/policies/policies.json:/usr/lib/firefox/distribution/policies.json:ro" \
+            -p 3000:3000 \
+            -p 3001:3001 \
+            lscr.io/linuxserver/firefox:latest
+          for i in $(seq 1 30); do
+            if curl -ksf -o /dev/null https://localhost:3001; then
+              echo "UI is up after ~$((i*2))s"
+              break
+            fi
+            sleep 2
+          done
+          docker ps -a
+          docker logs browser --tail 30
+          echo "--- policies path check ---"
+          docker exec browser sh -c 'ls -l /usr/lib/firefox/distribution/ 2>/dev/null || echo "distribution dir not found"; which firefox; ls -d /usr/lib/firefox* /opt/firefox* 2>/dev/null' || true
+
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  BROWSER READY"
+          echo "  Open THIS (HTTPS, port 3001):"
+          echo "  https://$TS_IP:3001"
+          echo "  (do NOT use http or port 3000)"
+          echo "  Accept the self-signed certificate warning"
+          echo "======================================"
+          while true; do
+            sleep 300
+            st=$(docker inspect -f '{{.State.Status}}' browser 2>/dev/null || echo "gone")
+            echo "[$(date -u +%H:%M:%S)] alive | container=$st"
+          done
