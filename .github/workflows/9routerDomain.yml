@@ -1,4 +1,4 @@
-name: 9Router Panel domain
+name: 9Router Panel
 
 on:
   workflow_dispatch:
@@ -120,11 +120,13 @@ jobs:
       # -----------------------------------
       # پورت 80 داخل تیل‌نت (آدرس بدون :20128)
       # -----------------------------------
-      - name: Serve on port 80
+      - name: Redirect port 80 to 9router
         run: |
-          sudo tailscale serve --bg --http=80 localhost:$ROUTER_PORT \
-            || echo "WARNING: serve failed, use the :$ROUTER_PORT address"
-          sudo tailscale serve status || true
+          # tailscale serve بر اساس Host header مسیریابی می‌کنه و دامنه‌ی شخصی رو 404 می‌ده،
+          # برای همین ترافیک پورت 80 تیل‌نت رو مستقیم به 9router می‌فرستیم
+          sudo iptables -t nat -A PREROUTING -i tailscale0 -p tcp --dport 80 \
+            -j REDIRECT --to-port $ROUTER_PORT
+          sudo iptables -t nat -L PREROUTING -n
 
       # -----------------------------------
       # Keep alive
