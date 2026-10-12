@@ -1,0 +1,145 @@
+name: 9Router Panel domain
+
+on:
+  workflow_dispatch:
+
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    env:
+      ROUTER_PORT: "20128"
+      INITIAL_PASSWORD: "*r96319631P-"
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      # ↓↓↓ این دو تا رو با دامنه‌ی خودت عوض کن ↓↓↓
+      ZONE_NAME: "codol.ir"        # دامنه‌ی اصلی توی Cloudflare
+      RECORD_NAME: "9r.codol.ir"   # ساب‌دامنه‌ای که می‌خوای
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # -----------------------------------
+      # Tailscale
+      # -----------------------------------
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-9router \
+            --accept-dns=false
+          for i in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "FATAL: Tailscale did not get an IP (check TAILSCALE_AUTH_KEY)"
+            tailscale status || true
+            exit 1
+          fi
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          tailscale status
+
+      # -----------------------------------
+      # Cloudflare DNS (رکورد A به IP تیل‌اسکیل)
+      # -----------------------------------
+      - name: Update Cloudflare DNS
+        run: |
+          API="https://api.cloudflare.com/client/v4"
+          AUTH="Authorization: Bearer $CF_API_TOKEN"
+
+          ZONE_ID=$(curl -s -H "$AUTH" "$API/zones?name=$ZONE_NAME" | jq -r '.result[0].id // empty')
+          if [ -z "$ZONE_ID" ]; then
+            echo "FATAL: zone $ZONE_NAME not found (check CF_API_TOKEN permissions: Zone:Read + DNS:Edit)"
+            exit 1
+          fi
+
+          REC_ID=$(curl -s -H "$AUTH" "$API/zones/$ZONE_ID/dns_records?type=A&name=$RECORD_NAME" | jq -r '.result[0].id // empty')
+
+          DATA=$(jq -n --arg n "$RECORD_NAME" --arg ip "$TS_IP" \
+            '{type:"A", name:$n, content:$ip, ttl:60, proxied:false}')
+
+          if [ -n "$REC_ID" ]; then
+            RES=$(curl -s -X PUT -H "$AUTH" -H "Content-Type: application/json" \
+              --data "$DATA" "$API/zones/$ZONE_ID/dns_records/$REC_ID")
+          else
+            RES=$(curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              --data "$DATA" "$API/zones/$ZONE_ID/dns_records")
+          fi
+
+          if [ "$(echo "$RES" | jq -r '.success')" != "true" ]; then
+            echo "FATAL: Cloudflare update failed"
+            echo "$RES" | jq .
+            exit 1
+          fi
+          echo "DNS updated: $RECORD_NAME -> $TS_IP"
+
+      # -----------------------------------
+      # 9router
+      # -----------------------------------
+      - name: Install 9router
+        run: npm install -g 9router
+
+      - name: Start 9router
+        run: |
+          BASE_URL="http://$RECORD_NAME"
+          echo "BASE_URL=$BASE_URL" >> $GITHUB_ENV
+
+          # stdin باز می‌مونه + pty مجازی، تا CLI بعد از EOF خارج نشه
+          cat > "$HOME/start-9router.sh" <<EOF
+          #!/usr/bin/env bash
+          export RUNNER_TRACKING_ID=""
+          export PORT=$ROUTER_PORT
+          export HOSTNAME=0.0.0.0
+          export NEXT_PUBLIC_BASE_URL=$BASE_URL
+          setsid bash -c 'tail -f /dev/null | script -qfec "9router --host 0.0.0.0" /dev/null' \
+            >> "$HOME/9router.log" 2>&1 < /dev/null &
+          EOF
+          chmod +x "$HOME/start-9router.sh"
+          "$HOME/start-9router.sh"
+
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://localhost:$ROUTER_PORT"; then
+              echo "9router is up after ~${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FATAL: 9router did not start"
+          cat "$HOME/9router.log" || true
+          exit 1
+
+      # -----------------------------------
+      # پورت 80 داخل تیل‌نت (آدرس بدون :20128)
+      # -----------------------------------
+      - name: Serve on port 80
+        run: |
+          sudo tailscale serve --bg --http=80 localhost:$ROUTER_PORT \
+            || echo "WARNING: serve failed, use the :$ROUTER_PORT address"
+          sudo tailscale serve status || true
+
+      # -----------------------------------
+      # Keep alive
+      # -----------------------------------
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  9ROUTER READY (tailnet only)"
+          echo "  http://$RECORD_NAME/dashboard"
+          echo "  http://$TS_IP:$ROUTER_PORT/dashboard"
+          echo "======================================"
+          while true; do
+            sleep 60
+            if ! curl -sf -o /dev/null "http://localhost:$ROUTER_PORT"; then
+              echo "[$(date -u +%H:%M:%S)] 9router down, restarting..."
+              "$HOME/start-9router.sh"
+            fi
+          done
