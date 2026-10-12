@@ -1,0 +1,122 @@
+name: 9Router Panel
+
+on:
+  workflow_dispatch:
+    inputs:
+      access_mode:
+        description: "funnel = عمومی از اینترنت | tailnet = فقط داخل تیل‌نت"
+        type: choice
+        default: funnel
+        options:
+          - funnel
+          - tailnet
+
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    env:
+      ROUTER_PORT: "20128"
+      ACCESS_MODE: ${{ inputs.access_mode || 'funnel' }}
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # -----------------------------------
+      # Tailscale
+      # -----------------------------------
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-9router \
+            --accept-dns=false
+          for i in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "FATAL: Tailscale did not get an IP (check TAILSCALE_AUTH_KEY)"
+            tailscale status || true
+            exit 1
+          fi
+          TS_DNS=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          echo "TS_DNS=$TS_DNS" >> $GITHUB_ENV
+          tailscale status
+
+      # -----------------------------------
+      # 9router
+      # -----------------------------------
+      - name: Install 9router
+        run: npm install -g 9router
+
+      - name: Start 9router
+        run: |
+          if [ "$ACCESS_MODE" = "funnel" ]; then
+            BASE_URL="https://$TS_DNS"
+          else
+            BASE_URL="http://$TS_IP:$ROUTER_PORT"
+          fi
+          echo "BASE_URL=$BASE_URL" >> $GITHUB_ENV
+
+          cat > "$HOME/start-9router.sh" <<EOF
+          #!/usr/bin/env bash
+          export PORT=$ROUTER_PORT
+          export HOSTNAME=0.0.0.0
+          export NEXT_PUBLIC_BASE_URL=$BASE_URL
+          nohup 9router >> "$HOME/9router.log" 2>&1 < /dev/null &
+          EOF
+          chmod +x "$HOME/start-9router.sh"
+          "$HOME/start-9router.sh"
+
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://localhost:$ROUTER_PORT"; then
+              echo "9router is up after ~${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FATAL: 9router did not start"
+          cat "$HOME/9router.log" || true
+          exit 1
+
+      # -----------------------------------
+      # Expose panel
+      # -----------------------------------
+      - name: Expose panel
+        run: |
+          if [ "$ACCESS_MODE" = "funnel" ]; then
+            if timeout 40 sudo tailscale funnel --bg $ROUTER_PORT; then
+              sudo tailscale funnel status
+            else
+              echo "WARNING: Funnel failed (enable Funnel + HTTPS in the tailnet admin)."
+              echo "Falling back to tailnet-only access."
+            fi
+          fi
+
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  9ROUTER READY"
+          if [ "$ACCESS_MODE" = "funnel" ]; then
+            echo "  Public : https://$TS_DNS/dashboard"
+          fi
+          echo "  Tailnet: http://$TS_IP:$ROUTER_PORT/dashboard"
+          echo "======================================"
+          while true; do
+            sleep 60
+            if ! curl -sf -o /dev/null "http://localhost:$ROUTER_PORT"; then
+              echo "[$(date -u +%H:%M:%S)] 9router down, restarting..."
+              "$HOME/start-9router.sh"
+            fi
+          done
