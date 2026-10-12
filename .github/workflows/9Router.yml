@@ -60,6 +60,9 @@ jobs:
       - name: Install 9router
         run: npm install -g 9router
 
+      - name: 9router help (debug)
+        run: 9router --help || true
+
       - name: Start 9router
         run: |
           if [ "$ACCESS_MODE" = "funnel" ]; then
@@ -69,12 +72,15 @@ jobs:
           fi
           echo "BASE_URL=$BASE_URL" >> $GITHUB_ENV
 
+          # stdin باز می‌مونه + pty مجازی، تا CLI بعد از EOF خارج نشه
           cat > "$HOME/start-9router.sh" <<EOF
           #!/usr/bin/env bash
+          export RUNNER_TRACKING_ID=""
           export PORT=$ROUTER_PORT
           export HOSTNAME=0.0.0.0
           export NEXT_PUBLIC_BASE_URL=$BASE_URL
-          nohup 9router >> "$HOME/9router.log" 2>&1 < /dev/null &
+          setsid bash -c 'tail -f /dev/null | script -qfec "9router --host 0.0.0.0" /dev/null' \
+            >> "$HOME/9router.log" 2>&1 < /dev/null &
           EOF
           chmod +x "$HOME/start-9router.sh"
           "$HOME/start-9router.sh"
@@ -104,6 +110,9 @@ jobs:
             fi
           fi
 
+      # -----------------------------------
+      # Keep alive
+      # -----------------------------------
       - name: Keep alive
         run: |
           echo "======================================"
