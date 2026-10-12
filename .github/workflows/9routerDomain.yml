@@ -1,4 +1,4 @@
-name: 9Router Panel
+name: 9Router Panel domain
 
 on:
   workflow_dispatch:
