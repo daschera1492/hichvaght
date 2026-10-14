@@ -39,19 +39,86 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y tailscale
 
-      - name: Start tailscaled
+      - name: Start Tailscale
         run: |
           sudo systemctl enable --now tailscaled
 
       - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+            echo "ERROR: TAILSCALE_AUTH_KEY secret is missing."
+            exit 1
+          fi
+
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-            --hostname="gh-android-${{ github.run_id }}" \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="gh-android-${GITHUB_RUN_ID}" \
             --accept-routes
 
-          echo "TS_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Could not obtain Tailscale IPv4 address."
+            exit 1
+          fi
+
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TS_IP"
           tailscale status
+
+      # Create the script BEFORE the emulator action.
+      # This avoids android-emulator-runner's multiline parser.
+      - name: Prepare emulator script
+        run: |
+          cat > /tmp/android-emulator-script.sh <<'EMULATOR_SCRIPT'
+          #!/usr/bin/env bash
+          set -eu
+
+          echo "Checking Android emulator..."
+          adb devices
+          adb shell getprop ro.product.model
+          adb shell getprop ro.build.characteristics
+          adb shell wm size
+          adb shell wm density
+
+          echo "Starting ADB relay..."
+          nohup socat \
+            TCP-LISTEN:5037,fork,reuseaddr,bind="${TS_IP}" \
+            TCP:127.0.0.1:5037 \
+            > /tmp/socat-adb.log 2>&1 &
+
+          echo "Starting scrcpy port relay..."
+          nohup socat \
+            TCP-LISTEN:27183,fork,reuseaddr,bind="${TS_IP}" \
+            TCP:127.0.0.1:27183 \
+            > /tmp/socat-scrcpy.log 2>&1 &
+
+          sleep 3
+
+          echo "======================================"
+          echo "ANDROID PHONE READY"
+          echo "Tailscale IP : ${TS_IP}"
+          echo "ADB server   : ${TS_IP}:5037"
+          echo "scrcpy port  : ${TS_IP}:27183"
+          echo "======================================"
+
+          # Keep the action running without multiline shell parsing.
+          while true; do
+            sleep 20
+            adb devices >/dev/null 2>&1 || true
+
+            CURRENT_TIME="$(date +%s)"
+            if [ "$((CURRENT_TIME % 300))" -lt 20 ]; then
+              echo "alive $(date -u +%H:%M:%S)"
+            fi
+          done
+          EMULATOR_SCRIPT
+
+          chmod +x /tmp/android-emulator-script.sh
+          bash -n /tmp/android-emulator-script.sh
+          echo "Emulator script syntax check passed."
 
       - name: Run Android phone emulator
         uses: reactivecircus/android-emulator-runner@v2
@@ -68,41 +135,4 @@ jobs:
           force-avd-creation: true
           emulator-boot-timeout: 900
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-boot-anim -noaudio -no-metrics -camera-back none -camera-front none
-          script: |
-            set -eu
-
-            echo "Checking Android emulator..."
-            adb devices
-            adb shell getprop ro.product.model
-            adb shell getprop ro.build.characteristics
-            adb shell wm size
-            adb shell wm density
-
-            echo "Starting ADB TCP relay..."
-            nohup socat TCP-LISTEN:5037,fork,reuseaddr,bind="${TS_IP}" TCP:127.0.0.1:5037 > socat-adb.log 2>&1 &
-
-            echo "Starting scrcpy TCP relay..."
-            nohup socat TCP-LISTEN:27183,fork,reuseaddr,bind="${TS_IP}" TCP:127.0.0.1:27183 > socat-scrcpy.log 2>&1 &
-
-            sleep 3
-
-            echo "======================================"
-            echo "ANDROID PHONE READY"
-            echo "Tailscale IP : ${TS_IP}"
-            echo "ADB server   : ${TS_IP}:5037"
-            echo "scrcpy port  : ${TS_IP}:27183"
-            echo "======================================"
-
-            while true
-            do
-              sleep 20
-
-              if ! adb devices >/dev/null 2>&1; then
-                echo "ADB check failed; retrying..."
-              fi
-
-              CURRENT_TIME=$(date +%s)
-              if [ $((CURRENT_TIME % 300)) -lt 20 ]; then
-                echo "alive $(date -u +%H:%M:%S)"
-              fi
-            done
+          script: bash /tmp/android-emulator-script.sh
