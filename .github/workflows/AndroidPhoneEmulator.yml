@@ -1,0 +1,86 @@
+name: Android Phone Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    steps:
+      # -----------------------------------
+      # Enable KVM (شتاب سخت‌افزاری)
+      # -----------------------------------
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "KVM not available"
+
+      # -----------------------------------
+      # Install packages
+      # -----------------------------------
+      - name: Install packages
+        run: |
+          sudo apt update -y
+          sudo apt install -y curl jq lsb-release socat
+
+      # -----------------------------------
+      # Tailscale
+      # -----------------------------------
+      - name: Add Tailscale GPG key
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+      - name: Add Tailscale repository
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+      - name: Install Tailscale
+        run: |
+          sudo apt update
+          sudo apt install -y tailscale
+
+      - name: Start tailscaled
+        run: |
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-android-${{ github.run_id }} --accept-routes
+          echo "TS_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          tailscale status
+
+      # -----------------------------------
+      # Run Android phone emulator (Pixel 7)
+      # -----------------------------------
+      - name: Run Android phone emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_7
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 16G
+          disable-animations: true
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-boot-anim -camera-back none -camera-front none -noaudio
+          script: |
+            adb devices
+            adb shell getprop ro.product.model
+            adb shell getprop ro.build.characteristics
+            adb shell wm size
+            adb shell wm density
+            nohup socat TCP-LISTEN:5555,fork,reuseaddr,bind=$TS_IP TCP:127.0.0.1:5555 > socat.log 2>&1 &
+            sleep 3
+            echo "======================================"
+            echo "  ANDROID PHONE READY"
+            echo "  Tailscale IP : $TS_IP"
+            echo "  Connect      : adb connect $TS_IP:5555"
+            echo "  Then run     : scrcpy -s $TS_IP:5555"
+            echo "======================================"
+            sleep 16500
