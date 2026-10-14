@@ -76,4 +76,9 @@ jobs:
             echo "  ADB server   : ${{ env.TS_IP }}:5037"
             echo "  scrcpy port  : ${{ env.TS_IP }}:27183"
             echo "======================================"
-            while true; do sleep 300; echo "alive $(date -u +%H:%M:%S)"; done
+            while true; do
+              sleep 20
+              # اگر adb server مرده باشد، این دستور خودکار دوباره بالایش می‌آورد
+              adb devices > /dev/null 2>&1 || true
+              if [ $(( $(date +%s) % 300 )) -lt 20 ]; then echo "alive $(date -u +%H:%M:%S)"; fi
+            done
