@@ -1,0 +1,84 @@
+name: Duck collector → DuckMail Hub
+
+# جمع‌آوری آدرس‌های duck.com با راند‌روبین بین توکن‌های داک‌داک‌گو
+# و ثبت هر آدرس تازه در وردپرس DuckMail Hub.
+#
+# تنظیمات لازم (Settings → Secrets and variables → Actions):
+#   HUB_URL      ← (Variable یا Secret) مثلا https://your-site.example.com  (ریشه سایت وردپرس)
+#   HUB_API_KEY  ← (Secret پیشنهادی، Variable هم قبول است) کلید هاب dhk_… با مجوز pool
+#   DDG_TOKENS   ← (Secret پیشنهادی، Variable هم قبول است) استخر توکن‌ها، هر خط یکی
+#
+# اولویت مقدارها: ورودی دستی (فقط برای توکن) ← Variable ← Secret
+
+on:
+  workflow_dispatch:
+    inputs:
+      interval_seconds:
+        description: 'فاصله (ثانیه) بین هر دریافت ایمیل داک'
+        required: false
+        default: '45'
+      duck_tokens:
+        description: 'توکن‌ها (اختیاری، در UI دیده می‌شود؛ بهتر است خالی بماند و از Secret DDG_TOKENS استفاده شود)'
+        required: false
+        default: ''
+      max_addresses:
+        description: 'حداکثر آدرس موفق در این اجرا (0 = تا وقتی توکن‌ها می‌کشند ادامه بده)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write # برای کامیت کردن used-addresses.txt در پایان
+
+concurrency:
+  group: duck-collector
+  cancel-in-progress: false # دو کلکتور همزمان توکن‌ها را نمی‌کُشند
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340 # سقف گیتهاب ۳۶۰ دقیقه است؛ اسکریپت خودش ۳۲۰ دقیقه‌ای تمیز متوقف می‌شود
+    env:
+      HUB_URL: ${{ vars.HUB_URL || secrets.HUB_URL }}
+      HUB_KEY: ${{ vars.HUB_API_KEY || secrets.HUB_API_KEY }}
+      DUCK_TOKENS: ${{ inputs.duck_tokens || vars.DDG_TOKENS || secrets.DDG_TOKENS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Validate configuration
+        run: |
+          fail=0
+          [ -n "$HUB_URL" ]     || { echo "::error::HUB_URL تنظیم نشده (Variable یا Secret با نام HUB_URL)"; fail=1; }
+          [ -n "$HUB_KEY" ]     || { echo "::error::HUB_API_KEY تنظیم نشده (Variable یا Secret)"; fail=1; }
+          [ -n "$DUCK_TOKENS" ] || { echo "::error::DDG_TOKENS تنظیم نشده و ورودی هم خالی است"; fail=1; }
+          exit $fail
+
+      - name: Collect addresses (round-robin) → Hub
+        env:
+          INTERVAL_SECONDS: ${{ inputs.interval_seconds }}
+          MAX_ADDRESSES: ${{ inputs.max_addresses }}
+          MAX_RUNTIME_MINUTES: '320'
+          COOLDOWN_SECONDS: '600'
+          USED_FILE: ${{ github.workspace }}/used-addresses.txt
+        run: node scripts/collect-to-hub.js
+
+      - name: Commit used-addresses.txt (حافظه تکراری برای اجرای بعدی)
+        if: always()
+        run: |
+          touch used-addresses.txt
+          git config user.name  "duck-collector"
+          git config user.email "actions@users.noreply.github.com"
+          git add used-addresses.txt
+          if git diff --cached --quiet; then
+            echo "تغییری نبود."
+          else
+            n=$(git diff --cached --numstat | awk '{print $1}')
+            git commit -m "collector: record ${n} new duck address(es)"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
