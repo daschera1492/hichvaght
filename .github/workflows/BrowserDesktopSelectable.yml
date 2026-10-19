@@ -1,0 +1,116 @@
+name: Browser Desktop Selectable
+
+on:
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: "Browser"
+        type: choice
+        default: firefox
+        options:
+          - firefox
+          - chromium
+          - chrome
+          - edge
+          - duckduckgo   # Firefox + DuckDuckGo start page
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+
+    steps:
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-browser-${{ github.run_id }} \
+            --accept-dns=false
+          for i in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "FATAL: Tailscale did not get an IP (check TAILSCALE_AUTH_KEY)"
+            tailscale status || true
+            exit 1
+          fi
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          tailscale status
+
+      - name: Start browser container
+        env:
+          BROWSER: ${{ inputs.browser }}
+          VNC_PW: ${{ secrets.VNC_PW }}
+        run: |
+          mkdir -p "$PWD/config"
+          START_URL="https://duckduckgo.com/"
+
+          case "$BROWSER" in
+            firefox|duckduckgo)
+              IMAGE="lscr.io/linuxserver/firefox:latest"
+              PORT=3001
+              ARGS=(-e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku
+                    -v "$PWD/config:/config" --security-opt seccomp=unconfined
+                    --shm-size=1gb -p 3000:3000 -p 3001:3001)
+              [ "$BROWSER" = "duckduckgo" ] && ARGS+=(-e FIREFOX_CLI="$START_URL")
+              ;;
+            chromium)
+              IMAGE="lscr.io/linuxserver/chromium:latest"
+              PORT=3001
+              ARGS=(-e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku
+                    -v "$PWD/config:/config" --security-opt seccomp=unconfined
+                    --shm-size=1gb -p 3000:3000 -p 3001:3001
+                    -e CHROME_CLI="$START_URL")
+              ;;
+            chrome)
+              IMAGE="kasmweb/chrome:1.16.0"
+              PORT=6901
+              ARGS=(-e VNC_PW="$VNC_PW" --shm-size=1gb -p 6901:6901)
+              ;;
+            edge)
+              IMAGE="kasmweb/edge:1.16.0"
+              PORT=6901
+              ARGS=(-e VNC_PW="$VNC_PW" --shm-size=1gb -p 6901:6901)
+              ;;
+            *)
+              echo "Unknown browser: $BROWSER"; exit 1 ;;
+          esac
+
+          echo "PORT=$PORT" >> $GITHUB_ENV
+          echo "BROWSER_NAME=$BROWSER" >> $GITHUB_ENV
+
+          docker run -d --name browser "${ARGS[@]}" "$IMAGE"
+
+          for i in $(seq 1 30); do
+            if curl -ks -o /dev/null "https://localhost:$PORT"; then
+              echo "UI is up after ~$((i*2))s"
+              break
+            fi
+            sleep 2
+          done
+          docker ps -a
+          docker logs browser --tail 30
+
+      - name: Keep alive
+        run: |
+          echo "======================================"
+          echo "  BROWSER READY: $BROWSER_NAME"
+          echo "  Open (HTTPS):"
+          echo "  https://$TS_IP:$PORT"
+          if [ "$PORT" = "6901" ]; then
+            echo "  Login: kasm_user / <your VNC_PW secret>"
+          fi
+          echo "  Accept the self-signed certificate warning"
+          echo "======================================"
+          while true; do
+            sleep 300
+            st=$(docker inspect -f '{{.State.Status}}' browser 2>/dev/null || echo "gone")
+            echo "[$(date -u +%H:%M:%S)] alive | container=$st"
+          done
