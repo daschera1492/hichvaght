@@ -12,7 +12,6 @@ on:
           - chromium
           - chrome
           - edge
-          - duckduckgo   # Firefox + DuckDuckGo start page
 
 jobs:
   browser:
@@ -44,40 +43,124 @@ jobs:
           echo "TS_IP=$TS_IP" >> $GITHUB_ENV
           tailscale status
 
+      - name: Prepare DuckDuckGo policies
+        env:
+          EMAIL_URL: https://duckduckgo.com/email/settings
+        run: |
+          mkdir -p "$PWD/config" "$PWD/policies" "$PWD/init"
+
+          # ---------- Firefox ----------
+          cat > "$PWD/policies/firefox.json" <<EOF
+          {
+            "policies": {
+              "DisableAppUpdate": true,
+              "OverrideFirstRunPage": "",
+              "OverridePostUpdatePage": "",
+              "Homepage": { "URL": "$EMAIL_URL", "StartPage": "homepage" },
+              "SearchEngines": { "Default": "DuckDuckGo" },
+              "ExtensionSettings": {
+                "jid1-ZAdIEUB7XOzOJw@jetpack": {
+                  "installation_mode": "force_installed",
+                  "install_url": "https://addons.mozilla.org/firefox/downloads/latest/duckduckgo-for-firefox/latest.xpi"
+                }
+              }
+            }
+          }
+          EOF
+
+          # ---------- Chromium / Chrome ----------
+          cat > "$PWD/policies/chrome.json" <<EOF
+          {
+            "ExtensionInstallForcelist": [
+              "bkdgflcldnnnapblkhphbgpggdiikppg;https://clients2.google.com/service/update2/crx"
+            ],
+            "DefaultSearchProviderEnabled": true,
+            "DefaultSearchProviderName": "DuckDuckGo",
+            "DefaultSearchProviderKeyword": "ddg",
+            "DefaultSearchProviderSearchURL": "https://duckduckgo.com/?q={searchTerms}",
+            "DefaultSearchProviderSuggestURL": "https://duckduckgo.com/ac/?q={searchTerms}&type=list",
+            "HomepageLocation": "$EMAIL_URL",
+            "HomepageIsNewTabPage": false,
+            "ShowHomeButton": true,
+            "RestoreOnStartup": 4,
+            "RestoreOnStartupURLs": ["$EMAIL_URL"]
+          }
+          EOF
+
+          # ---------- Edge ----------
+          cat > "$PWD/policies/edge.json" <<EOF
+          {
+            "ExtensionInstallForcelist": [
+              "caoacbimdbbljakfhgikoodekdnlcgpk;https://edge.microsoft.com/extensionwebstorebase/v1/crx"
+            ],
+            "DefaultSearchProviderEnabled": true,
+            "DefaultSearchProviderName": "DuckDuckGo",
+            "DefaultSearchProviderKeyword": "ddg",
+            "DefaultSearchProviderSearchURL": "https://duckduckgo.com/?q={searchTerms}",
+            "DefaultSearchProviderSuggestURL": "https://duckduckgo.com/ac/?q={searchTerms}&type=list",
+            "HomepageLocation": "$EMAIL_URL",
+            "HomepageIsNewTabPage": false,
+            "ShowHomeButton": true,
+            "RestoreOnStartup": 4,
+            "RestoreOnStartupURLs": ["$EMAIL_URL"]
+          }
+          EOF
+
+          # ---------- Firefox init script (runs as root inside container) ----------
+          cat > "$PWD/init/10-ddg-policies.sh" <<'EOF'
+          #!/bin/bash
+          for d in /usr/lib/firefox /usr/lib/firefox-esr /usr/lib64/firefox /opt/firefox; do
+            [ -d "$d" ] || continue
+            mkdir -p "$d/distribution"
+            cp /policies/firefox.json "$d/distribution/policies.json"
+            echo "[ddg] policies.json written to $d/distribution"
+          done
+          EOF
+
+          chmod 755 "$PWD/init/10-ddg-policies.sh"
+          chmod 644 "$PWD"/policies/*.json
+          echo "EMAIL_URL=$EMAIL_URL" >> $GITHUB_ENV
+
       - name: Start browser container
         env:
           BROWSER: ${{ inputs.browser }}
           VNC_PW: ${{ secrets.VNC_PW }}
         run: |
-          mkdir -p "$PWD/config"
-          START_URL="https://duckduckgo.com/"
-
           case "$BROWSER" in
-            firefox|duckduckgo)
+            firefox)
               IMAGE="lscr.io/linuxserver/firefox:latest"
               PORT=3001
               ARGS=(-e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku
-                    -v "$PWD/config:/config" --security-opt seccomp=unconfined
-                    --shm-size=1gb -p 3000:3000 -p 3001:3001)
-              [ "$BROWSER" = "duckduckgo" ] && ARGS+=(-e FIREFOX_CLI="$START_URL")
+                    -v "$PWD/config:/config"
+                    -v "$PWD/policies:/policies:ro"
+                    -v "$PWD/init:/custom-cont-init.d:ro"
+                    --security-opt seccomp=unconfined
+                    --shm-size=1gb -p 3000:3000 -p 3001:3001
+                    -e FIREFOX_CLI="$EMAIL_URL")
               ;;
             chromium)
               IMAGE="lscr.io/linuxserver/chromium:latest"
               PORT=3001
               ARGS=(-e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Asia/Baku
-                    -v "$PWD/config:/config" --security-opt seccomp=unconfined
+                    -v "$PWD/config:/config"
+                    -v "$PWD/policies/chrome.json:/etc/chromium/policies/managed/ddg.json:ro"
+                    --security-opt seccomp=unconfined
                     --shm-size=1gb -p 3000:3000 -p 3001:3001
-                    -e CHROME_CLI="$START_URL")
+                    -e CHROME_CLI="$EMAIL_URL")
               ;;
             chrome)
               IMAGE="kasmweb/chrome:1.16.0"
               PORT=6901
-              ARGS=(-e VNC_PW="$VNC_PW" --shm-size=1gb -p 6901:6901)
+              ARGS=(-e VNC_PW="$VNC_PW"
+                    -v "$PWD/policies/chrome.json:/etc/opt/chrome/policies/managed/ddg.json:ro"
+                    --shm-size=1gb -p 6901:6901)
               ;;
             edge)
               IMAGE="kasmweb/edge:1.16.0"
               PORT=6901
-              ARGS=(-e VNC_PW="$VNC_PW" --shm-size=1gb -p 6901:6901)
+              ARGS=(-e VNC_PW="$VNC_PW"
+                    -v "$PWD/policies/edge.json:/etc/opt/edge/policies/managed/ddg.json:ro"
+                    --shm-size=1gb -p 6901:6901)
               ;;
             *)
               echo "Unknown browser: $BROWSER"; exit 1 ;;
