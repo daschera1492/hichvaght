@@ -45,7 +45,7 @@ jobs:
 
       - name: Prepare DuckDuckGo policies
         env:
-          EMAIL_URL: https://duckduckgo.com/email/settings
+          EMAIL_URL: https://duckduckgo.com/email
         run: |
           mkdir -p "$PWD/config" "$PWD/policies" "$PWD/init"
 
