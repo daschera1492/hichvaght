@@ -1,4 +1,4 @@
-name: RDP Mail
+name: RDP
 
 on:
   workflow_dispatch:
@@ -187,34 +187,35 @@ jobs:
 
       - name: Install OpenCode
         shell: pwsh
+        timeout-minutes: 10
         run: |
-          $installer = "$env:TEMP\opencode-setup.exe"
-          Write-Host "Downloading OpenCode..."
-          Invoke-WebRequest -Uri "https://opencode.ai/download/stable/windows-x64-nsis" -OutFile $installer -UseBasicParsing
+          Write-Host "Installing OpenCode via npm..."
+          npm install -g opencode-ai
+          if ($LASTEXITCODE -ne 0) { throw "npm install -g opencode-ai failed" }
 
-          Write-Host "Installing OpenCode (silent)..."
-          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
-          Remove-Item $installer -Force -ErrorAction SilentlyContinue
-
-          # پیدا کردن فایل اجرایی و ساخت شورتکات روی دسکتاپ همه‌ی یوزرها
-          $searchRoots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}")
-          $exe = foreach ($root in $searchRoots) {
-              Get-ChildItem -Path $root -Filter "*opencode*.exe" -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch "unins|uninstall|update" } |
-                Select-Object -First 1
+          # مطمئن شو پوشه‌ی global npm توی PATH سیستم هست (برای یوزر RDP)
+          $npmPrefix = (npm prefix -g).Trim()
+          Write-Host "npm global prefix: $npmPrefix"
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*$npmPrefix*") {
+              [Environment]::SetEnvironmentVariable("Path", "$machinePath;$npmPrefix", "Machine")
+              Write-Host "Added $npmPrefix to machine PATH"
           }
-          $exe = $exe | Select-Object -First 1
+          $env:Path = "$env:Path;$npmPrefix"
 
-          if ($exe) {
-              Write-Host "OpenCode installed at: $($exe.FullName)"
-              $shell = New-Object -ComObject WScript.Shell
-              $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\OpenCode.lnk")
-              $lnk.TargetPath = $exe.FullName
-              $lnk.WorkingDirectory = $exe.DirectoryName
-              $lnk.Save()
-          } else {
-              Write-Warning "OpenCode exe not found after install, check installer behavior"
-          }
+          # تست نصب
+          & "$npmPrefix\opencode.cmd" --version
+
+          # شورتکات روی دسکتاپ همه‌ی یوزرها: ترمینال با opencode داخل پوشه‌ی project
+          New-Item -ItemType Directory -Path "C:\Users\Public\Desktop\project" -Force | Out-Null
+          $shell = New-Object -ComObject WScript.Shell
+          $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\OpenCode.lnk")
+          $lnk.TargetPath = "powershell.exe"
+          $lnk.Arguments = "-NoExit -Command opencode"
+          $lnk.WorkingDirectory = "C:\Users\Public\Desktop\project"
+          $lnk.Save()
+
+          Write-Host "OpenCode installed"
 
       - name: Add Persian (Farsi) Keyboard
         shell: pwsh
@@ -298,6 +299,7 @@ jobs:
           Write-Host ""
           Write-Host "Project folder: Desktop\project (GmailDuck, duckmail-hub)"
           Write-Host "GmailDuck log:  C:\Users\Public\Desktop\project\GmailDuck\start.log"
+          Write-Host "OpenCode: shortcut on Desktop (or run 'opencode' in terminal)"
           Write-Host ""
           Write-Host "After reboot, wait 1-2 minutes for reconnection"
           Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
