@@ -1,4 +1,4 @@
-name: RDP mail
+name: RDP
 
 on:
   workflow_dispatch:
@@ -185,7 +185,63 @@ jobs:
               Write-Warning "RDP test failed, but continuing"
           }
 
-      # ===================== مرحله‌ی جدید =====================
+      - name: Install OpenCode
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\opencode-setup.exe"
+          Write-Host "Downloading OpenCode..."
+          Invoke-WebRequest -Uri "https://opencode.ai/download/stable/windows-x64-nsis" -OutFile $installer -UseBasicParsing
+
+          Write-Host "Installing OpenCode (silent)..."
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          # پیدا کردن فایل اجرایی و ساخت شورتکات روی دسکتاپ همه‌ی یوزرها
+          $searchRoots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}")
+          $exe = foreach ($root in $searchRoots) {
+              Get-ChildItem -Path $root -Filter "*opencode*.exe" -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch "unins|uninstall|update" } |
+                Select-Object -First 1
+          }
+          $exe = $exe | Select-Object -First 1
+
+          if ($exe) {
+              Write-Host "OpenCode installed at: $($exe.FullName)"
+              $shell = New-Object -ComObject WScript.Shell
+              $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\OpenCode.lnk")
+              $lnk.TargetPath = $exe.FullName
+              $lnk.WorkingDirectory = $exe.DirectoryName
+              $lnk.Save()
+          } else {
+              Write-Warning "OpenCode exe not found after install, check installer behavior"
+          }
+
+      - name: Add Persian (Farsi) Keyboard
+        shell: pwsh
+        run: |
+          # 00000429 = کیبورد فارسی (fa-IR)
+          # 1) برای یوزر فعلی runner
+          try {
+              $list = Get-WinUserLanguageList
+              if (-not ($list.LanguageTag -contains "fa-IR")) {
+                  $list.Add("fa-IR")
+                  Set-WinUserLanguageList $list -Force
+              }
+          } catch { Write-Warning "Set-WinUserLanguageList failed: $_" }
+
+          # 2) برای یوزرهای جدید (از جمله RDP) از طریق Default User hive
+          reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT" | Out-Null
+          reg add "HKU\DefaultUser\Keyboard Layout\Preload" /v 1 /t REG_SZ /d 00000409 /f | Out-Null
+          reg add "HKU\DefaultUser\Keyboard Layout\Preload" /v 2 /t REG_SZ /d 00000429 /f | Out-Null
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefaultUser | Out-Null
+
+          # 3) برای صفحه‌ی لاگین (.DEFAULT)
+          reg add "HKU\.DEFAULT\Keyboard Layout\Preload" /v 2 /t REG_SZ /d 00000429 /f | Out-Null
+
+          Write-Host "Persian keyboard added (switch with Alt+Shift or Win+Space)"
+
       - name: Setup Project (clone repos + npm install + npm start)
         shell: pwsh
         env:
@@ -226,7 +282,6 @@ jobs:
           if (Test-Path "$projectDir\GmailDuck\start.log") {
               Get-Content "$projectDir\GmailDuck\start.log" -TotalCount 30
           }
-      # ========================================================
 
       - name: Display Connection Info
         run: |
