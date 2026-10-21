@@ -483,6 +483,22 @@ async function collectOnce(t) {
   try {
     const hubRes = await registerInHub(email);
     hubDupTotal += hubRes.duplicates;
+
+    // The hub already had this address → DuckDuckGo re-emitted an alias we
+    // collected before, which is the daily-quota signal. The local state file
+    // may be gone (fresh clone, lost file), but the hub remembers, so the
+    // token is retired here as well.
+    if (hubRes.duplicates > 0) {
+      t.dup += 1;
+      totalDup += 1;
+      t.state = 'retired';
+      t.reason = 'duplicate';
+      log({ token: tag(t), email, event: 'retired', reason: 'ddg-duplicate (hub already had it)' });
+      summary.push(`| ${tag(t)} | \`${email}\` | تکراری (هاب از قبل داشت) — توکن بازنشسته شد |`);
+      rememberAddress(email);
+      return 'retired-duplicate';
+    }
+
     t.ok += 1;
     totalOk += 1;
     rememberAddress(email);
@@ -495,7 +511,7 @@ async function collectOnce(t) {
       by_source: hubRes.bySource,
       total_ok: totalOk,
     });
-    summary.push(`| ${tag(t)} | \`${email}\` | ثبت شد${hubRes.duplicates ? ' (قبلاً در هاب بود — توکن سالم ماند)' : ''} |`);
+    summary.push(`| ${tag(t)} | \`${email}\` | ثبت شد |`);
     return 'ok';
   } catch (err) {
     t.fail += 1;

@@ -1,0 +1,22 @@
+# Keep every text file LF on checkout.
+#
+# The collector script starts with a shebang (`#!/usr/bin/env node`); a CRLF
+# checkout would break it on Unix runners.
+* text=auto eol=lf
+
+*.js  text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.woff binary
+*.woff2 binary
