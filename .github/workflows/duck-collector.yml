@@ -1,7 +1,7 @@
 name: Duck collector → DuckMail Hub
 
 # جمع‌آوری آدرس‌های duck.com با راند‌روبین بین توکن‌های داک‌داک‌گو
-# و ثبت هر آدرس تازه در وردپرس DuckMail Hub.
+# و ثبت هر آدرس تازه در DuckMail Hub (POST /pool/emails — منبع داخلی `duck`).
 #
 # تنظیمات لازم (Settings → Secrets and variables → Actions):
 #   HUB_URL      ← (Variable یا Secret) مثلا https://your-site.example.com  (ریشه سایت وردپرس)
@@ -9,6 +9,9 @@ name: Duck collector → DuckMail Hub
 #   DDG_TOKENS   ← (Secret پیشنهادی، Variable هم قبول است) استخر توکن‌ها، هر خط یکی
 #
 # اولویت مقدارها: ورودی دستی (فقط برای توکن) ← Variable ← Secret
+#
+# یادآوری: هاب هر آدرس duck.com را زیر source=duck فایل می‌کند؛
+# اپ اتوماسیون با claim(source:'duck') همان را برمی‌دارد.
 
 on:
   workflow_dispatch:
@@ -73,12 +76,12 @@ jobs:
           touch used-addresses.txt
           git config user.name  "duck-collector"
           git config user.email "actions@users.noreply.github.com"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
           git add used-addresses.txt
           if git diff --cached --quiet; then
             echo "تغییری نبود."
           else
             n=$(git diff --cached --numstat | awk '{print $1}')
             git commit -m "collector: record ${n} new duck address(es)"
-            git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push
           fi
