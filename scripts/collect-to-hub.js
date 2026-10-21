@@ -86,6 +86,22 @@ function normalizeHubUrl(raw) {
   return base;
 }
 
+/**
+ * Secrets/Variables often pick up invisible Unicode on copy & paste (RTL
+ * marks, BOM, NBSP, smart quotes…). Node refuses to put such characters in
+ * an HTTP header (ERR_INVALID_CHAR: "Invalid character in header content").
+ * Keep printable ASCII only and report how many characters were dropped —
+ * the values themselves are masked, so only counts are logged.
+ */
+function sanitizeAscii(v, field) {
+  const before = String(v || '');
+  const clean = before.replace(/[^\x21-\x7E]/g, '');
+  if (clean.length !== before.length) {
+    log({ event: 'input-sanitized', field, removed: before.length - clean.length });
+  }
+  return clean;
+}
+
 function hubRequest(urlString, { method = 'GET', headers = {}, body = null, timeout = 30000 } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(urlString);
@@ -238,7 +254,7 @@ function extractAddress(json, raw, domain) {
 function parseTokens(raw) {
   return String(raw || '')
     .split(/[\r\n,;]+/)
-    .map((t) => t.trim().replace(/^Bearer\s+/i, ''))
+    .map((t) => sanitizeAscii(t, 'token').trim().replace(/^Bearer\s+/i, ''))
     .filter(Boolean)
     .filter((t, i, a) => a.indexOf(t) === i);
 }
@@ -264,10 +280,13 @@ function knownAddressesFromText(raw) {
 
 const problems = [];
 
+// URL: strip invisible characters *before* validating so a RTL-marked
+// pasted URL cannot fail unnoticed.
 let HUB_URL = '';
-try { HUB_URL = normalizeHubUrl(process.env.HUB_URL); } catch (e) { problems.push(e.message); }
+try { HUB_URL = normalizeHubUrl(sanitizeAscii(process.env.HUB_URL, 'hub_url')); } catch (e) { problems.push(e.message); }
 
-const HUB_KEY = String(process.env.HUB_KEY || '').trim();
+// The API key must survive a raw HTTP header: printable ASCII only.
+const HUB_KEY = sanitizeAscii(process.env.HUB_KEY, 'hub_key') || '';
 if (!HUB_KEY) problems.push('HUB_KEY خالی است (Variable یا Secret با نام HUB_API_KEY بسازید)');
 
 const TOKENS = parseTokens(process.env.DUCK_TOKENS);
