@@ -1,0 +1,270 @@
+name: RDP mail
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Set-Service -Name TermService -StartupType Automatic
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "*r96319631P-"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "User RDP created successfully"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully"
+
+      - name: Create Reconnection Script
+        run: |
+          $scriptContent = @"
+          `$logFile = "C:\ProgramData\tailscale-reconnect.log"
+          function Write-Log {
+              param(`$Message)
+              `$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              "`$timestamp - `$Message" | Out-File -FilePath `$logFile -Append
+              Write-Host `$Message
+          }
+
+          Write-Log "Starting Tailscale reconnection script..."
+          
+          `$maxWait = 60
+          `$waited = 0
+          while (`$waited -lt `$maxWait) {
+              `$service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+              if (`$service -and `$service.Status -eq "Running") {
+                  Write-Log "Tailscale service is running"
+                  break
+              }
+              Start-Sleep -Seconds 2
+              `$waited += 2
+              Write-Log "Waiting for Tailscale service... (`$waited seconds)"
+          }
+
+          `$authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          `$hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          `$maxRetries = 10
+          `$retryCount = 0
+          `$connected = `$false
+
+          while (-not `$connected -and `$retryCount -lt `$maxRetries) {
+              try {
+                  Write-Log "Attempting to connect to Tailscale (Attempt `$(`$retryCount + 1)/`$maxRetries)..."
+                  
+                  & "C:\Program Files\Tailscale\tailscale.exe" logout 2>`$null
+                  Start-Sleep -Seconds 2
+                  
+                  `$output = & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=`$authKey --hostname=`$hostname --accept-routes --reset 2>&1
+                  Write-Log "Tailscale up output: `$output"
+                  
+                  Start-Sleep -Seconds 5
+                  `$tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>`$null
+                  
+                  if (`$tsIP -and `$tsIP.Trim() -ne "") {
+                      `$tsIP = `$tsIP.Trim()
+                      Write-Log "Successfully connected! Tailscale IP: `$tsIP"
+                      `$tsIP | Out-File -FilePath "C:\ProgramData\tailscale-ip.txt" -Force
+                      `$connected = `$true
+                  } else {
+                      Write-Log "No IP assigned yet, retrying..."
+                      `$retryCount++
+                      Start-Sleep -Seconds 10
+                  }
+              } catch {
+                  Write-Log "Error: `$_"
+                  `$retryCount++
+                  Start-Sleep -Seconds 10
+              }
+          }
+
+          if (`$connected) {
+              Write-Log "Tailscale connection established successfully"
+              while (`$true) {
+                  Start-Sleep -Seconds 60
+                  `$status = & "C:\Program Files\Tailscale\tailscale.exe" status --json 2>`$null | ConvertFrom-Json
+                  if (`$status.BackendState -ne "Running") {
+                      Write-Log "Connection lost, reconnecting..."
+                      & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=`$authKey --hostname=`$hostname --accept-routes
+                  }
+              }
+          } else {
+              Write-Log "Failed to establish Tailscale connection after `$maxRetries attempts"
+              exit 1
+          }
+          "@
+          
+          $scriptPath = "C:\ProgramData\tailscale-reconnect.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
+          Write-Host "Reconnection script created at $scriptPath"
+
+      - name: Create Startup Scheduled Task
+        run: |
+          Unregister-ScheduledTask -TaskName "TailscaleAutoConnect" -Confirm:$false -ErrorAction SilentlyContinue
+          
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\ProgramData\tailscale-reconnect.ps1`""
+          
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+          $trigger.Delay = "PT30S"
+          
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+          
+          Register-ScheduledTask -TaskName "TailscaleAutoConnect" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+          
+          Write-Host "Scheduled task created successfully"
+
+      - name: Set Tailscale Service to Auto-Start
+        run: |
+          Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+          Write-Host "Tailscale service set to automatic startup"
+
+      - name: Establish Initial Tailscale Connection
+        run: |
+          Write-Host "Connecting to Tailscale..."
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+          Start-Sleep -Seconds 2
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 30) {
+              Start-Sleep -Seconds 3
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) {
+                  $tsIP = $tsIP.Trim()
+              }
+              $retries++
+              Write-Host "Waiting for Tailscale IP... Attempt $retries/30"
+          }
+          
+          if (-not $tsIP -or $tsIP -eq "") {
+              Write-Error "Tailscale IP not assigned after 90 seconds"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          $tsIP | Out-File -FilePath "C:\ProgramData\tailscale-ip.txt" -Force
+          Write-Host "Tailscale connected: $tsIP"
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity on $env:TAILSCALE_IP..."
+          Start-Sleep -Seconds 5
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "RDP is accessible on port 3389"
+          } else {
+              Write-Warning "RDP test failed, but continuing"
+          }
+
+      # ===================== مرحله‌ی جدید =====================
+      - name: Setup Project (clone repos + npm install + npm start)
+        shell: pwsh
+        env:
+          GH_PAT: ${{ secrets.daschera1492 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Public Desktop = روی دسکتاپ همه‌ی یوزرها (از جمله RDP) دیده می‌شود
+          $projectDir = "C:\Users\Public\Desktop\project"
+          New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
+          Set-Location $projectDir
+
+          $repos = @("GmailDuck", "duckmail-hub")
+          foreach ($repo in $repos) {
+              if (Test-Path "$projectDir\$repo") { Remove-Item "$projectDir\$repo" -Recurse -Force }
+              Write-Host "Cloning $repo ..."
+              git clone "https://x-access-token:$($env:GH_PAT)@github.com/daschera1492/$repo.git" "$projectDir\$repo"
+              if ($LASTEXITCODE -ne 0) { throw "Clone failed for $repo" }
+              # حذف توکن از remote تا داخل فایل‌های کلون‌شده نماند
+              git -C "$projectDir\$repo" remote set-url origin "https://github.com/daschera1492/$repo.git"
+          }
+
+          # GmailDuck: npm install
+          Set-Location "$projectDir\GmailDuck"
+          Write-Host "Running npm install ..."
+          npm install
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+
+          # GmailDuck: npm start (در پس‌زمینه تا ورکفلو ادامه پیدا کند)
+          Write-Host "Starting npm start in background ..."
+          Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c npm start > `"$projectDir\GmailDuck\start.log`" 2>&1" `
+            -WorkingDirectory "$projectDir\GmailDuck" `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 10
+          Write-Host "---- start.log (first lines) ----"
+          if (Test-Path "$projectDir\GmailDuck\start.log") {
+              Get-Content "$projectDir\GmailDuck\start.log" -TotalCount 30
+          }
+      # ========================================================
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "========================================"
+          Write-Host "       RDP CONNECTION READY"
+          Write-Host "========================================"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username:     RDP"
+          Write-Host "Password:     *r96319631P-"
+          Write-Host "========================================"
+          Write-Host "Auto-reconnect configured"
+          Write-Host "Survives reboots"
+          Write-Host "Connection will remain active for 60 hours"
+          Write-Host ""
+          Write-Host "Project folder: Desktop\project (GmailDuck, duckmail-hub)"
+          Write-Host "GmailDuck log:  C:\Users\Public\Desktop\project\GmailDuck\start.log"
+          Write-Host ""
+          Write-Host "After reboot, wait 1-2 minutes for reconnection"
+          Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
+
+      - name: Maintain Connection
+        run: |
+          $counter = 0
+          while ($true) {
+              $counter++
+              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              
+              if ($counter % 1 -eq 0) {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  
+                  if ($tsStatus.BackendState -eq "Running" -and $tsIP) {
+                      Write-Host "[$currentTime] RDP Active | Tailscale: Connected ($($tsIP.Trim()))"
+                  } else {
+                      Write-Host "[$currentTime] RDP Active | Tailscale: Reconnecting..."
+                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes 2>$null
+                  }
+              }
+              
+              Start-Sleep -Seconds 300
+          }
