@@ -1,4 +1,4 @@
-name: RDP
+name: RDPMail
 
 on:
   workflow_dispatch:
