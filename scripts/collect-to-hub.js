@@ -39,7 +39,9 @@
 //   DDG_BASE_URL         DuckDuckGo API root                      (default https://quack.duckduckgo.com)
 //   DD_DOMAIN            domain appended to bare local-parts      (default duck.com)
 //
-// No external dependencies — the hub client comes from src/mail/.
+// No external dependencies — the hub client's semantics live inside this file
+// (mirrors src/mail/duckmail-hub.js of the desktop app), so the script runs in
+// ANY repository: only scripts/ + .github/workflows/ are needed.
 
 'use strict';
 
@@ -47,14 +49,23 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const { DuckmailHub, normalizeBaseUrl, HubError } = require('../src/mail/duckmail-hub');
 
 const DDG_PATH = '/api/email/addresses';
-const ADDRESS_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-const LOCAL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{1,62}[A-Za-z0-9])?$/;
-const KNOWN_KEYS = ['address', 'duck_address', 'email', 'private_address', 'forwarder', 'local_part', 'mailbox'];
 
-// ---------------------------------------------------------------- helpers
+// ------------------------------------------------------ hub client (inline)
+// Same behaviour as the app's shared client: base normalisation, timeouts,
+// typed error codes, and retry on network/5xx only.
+
+const HUB_ADD_ATTEMPTS = 3;
+
+class HubError extends Error {
+  constructor(message, code, statusCode) {
+    super(message);
+    this.name = 'HubError';
+    this.code = code || 'HUB_ERROR';
+    this.statusCode = statusCode || null;
+  }
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -65,6 +76,113 @@ function log(obj) {
     : Object.entries(obj).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
   process.stdout.write(`[${new Date().toISOString()}] ${line}\n`);
 }
+
+/** Accept either the site root or the full …/wp-json/duckmail/v1 base. */
+function normalizeHubUrl(raw) {
+  const base = String(raw || '').trim().replace(/\/+$/, '');
+  if (!base) throw new Error('HUB_URL خالی است (Variable یا Secret با نام HUB_URL بسازید)');
+  if (!/^https?:\/\//i.test(base)) throw new Error(`HUB_URL باید با http:// یا https:// شروع شود: "${base}"`);
+  if (!/\/wp-json(\/|$)/.test(base)) return base + '/wp-json/duckmail/v1';
+  return base;
+}
+
+function hubRequest(urlString, { method = 'GET', headers = {}, body = null, timeout = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const client = url.protocol === 'http:' ? http : https;
+    const payload = body === null || body === undefined
+      ? null
+      : (typeof body === 'string' ? body : JSON.stringify(body));
+    const finalHeaders = { ...headers };
+    if (payload !== null) finalHeaders['Content-Length'] = Buffer.byteLength(payload);
+
+    const req = client.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'http:' ? 80 : 443),
+      path: url.pathname + url.search,
+      method,
+      headers: finalHeaders,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
+        resolve({ status: res.statusCode, headers: res.headers || {}, body: text, json });
+      });
+    });
+    req.on('error', (err) => reject(new HubError(`ارتباط با هاب برقرار نشد (${err.code || err.message})`, 'NETWORK')));
+    req.setTimeout(timeout, () => req.destroy(new HubError(`پاسخ هاب در ${timeout}ms نرسید.`, 'TIMEOUT')));
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * POST /pool/emails (perm: pool). The hub files every @duck.com alias under
+ * its internal `duck` source no matter what `source` says, and dedupes
+ * server-side (INSERT IGNORE on a UNIQUE index) — a lost state file can never
+ * create a real duplicate. retry on network/5xx only; 4xx (auth!) is fatal.
+ */
+async function addEmailsToHub({ base, key, emails, source, log }) {
+  for (let attempt = 1; attempt <= HUB_ADD_ATTEMPTS; attempt++) {
+    let res;
+    try {
+      res = await hubRequest(`${base}/pool/emails`, {
+        method: 'POST',
+        headers: {
+          'X-Duck-Key': key,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: { emails, source },
+        timeout: 30000,
+      });
+    } catch (err) {
+      if (attempt === HUB_ADD_ATTEMPTS) {
+        throw new HubError(`هاب جواب نداد (${err.code || err.message}) — بعد از ${attempt} تلاش`, err.code, null);
+      }
+      log({ event: 'hub-transient', attempt, error: err.message });
+      await sleep(800 * attempt);
+      continue;
+    }
+
+    if (res.status >= 200 && res.status < 300) {
+      const data = res.json || {};
+      if (data.ok === false) {
+        throw new HubError('پاسخ هاب نامعتبر بود.', 'BAD_RESPONSE', res.status);
+      }
+      return {
+        added: Number(data.added || 0),
+        duplicates: Number(data.duplicates || 0),
+        invalid: Array.isArray(data.invalid) ? data.invalid : [],
+        bySource: data.by_source || {},
+        poolStatus: data.pool_status || null,
+      };
+    }
+
+    const apiMessage = res.json && res.json.message ? String(res.json.message).replace(/<[^>]+>/g, '') : '';
+    const code = res.json && res.json.code ? String(res.json.code) : `HTTP_${res.status}`;
+    const retryable = res.status >= 500;
+    if (!retryable) {
+      throw new HubError(apiMessage || `هاب خطا برگرداند (HTTP ${res.status})`, code, res.status);
+    }
+    if (attempt === HUB_ADD_ATTEMPTS) {
+      throw new HubError(apiMessage || `هاب خطا برگرداند (HTTP ${res.status})`, code, res.status);
+    }
+    log({ event: 'hub-transient', attempt, code });
+    await sleep(800 * attempt);
+  }
+  /* unreachable */
+}
+
+const ADDRESS_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const LOCAL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{1,62}[A-Za-z0-9])?$/;
+const KNOWN_KEYS = ['address', 'duck_address', 'email', 'private_address', 'forwarder', 'local_part', 'mailbox'];
+
+// ---------------------------------------------------------------- DDG helpers
 
 function rawRequest(urlString, { method = 'GET', headers = {}, body = null, timeout = 20000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -147,8 +265,7 @@ function knownAddressesFromText(raw) {
 const problems = [];
 
 let HUB_URL = '';
-try { HUB_URL = normalizeBaseUrl(process.env.HUB_URL); } catch (e) { problems.push(e.message); }
-if (!HUB_URL) problems.push('HUB_URL خالی است (Variable یا Secret با نام HUB_URL بسازید)');
+try { HUB_URL = normalizeHubUrl(process.env.HUB_URL); } catch (e) { problems.push(e.message); }
 
 const HUB_KEY = String(process.env.HUB_KEY || '').trim();
 if (!HUB_KEY) problems.push('HUB_KEY خالی است (Variable یا Secret با نام HUB_API_KEY بسازید)');
@@ -176,16 +293,8 @@ const DEADLINE = STARTED_AT + MAX_RUNTIME_MS;
 process.stdout.write(`::add-mask::${HUB_KEY}\n`);
 for (const t of TOKENS) process.stdout.write(`::add-mask::${t}\n`);
 
-// The SAME client the desktop app uses (claim/report/inbox/addEmails live on
-// one code path): base-normalising, timeouts, HubError codes and 5xx retries.
-const hub = new DuckmailHub({
-  url: HUB_URL,
-  key: HUB_KEY,
-  // A shared host can stall under load; 30 s is what the app uses too.
-  timeout: 30000,
-  claimedBy: 'gh-collector',
-  log: (msg, level) => log({ event: 'hub', level: level || 'info', msg }),
-});
+// Hub connection (self-contained client above): base-normalising, timeouts,
+// HubError codes and 5xx retries — the same semantics the desktop app has.
 
 // Persistent known set: everything DDG ever made for us (all previous runs).
 const known = new Set();
@@ -225,12 +334,18 @@ const tag = (t) => `${t.index}/${t.total}`;
 // ---------------------------------------------------------------- hub + state file
 
 /**
- * Register one address in the hub via the shared client (POST /pool/emails).
+ * Register one address in the hub via the inline client (POST /pool/emails).
  * The hub files every @duck.com alias under its own `duck` source, so the
  * automation app's claim(source: 'duck') always picks these up.
  */
 async function registerInHub(email) {
-  const r = await hub.addEmails([email.toLowerCase()], 'gh-collector');
+  const r = await addEmailsToHub({
+    base: HUB_URL,
+    key: HUB_KEY,
+    emails: [email.toLowerCase()],
+    source: 'gh-collector',
+    log,
+  });
   if (r.invalid.length) {
     // The hub's own validator refused the address — treat as a real error.
     throw new HubError(`هاب آدرس را نامعتبر رد کرد: ${JSON.stringify(r.invalid)}`, 'BAD_EMAIL');
