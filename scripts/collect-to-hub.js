@@ -286,8 +286,18 @@ let HUB_URL = '';
 try { HUB_URL = normalizeHubUrl(sanitizeAscii(process.env.HUB_URL, 'hub_url')); } catch (e) { problems.push(e.message); }
 
 // The API key must survive a raw HTTP header: printable ASCII only.
-const HUB_KEY = sanitizeAscii(process.env.HUB_KEY, 'hub_key') || '';
-if (!HUB_KEY) problems.push('HUB_KEY خالی است (Variable یا Secret با نام HUB_API_KEY بسازید)');
+let HUB_KEY = sanitizeAscii(process.env.HUB_KEY, 'hub_key');
+HUB_KEY = HUB_KEY.replace(/^Bearer\s+/i, '').trim();
+if (!HUB_KEY) {
+  problems.push('HUB_KEY خالی است (Variable یا Secret با نام HUB_API_KEY بسازید)');
+} else if (!/^dhk_[a-z0-9]{16,}$/i.test(HUB_KEY)) {
+  // Fail BEFORE any DDG request: a doomed run would only burn Slack quota on
+  // the DDG tokens. Keys minted by the hub's panel are dhk_ + long hex.
+  problems.push(
+    'HUB_API_KEY شکل یک کلید هاب نیست (باید «dhk_…» باشد). ' +
+    'در پنل وردپرس → DuckMail Hub → کلیدهای API یک کلید با مجوز pool بگیر و فقط همان مقدار خام را در Secret بگذار.'
+  );
+}
 
 const TOKENS = parseTokens(process.env.DUCK_TOKENS);
 if (!TOKENS.length) problems.push('DUCK_TOKENS خالی است (Secret با نام DDG_TOKENS بسازید یا هنگام اجرا وارد کنید)');
