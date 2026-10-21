@@ -3,14 +3,20 @@
 //
 // Round-robins a pool of DuckDuckGo account tokens: ONE address request per
 // token per round, with a configurable rest in between. Every fresh address
-// is registered into the WordPress DuckMail Hub (POST /pool/emails) and
-// appended to the used-addresses state file.
+// is registered into the WordPress DuckMail Hub (POST /pool/emails) via the
+// app's shared hub client (src/mail/duckmail-hub.js) and appended to the
+// used-addresses state file.
 //
 // The "duplicate" that retires a token is a DuckDuckGo-side signal:
 // when an account exhausts its daily quota, DDG starts re-emitting an
 // address that was already generated before (possibly in an earlier run —
 // hence the persistent used-addresses file). That request is NOT sent to
 // the hub; the token is retired and the round-robin moves on to the rest.
+//
+// Hub-side duplicates are a DIFFERENT signal: the hub dedupes server-side
+// (INSERT IGNORE on a UNIQUE(email) index), so a lost state file can never
+// create a real duplicate. `duplicates > 0` from the hub only means "we
+// already had this one" — the address is remembered and the token survives.
 //
 // Token state machine (per DuckDuckGo account):
 //   401/403                      → invalid token      → retired
@@ -33,7 +39,7 @@
 //   DDG_BASE_URL         DuckDuckGo API root                      (default https://quack.duckduckgo.com)
 //   DD_DOMAIN            domain appended to bare local-parts      (default duck.com)
 //
-// No external dependencies.
+// No external dependencies — the hub client comes from src/mail/.
 
 'use strict';
 
@@ -41,6 +47,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { DuckmailHub, normalizeBaseUrl, HubError } = require('../src/mail/duckmail-hub');
 
 const DDG_PATH = '/api/email/addresses';
 const ADDRESS_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
@@ -110,14 +117,6 @@ function extractAddress(json, raw, domain) {
   return m ? m[0] : null;
 }
 
-function normalizeHubUrl(v) {
-  let base = String(v || '').trim().replace(/\/+$/, '');
-  if (!base) throw new Error('HUB_URL خالی است (Variable یا Secret با نام HUB_URL بسازید)');
-  if (!/^https?:\/\//i.test(base)) throw new Error(`HUB_URL باید با http:// یا https:// شروع شود: "${base}"`);
-  if (!base.includes('/wp-json')) base += '/wp-json/duckmail/v1';
-  return base;
-}
-
 function parseTokens(raw) {
   return String(raw || '')
     .split(/[\r\n,;]+/)
@@ -148,7 +147,8 @@ function knownAddressesFromText(raw) {
 const problems = [];
 
 let HUB_URL = '';
-try { HUB_URL = normalizeHubUrl(process.env.HUB_URL); } catch (e) { problems.push(e.message); }
+try { HUB_URL = normalizeBaseUrl(process.env.HUB_URL); } catch (e) { problems.push(e.message); }
+if (!HUB_URL) problems.push('HUB_URL خالی است (Variable یا Secret با نام HUB_URL بسازید)');
 
 const HUB_KEY = String(process.env.HUB_KEY || '').trim();
 if (!HUB_KEY) problems.push('HUB_KEY خالی است (Variable یا Secret با نام HUB_API_KEY بسازید)');
@@ -176,6 +176,17 @@ const DEADLINE = STARTED_AT + MAX_RUNTIME_MS;
 process.stdout.write(`::add-mask::${HUB_KEY}\n`);
 for (const t of TOKENS) process.stdout.write(`::add-mask::${t}\n`);
 
+// The SAME client the desktop app uses (claim/report/inbox/addEmails live on
+// one code path): base-normalising, timeouts, HubError codes and 5xx retries.
+const hub = new DuckmailHub({
+  url: HUB_URL,
+  key: HUB_KEY,
+  // A shared host can stall under load; 30 s is what the app uses too.
+  timeout: 30000,
+  claimedBy: 'gh-collector',
+  log: (msg, level) => log({ event: 'hub', level: level || 'info', msg }),
+});
+
 // Persistent known set: everything DDG ever made for us (all previous runs).
 const known = new Set();
 try {
@@ -202,7 +213,8 @@ const pool = TOKENS.map((token, i) => ({
 }));
 
 let totalOk = 0;
-let totalDup = 0;
+let totalDup = 0;      // DDG-side duplicates (token-retiring signal)
+let hubDupTotal = 0;   // hub-side duplicates (harmless, already in the pool)
 let hubFatal = false;
 const summary = [];
 
@@ -212,27 +224,18 @@ const tag = (t) => `${t.index}/${t.total}`;
 
 // ---------------------------------------------------------------- hub + state file
 
+/**
+ * Register one address in the hub via the shared client (POST /pool/emails).
+ * The hub files every @duck.com alias under its own `duck` source, so the
+ * automation app's claim(source: 'duck') always picks these up.
+ */
 async function registerInHub(email) {
-  const res = await rawRequest(`${HUB_URL}/pool/emails`, {
-    method: 'POST',
-    headers: {
-      'X-Duck-Key': HUB_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify({ emails: [email], source: 'gh-collector' }),
-    timeout: 25000,
-  });
-  if (res.status === 401 || res.status === 403) {
-    const err = new Error(`hub auth failed (${res.status}) — کلید HUB_API_KEY را بررسی کنید`);
-    err.isHubAuth = true;
-    throw err;
+  const r = await hub.addEmails([email.toLowerCase()], 'gh-collector');
+  if (r.invalid.length) {
+    // The hub's own validator refused the address — treat as a real error.
+    throw new HubError(`هاب آدرس را نامعتبر رد کرد: ${JSON.stringify(r.invalid)}`, 'BAD_EMAIL');
   }
-  if (res.status < 200 || res.status >= 300) {
-    throw new Error(`hub error ${res.status}: ${(res.body || '').slice(0, 120)}`);
-  }
-  const j = res.json || {};
-  return { added: Number(j.added || 0), dups: Number(j.duplicates || 0) };
+  return r;
 }
 
 /** Called only after the hub accepted the address. */
@@ -246,6 +249,18 @@ function rememberAddress(email) {
   } catch (e) {
     log(`warn: cannot append to ${USED_FILE}: ${e.message}`);
   }
+}
+
+/** Authentication failed — every further call would just burn tokens. */
+function retireAllForHubAuth(errMessage) {
+  hubFatal = true;
+  for (const other of pool) {
+    if (other.state !== 'retired') {
+      other.state = 'retired';
+      other.reason = 'hub-auth';
+    }
+  }
+  log({ event: 'fatal', error: errMessage });
 }
 
 // ---------------------------------------------------------------- one request
@@ -322,28 +337,32 @@ async function collectOnce(t) {
 
   // Fresh address → register in the hub, and only then persist it.
   try {
-    const hub = await registerInHub(email);
+    const hubRes = await registerInHub(email);
+    hubDupTotal += hubRes.duplicates;
     t.ok += 1;
     totalOk += 1;
     rememberAddress(email);
-    log({ token: tag(t), email, event: 'registered', hub_added: hub.added, hub_dups: hub.dups, total_ok: totalOk });
-    summary.push(`| ${tag(t)} | \`${email}\` | ثبت شد |`);
+    log({
+      token: tag(t),
+      email,
+      event: 'registered',
+      hub_added: hubRes.added,
+      hub_dups: hubRes.duplicates,
+      by_source: hubRes.bySource,
+      total_ok: totalOk,
+    });
+    summary.push(`| ${tag(t)} | \`${email}\` | ثبت شد${hubRes.duplicates ? ' (قبلاً در هاب بود — توکن سالم ماند)' : ''} |`);
     return 'ok';
   } catch (err) {
     t.fail += 1;
     t.lastError = err.message;
     log({ token: tag(t), email, event: 'hub-error', error: err.message });
     summary.push(`| ${tag(t)} | \`${email}\` | ⚠ ثبت در هاب ناموفق (در فایل ذخیره نشد) |`);
-    if (err.isHubAuth) {
+
+    const code = err.code || String(err.statusCode || '');
+    if (err.statusCode === 401 || err.statusCode === 403 || code.startsWith('HTTP_401') || code.startsWith('HTTP_403')) {
       // کلید/مجوز هاب خراب است: ادامه دادن فقط توکن‌ها را خالی می‌کند — فتال.
-      hubFatal = true;
-      for (const other of pool) {
-        if (other.state !== 'retired') {
-          other.state = 'retired';
-          other.reason = 'hub-auth';
-        }
-      }
-      log({ event: 'fatal', error: err.message });
+      retireAllForHubAuth(`${err.message} (${err.code || err.statusCode})`);
     }
     return 'error';
   }
@@ -411,6 +430,7 @@ function activeTokens() {
   out.push('');
   out.push(`- ثبت موفق در هاب: **${totalOk}**`);
   out.push(`- تکراری سمت داک‌داک‌گو (توکن بازنشسته): ${totalDup}`);
+  out.push(`- تکراری سمت هاب (بی‌خطر — توکن سالم): ${hubDupTotal}`);
   out.push(`- راند‌ها: ${round}`);
   out.push(`- دلیل توقف: \`${stopReason}\``);
   out.push(`- مدت اجرا: ${Math.round((Date.now() - STARTED_AT) / 60000)} دقیقه`);
@@ -433,7 +453,7 @@ function activeTokens() {
     try { fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text); } catch (e) { /* ignore */ }
   }
 
-  log({ done: true, total_ok: totalOk, total_dup: totalDup, stop: stopReason });
+  log({ done: true, total_ok: totalOk, total_dup: totalDup, hub_dups: hubDupTotal, stop: stopReason });
   process.exit(hubFatal ? 1 : 0);
 })().catch((err) => {
   process.stderr.write(`FATAL: ${err.message}\n`);
