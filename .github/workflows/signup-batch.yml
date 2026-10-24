@@ -5,14 +5,21 @@ name: ساخت حساب  —  Signup batch
 # گزارش registered/released ← پایان و بستن خودکار job.
 #
 # ورودی‌ها در لحظهٔ Start workflow (Run workflow) تعیین می‌شوند:
-#   1. count        تعداد حساب برای ساخت
-#   2. email_method duck | generated | erine یا rotate (= تلفیقیِ هر سه)
-#   3. auto         full = کاملاً اتوماتیک (پیش‌فرض)
+#   1. count         تعداد حساب برای ساخت
+#   2. email_method  duck | generated | erine یا rotate (= تلفیقیِ هر سه)
+#   3. auto          full = کاملاً اتوماتیک (پیش‌فرض)
+#   4. proxy_mode    on/off — پروکسی روشن/خاموش
+#   5. proxy         رشتهٔ پروکسی host:port:user:pass (خالی = از Secret)
+#   6. proxy_country کشور خروج پروکسی (پیش‌فرض us)
+#
+# پروکسی چرا: IP رانر عمومی گیت‌هاب دیتاسنتری است و گوگل آخرین مرحلهٔ
+# ثبت‌نام را با `?error=BAD_REQUEST` رد می‌کند (docs/BAD-REQUEST.md).
 #
 # Secret های لازم (Settings → Secrets and variables → Actions):
 #   HUB_URL         آدرس هاب          (قبلاً هم ثبت شده)
 #   HUB_API_KEY     کلید dhk_… هاب     (قبلاً هم ثبت شده)
-#   GMAILDUCK_PAT   توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck (جدید)
+#   PROXY           رشتهٔ پروکسی پیش‌فرض (host:port:user:pass)
+#   GMAILDUCK_PAT   توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck
 
 on:
   workflow_dispatch:
@@ -39,6 +46,42 @@ on:
         options:
           - full
           - manual
+      proxy_mode:
+        description: '۴) پروکسی — on = با پروکسی (IP مسکونی)، off = IP خود رانر گیت‌هاب'
+        required: true
+        default: 'on'
+        type: choice
+        options:
+          - 'on'
+          - 'off'
+      proxy:
+        description: '۵) رشتهٔ پروکسی (host:port:user:pass) — خالی یعنی از Secret پروکسی استفاده شود'
+        required: false
+        default: ''
+      proxy_country:
+        description: '۶) کشور خروج پروکسی — ثبت‌نام با region=US انجام می‌شود، پس us بهترین انتخاب است'
+        required: true
+        default: 'us'
+        type: choice
+        options:
+          - us
+          - ca
+          - gb
+          - de
+          - fr
+          - nl
+          - es
+          - it
+          - se
+          - pl
+          - tr
+          - ae
+          - au
+          - jp
+          - kr
+          - in
+          - br
+          - mx
 
 # دو دستهٔ همزمان از یک IP فقط الگوی ریسک می‌سازند — همیشه یکی پشت سر دیگری.
 concurrency:
@@ -66,6 +109,12 @@ jobs:
       GSA_METHOD: ${{ inputs.email_method }}
       # ۳) کاملاً اتوماتیک
       GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
+      # ۴/۵/۶) پروکسی — وقتی off است رشته خالی می‌شود و ترافیک با IP رانر می‌رود.
+      GSA_PROXY: ${{ inputs.proxy_mode == 'on' && (inputs.proxy != '' && inputs.proxy || secrets.PROXY) || '' }}
+      GSA_PROXY_COUNTRY: ${{ inputs.proxy_country }}
+      GSA_PROXY_STICKY: '1'   # یک IP ثابت برای کل یک ثبت‌نام
+      GSA_PROXY_STRICT: '1'    # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
+      GSA_PROXY_SESSION_MIN: '60'
       # تنظیم‌های ثابت اجرای CI: تک‌تک (بدون همزمانی) و با فاصله، چون IP اینجا
       # دیتاسنتر است و عجله دقیقاً همان چیزی است که `?error=BAD_REQUEST` می‌سازد.
       GSA_CONCURRENCY: '1'
@@ -98,6 +147,17 @@ jobs:
 
       - name: نصب وابستگی‌ها
         run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: بررسی پروکسی
+        if: inputs.proxy_mode == 'on'
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GSA_PROXY)) {
+            Write-Error "proxy_mode روی on است ولی نه ورودی proxy مقداری دارد نه Secret پروکسی — اجرای بدون پروکسی فقط BAD_REQUEST می‌دهد."
+            exit 2
+          }
+          # فقط آدرس سرور؛ رمز هرگز در لاگ نمی‌آید.
+          $server = (($env:GSA_PROXY -replace '^[a-z]+://', '') -split ':')[0..1] -join ':'
+          Write-Host "proxy = $server (country=$env:GSA_PROXY_COUNTRY)"
 
       - name: بررسی پیش از اجرا (هاب + Chrome، بدون ساخت حساب)
         run: node scripts/run-batch.js --preflight --count "$env:GSA_COUNT" --method "$env:GSA_METHOD"
