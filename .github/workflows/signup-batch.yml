@@ -1,0 +1,145 @@
+name: ساخت حساب  —  Signup batch
+
+# اجرای کاملاً خودکارِ اتوماسیون ثبت‌نام گوگل (GmailDuck) روی رانر عمومی ویندوز
+# گیت‌هاب — بدون هیچ دخالت دستی: claim از هاب ← ثبت‌نام ← کد از صندوق هاب ←
+# گزارش registered/released ← پایان و بستن خودکار job.
+#
+# ورودی‌ها در لحظهٔ Start workflow (Run workflow) تعیین می‌شوند:
+#   1. count        تعداد حساب برای ساخت
+#   2. email_method duck | generated | erine یا rotate (= تلفیقیِ هر سه)
+#   3. auto         full = کاملاً اتوماتیک (پیش‌فرض)
+#
+# Secret های لازم (Settings → Secrets and variables → Actions):
+#   HUB_URL         آدرس هاب          (قبلاً هم ثبت شده)
+#   HUB_API_KEY     کلید dhk_… هاب     (قبلاً هم ثبت شده)
+#   GMAILDUCK_PAT   توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck (جدید)
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: '۱) تعداد حساب برای ساخت'
+        required: true
+        default: '1'
+      email_method:
+        description: '۲) منبع ایمیل — rotate یعنی تلفیقیِ هر سه (duck ← generated ← erine)'
+        required: true
+        default: 'duck'
+        type: choice
+        options:
+          - duck
+          - generated
+          - erine
+          - rotate
+      auto:
+        description: '۳) حالت اجرا — full کاملاً اتوماتیک است (تیک و دکمهٔ آخر را هم ماشین می‌زند)'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - manual
+
+# دو دستهٔ همزمان از یک IP فقط الگوی ریسک می‌سازند — همیشه یکی پشت سر دیگری.
+concurrency:
+  group: signup-batch
+  cancel-in-progress: false
+
+permissions:
+  contents: write # ثبت نتیجهٔ هر اجرا در پوشهٔ results/
+
+jobs:
+  batch:
+    runs-on: windows-latest
+    timeout-minutes: 340 # زیر سقف ۶ ساعتهٔ job ها؛ خودِ اسکریپت سقف ۳۰۰ دقیقه دارد.
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: GmailDuck
+
+    env:
+      HUB_URL: ${{ vars.HUB_URL || secrets.HUB_URL }}
+      HUB_KEY: ${{ vars.HUB_KEY || secrets.HUB_API_KEY }}
+      # ۱) تعداد
+      GSA_COUNT: ${{ inputs.count }}
+      # ۲) منبع ایمیل
+      GSA_METHOD: ${{ inputs.email_method }}
+      # ۳) کاملاً اتوماتیک
+      GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
+      # تنظیم‌های ثابت اجرای CI: تک‌تک (بدون همزمانی) و با فاصله، چون IP اینجا
+      # دیتاسنتر است و عجله دقیقاً همان چیزی است که `?error=BAD_REQUEST` می‌سازد.
+      GSA_CONCURRENCY: '1'
+      GSA_DELAY_SEC: '25'
+      GSA_FRESH_PROFILE: '0'
+      GSA_OTP_TIMEOUT_SEC: '240'
+      GSA_TIMEOUT_MIN: '300'
+      GSA_CLAIM_BY: 'gha-${{ github.run_id }}'
+
+    steps:
+      - name: دریافت کد اتوماسیون (مخزن خصوصی GmailDuck)
+        uses: actions/checkout@v5
+        with:
+          repository: daschera1492/GmailDuck
+          ref: main
+          path: GmailDuck
+          token: ${{ secrets.GMAILDUCK_PAT }}
+
+      - name: دریافت مخزن این ورک‌فلو (برای ثبت نتیجه)
+        uses: actions/checkout@v5
+        with:
+          path: hichvaght
+
+      - name: Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: GmailDuck/package-lock.json
+
+      - name: نصب وابستگی‌ها
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: بررسی پیش از اجرا (هاب + Chrome، بدون ساخت حساب)
+        run: node scripts/run-batch.js --preflight --count "$env:GSA_COUNT" --method "$env:GSA_METHOD"
+
+      - name: ساخت حساب‌ها
+        run: node scripts/run-batch.js
+
+      - name: آپلود نتیجه‌ها
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signup-results-${{ github.run_id }}
+          path: |
+            GmailDuck/result.txt
+            GmailDuck/used-addresses.txt
+            GmailDuck/preflight.png
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # حافظهٔ قابل مرور: هر اجرا یک فایل در results/ تا بدون باز کردن لاگ هم
+      # معلوم باشد کدام آدرس‌ها ساخته شدند. شکست این قدم شغل را خراب نمی‌کند.
+      - name: ثبت نتیجه در مخزن
+        if: always()
+        working-directory: hichvaght
+        continue-on-error: true
+        run: |
+          $stamp = (Get-Date).ToString('yyyy-MM-dd-HHmm')
+          $src   = Join-Path $env:GITHUB_WORKSPACE 'GmailDuck\result.txt'
+          New-Item -ItemType Directory -Force -Path results | Out-Null
+          $out = "results/$stamp-run${{ github.run_id }}.txt"
+          if (Test-Path $src) {
+            Copy-Item $src $out -Force
+          } else {
+            Set-Content -Path $out -Value "no result.txt in this run"
+          }
+          git config user.name  "signup-batch"
+          git config user.email "actions@users.noreply.github.com"
+          git pull --rebase origin "${env:GITHUB_REF_NAME}" 2>$null
+          git add $out
+          if (git diff --cached --quiet) {
+            Write-Host "نتیجه‌ای برای ثبت نبود."
+          } else {
+            git commit -m "batch: ${{ github.run_id }} (${env:GSA_COUNT} requested, method=${env:GSA_METHOD})"
+            git push
+          }
