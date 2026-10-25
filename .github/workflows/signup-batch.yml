@@ -183,8 +183,13 @@ jobs:
           try { Set-WinHomeLocation -GeoId $g.windowsGeoId } catch { Write-Warning "Set-WinHomeLocation: $($_.Exception.Message)" }
 
           # اثبات: چیزی که ویندوز واقعاً گزارش می‌کند.
-          $tzId   = (Get-TimeZone).Id
+          # Set-Culture کاربر جاری را در رجیستری می‌نویسد؛ برای همین اگر همین
+          # پروسه مقدار قبلی را کش کرده باشد، یک پروسهٔ تازه می‌پرسیم.
+          $tzId = (Get-TimeZone).Id
           $culture = (Get-Culture).Name
+          if ($culture -ne $g.locale) {
+            $culture = (pwsh -NoProfile -Command '(Get-Culture).Name' | Out-String).Trim()
+          }
           Write-Host "ویندوز الان: language=$culture timezone=$tzId"
           if ($tzId -ne $g.windowsTimezone) { throw "منطقهٔ زمانی ست نشد: $tzId ≠ $($g.windowsTimezone)" }
           if ($culture -ne $g.locale) { throw "زبان/فرهنگ ست نشد: $culture ≠ $($g.locale)" }
