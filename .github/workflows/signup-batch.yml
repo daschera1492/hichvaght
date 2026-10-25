@@ -8,12 +8,20 @@ name: ساخت حساب  —  Signup batch
 #   1. count         تعداد حساب برای ساخت
 #   2. email_method  duck | generated | erine یا rotate (= تلفیقیِ هر سه)
 #   3. auto          full = کاملاً اتوماتیک (پیش‌فرض)
-#   4. proxy_mode    on/off — پروکسی روشن/خاموش
-#   5. proxy         رشتهٔ پروکسی host:port:user:pass (خالی = از Secret)
-#   6. proxy_country کشور خروج پروکسی (پیش‌فرض us)
+#   4. proxy         رشتهٔ پروکسی host:port:user:pass (خالی = از Secret)
+#   5. proxy_country کشور خروج پروکسی (پیش‌فرض us)
 #
-# پروکسی چرا: IP رانر عمومی گیت‌هاب دیتاسنتری است و گوگل آخرین مرحلهٔ
-# ثبت‌نام را با `?error=BAD_REQUEST` رد می‌کند (docs/BAD-REQUEST.md).
+# ── چرا پروکسی به‌تنهایی بی‌فایده بود ──────────────────────────────────────────
+# یک IP مسکونی وقتی «کامپیوتر» هنوز en-US و America/Los_Angeles است، خودش
+# تناقض است: گوگل کشور IP را با زبان مرورگر و منطقهٔ زمانی دستگاه مقایسه
+# می‌کند و تناقض = همان امتیاز ریسکی که آخرِ ثبت‌نام `?error=BAD_REQUEST`
+# می‌دهد. پس ترتیب اجرا این است و هر مرحله سخت‌گیرانه است:
+#
+#   ① پروکسی الزامی است — بدون آن اجرا اصلاً شروع نمی‌شود.
+#   ② زبان ویندوز و کروم دقیقاً روی کشور پروکسی ست می‌شود.
+#   ③ منطقهٔ زمانی ویندوز و کروم دقیقاً روی همان کشور ست می‌شود.
+#   ④ سپس IP واقعیِ خروجی از دو سرویس مستقل پرسیده می‌شود؛ اگر کشورش با
+#      کشور مورد انتظار یکی نبود، کار همان‌جا با شکست تمام می‌شود.
 #
 # Secret های لازم (Settings → Secrets and variables → Actions):
 #   HUB_URL         آدرس هاب          (قبلاً هم ثبت شده)
@@ -46,20 +54,12 @@ on:
         options:
           - full
           - manual
-      proxy_mode:
-        description: '۴) پروکسی — on = با پروکسی (IP مسکونی)، off = IP خود رانر گیت‌هاب'
-        required: true
-        default: 'on'
-        type: choice
-        options:
-          - 'on'
-          - 'off'
       proxy:
-        description: '۵) رشتهٔ پروکسی (host:port:user:pass) — خالی یعنی از Secret پروکسی استفاده شود'
+        description: '۴) رشتهٔ پروکسی (host:port:user:pass) — خالی یعنی از Secret پروکسی استفاده شود'
         required: false
         default: ''
       proxy_country:
-        description: '۶) کشور خروج پروکسی — ثبت‌نام با region=US انجام می‌شود، پس us بهترین انتخاب است'
+        description: '۵) کشور خروج پروکسی — زبان و منطقهٔ زمانی دستگاه هم روی همین کشور ست می‌شود'
         required: true
         default: 'us'
         type: choice
@@ -109,12 +109,16 @@ jobs:
       GSA_METHOD: ${{ inputs.email_method }}
       # ۳) کاملاً اتوماتیک
       GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
-      # ۴/۵/۶) پروکسی — وقتی off است رشته خالی می‌شود و ترافیک با IP رانر می‌رود.
-      GSA_PROXY: ${{ inputs.proxy_mode == 'on' && (inputs.proxy != '' && inputs.proxy || secrets.PROXY) || '' }}
+      # ۴) پروکسی — الزامی. خالی بودن این یعنی `npm` هم شروع نمی‌شود.
+      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || secrets.PROXY }}
       GSA_PROXY_COUNTRY: ${{ inputs.proxy_country }}
       GSA_PROXY_STICKY: '1'   # یک IP ثابت برای کل یک ثبت‌نام
       GSA_PROXY_STRICT: '1'    # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
       GSA_PROXY_SESSION_MIN: '60'
+      # ① پروکسی اجباری است و ④ اگر کشور IP تأیید نشد، اجرا ادامه پیدا نمی‌کند.
+      GSA_REQUIRE_PROXY: '1'
+      GSA_GEO_STRICT: '1'
+      GSA_GEO_CHECK_EACH: '1'  # پیش از هر ثبت‌نام هم کشور IP دوباره چک می‌شود
       # تنظیم‌های ثابت اجرای CI: تک‌تک (بدون همزمانی) و با فاصله، چون IP اینجا
       # دیتاسنتر است و عجله دقیقاً همان چیزی است که `?error=BAD_REQUEST` می‌سازد.
       GSA_CONCURRENCY: '1'
@@ -145,22 +149,69 @@ jobs:
           cache: npm
           cache-dependency-path: GmailDuck/package-lock.json
 
-      - name: نصب وابستگی‌ها
-        run: npm ci --omit=dev --no-audit --no-fund
-
-      - name: بررسی پروکسی
-        if: inputs.proxy_mode == 'on'
+      # ① بدون پروکسی هیچ‌چیز شروع نمی‌شود.
+      - name: ① بررسی وجود پروکسی
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GSA_PROXY)) {
-            Write-Error "proxy_mode روی on است ولی نه ورودی proxy مقداری دارد نه Secret پروکسی — اجرای بدون پروکسی فقط BAD_REQUEST می‌دهد."
+            Write-Error "پروکسی تنظیم نشده — نه ورودی proxy مقداری دارد نه Secret پروکسی. اجرا بدون پروکسی فقط BAD_REQUEST می‌دهد."
             exit 2
           }
           # فقط آدرس سرور؛ رمز هرگز در لاگ نمی‌آید.
           $server = (($env:GSA_PROXY -replace '^[a-z]+://', '') -split ':')[0..1] -join ':'
           Write-Host "proxy = $server (country=$env:GSA_PROXY_COUNTRY)"
 
-      - name: بررسی پیش از اجرا (هاب + Chrome، بدون ساخت حساب)
-        run: node scripts/run-batch.js --preflight --count "$env:GSA_COUNT" --method "$env:GSA_METHOD"
+      # ②③ زبان و منطقهٔ زمانی دستگاه دقیقاً روی کشور پروکسی.
+      - name: ②③ هم‌ترازی زبان و منطقهٔ زمانی ویندوز با کشور پروکسی
+        run: |
+          $geoJson = node -e "const g=require('./src/geo.js');process.stdout.write(JSON.stringify(g.geoProfile(process.argv[1])));" "$env:GSA_PROXY_COUNTRY"
+          if ([string]::IsNullOrWhiteSpace($geoJson)) { throw 'پروفایل جغرافیایی خوانده نشد.' }
+          $g = $geoJson | ConvertFrom-Json
+          if (-not $g.known) { throw "کشور «$($g.country)» در جدول زبان/منطقهٔ زمانی نیست — هم‌ترازی ممکن نیست." }
+
+          Write-Host "هدف: $($g.region) | زبان $($g.locale) | تایم‌زون $($g.timezone) ($($g.windowsTimezone))"
+
+          # ③ منطقهٔ زمانی — این یکی باید قطعی موفق شود، وگرنه اجرا معنی ندارد.
+          Set-TimeZone -Id $g.windowsTimezone
+          "TZ=$($g.timezone)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # ② زبان و فرمت‌ها. Set-Culture و Set-WinSystemLocale همیشه در دسترس‌اند؛
+          # تغییر زبانِ رابط کاربری به بستهٔ زبان نیاز دارد، پس best-effort است.
+          Set-Culture -CultureInfo $g.locale
+          try { Set-WinSystemLocale -SystemLocale $g.locale } catch { Write-Warning "Set-WinSystemLocale: $($_.Exception.Message)" }
+          try { Set-WinUserLanguageList -LanguageList $g.locale -Force } catch { Write-Warning "Set-WinUserLanguageList: $($_.Exception.Message)" }
+          try { Set-WinUILanguageOverride -Language $g.locale } catch { Write-Warning "Set-WinUILanguageOverride: $($_.Exception.Message)" }
+          try { Set-WinHomeLocation -GeoId $g.windowsGeoId } catch { Write-Warning "Set-WinHomeLocation: $($_.Exception.Message)" }
+
+          # اثبات: چیزی که ویندوز واقعاً گزارش می‌کند.
+          $tzId   = (Get-TimeZone).Id
+          $culture = (Get-Culture).Name
+          Write-Host "ویندوز الان: language=$culture timezone=$tzId"
+          if ($tzId -ne $g.windowsTimezone) { throw "منطقهٔ زمانی ست نشد: $tzId ≠ $($g.windowsTimezone)" }
+          if ($culture -ne $g.locale) { throw "زبان/فرهنگ ست نشد: $culture ≠ $($g.locale)" }
+
+          @(
+            '### ②③ هم‌ترازی دستگاه با کشور پروکسی'
+            ''
+            '| مورد | مقدار |'
+            '| --- | --- |'
+            "| کشور | $($g.region) |"
+            "| زبان ویندوز | $culture |"
+            "| منطقهٔ زمانی ویندوز | $tzId |"
+            "| Accept-Language مرورگر | ``$($g.acceptLanguage)`` |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      # ④ اثبات با پرسیدن از خودِ اینترنت: این IP واقعاً مال آن کشور است؟
+      # اگر نه، کار همین‌جا تمام می‌شود؛ هیچ آدرسی claim نمی‌شود.
+      - name: ④ تأیید کشور واقعی IP پروکسی
+        run: node scripts/verify-geo.js --country "$env:GSA_PROXY_COUNTRY" --require-proxy
+
+      - name: نصب وابستگی‌ها
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      # همان بررسی ①–④، این بار از داخل خودِ Chrome و روی همان session چسبنده‌ای
+      # که ثبت‌نام با آن انجام می‌شود (زبان/تایم‌زون مرورگر هم اینجا سنجیده می‌شود).
+      - name: بررسی پیش از اجرا (هاب + Chrome + زبان/تایم‌زون/کشور IP)
+        run: node scripts/run-batch.js --preflight --count "$env:GSA_COUNT" --method "$env:GSA_METHOD" --require-proxy
 
       - name: ساخت حساب‌ها
         run: node scripts/run-batch.js
