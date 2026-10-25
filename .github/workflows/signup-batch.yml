@@ -10,8 +10,9 @@ name: ساخت حساب  —  Signup batch
 #   3. auto          full = کاملاً اتوماتیک (پیش‌فرض)
 #   4. proxy         رشتهٔ پروکسی host:port:user:pass (برای نوع scrapeops خالی بگذار)
 #   5. proxy_country کشور خروج پروکسی (پیش‌فرض us)
-#   6. proxy_type    auto | rainproxy | scrapeops  — کدام نوع پروکسی
+#   6. proxy_type    auto | rainproxy | scrapeops | oxylabs  — کدام نوع پروکسی
 #   7. use_proxy     on = پروکسی روشن، off = هیچ پروکسی‌ای در کار نیست
+#   8. concurrency   ۱..۶ ثبت‌نام همزمان (پیش‌فرض ۱) — هر کدام IP خودش را دارد
 #
 # ── سه نوع پروکسی (ورودی ۶) و سکرت هر کدام ────────────────────────────────────
 #   نوع اول  rainproxy   host:port:user:pass با پسوند session روی نام کاربری
@@ -138,6 +139,18 @@ on:
         options:
           - on
           - off
+      concurrency:
+        description: '۸) همزمانی — چند ثبت‌نام همزمان روی رانر (۱ = تک‌تک، تا ۶). هر ثبت‌نام IP خودش را دارد'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
 
 # دو دستهٔ همزمان از یک IP فقط الگوی ریسک می‌سازند — همیشه یکی پشت سر دیگری.
 concurrency:
@@ -188,9 +201,10 @@ jobs:
       GSA_REQUIRE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
       GSA_GEO_STRICT: '1'
       GSA_GEO_CHECK_EACH: '1'  # پیش از هر ثبت‌نام هم کشور IP دوباره چک می‌شود
-      # تنظیم‌های ثابت اجرای CI: تک‌تک (بدون همزمانی) و با فاصله، چون IP اینجا
-      # دیتاسنتر است و عجله دقیقاً همان چیزی است که `?error=BAD_REQUEST` می‌سازد.
-      GSA_CONCURRENCY: '1'
+      # همزمانی: از ورودی ۸. هر ثبت‌نام IP خودش را دارد (sticky session جدا)؛
+      # عجلهٔ بیش از حد (delay کم + همزمانی بالا) همان چیزی است که
+      # `?error=BAD_REQUEST` می‌سازد، پس delay 25 ثانیه ثابت می‌ماند.
+      GSA_CONCURRENCY: ${{ inputs.concurrency }}
       GSA_DELAY_SEC: '25'
       GSA_FRESH_PROFILE: '0'
       GSA_OTP_TIMEOUT_SEC: '240'
