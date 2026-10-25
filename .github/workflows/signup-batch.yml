@@ -8,9 +8,26 @@ name: ساخت حساب  —  Signup batch
 #   1. count         تعداد حساب برای ساخت
 #   2. email_method  duck | generated | erine یا rotate (= تلفیقیِ هر سه)
 #   3. auto          full = کاملاً اتوماتیک (پیش‌فرض)
-#   4. proxy         رشتهٔ پروکسی host:port:user:pass (خالی = از Secret)
+#   4. proxy         رشتهٔ پروکسی host:port:user:pass (برای نوع scrapeops خالی بگذار)
 #   5. proxy_country کشور خروج پروکسی (پیش‌فرض us)
-#   6. use_proxy     on = پروکسی روشن، off = هیچ پروکسی‌ای در کار نیست
+#   6. proxy_type    auto | rainproxy | scrapeops  — کدام نوع پروکسی
+#   7. use_proxy     on = پروکسی روشن، off = هیچ پروکسی‌ای در کار نیست
+#
+# ── دو نوع پروکسی (ورودی ۶) و سکرت هر کدام ────────────────────────────────────
+#   نوع اول  rainproxy   host:port:user:pass با پسوند session روی نام کاربری
+#                        (خط‌تیره‌ای):  user-country-us-session-<id>-sessTime-60
+#                        → از Secret «PROXY» خوانده می‌شود.
+#   نوع دوم  scrapeops   نام کاربری لیستِ پارامتر با «نقطه» و رمز = API key:
+#                        scrapeops.country=us.sticky_session=<n>.session_timeout=60
+#                        → از Secret «PROXY_SCRAPEOPS» خوانده می‌شود و کشورش را
+#                          همین ورودی ۵ تعیین می‌کند (پس سکرت را بدون country بنویس).
+#   auto (پیش‌فرض)       از روی آدرس خودِ سکرت تشخیص می‌دهد: scrapeops.io → نوع دوم.
+#                        یعنی اگر نوع را اشتباه بگیری auto معمولاً نجاتت می‌دهد.
+#
+#   پروکسی نوع دوم هم مثل نوع اول «رزیدنتیال» است (اسکرین‌شات دشبورد ScrapeOps
+#   کشورهای us/ca/gb/de/fr/nl/es/it/se/pl/tr/ae/au/jp/kr/in/br/mx را می‌دهد و
+#   همهٔ همین‌ها عملاً تست شدند) و دروازهٔ روشن/خاموش (ورودی ۷) برای هر دو نوع
+#   یکسان کار می‌کند چون دروازه فقط یک HTTP-CONNECT relay است.
 #
 # ── کلید پروکسی (use_proxy) و رفتارش ─────────────────────────────────────────
 #   off → GSA_USE_PROXY=0 یعنی هیچ‌جا پروکسی در کار نیست: نه Chrome با آن
@@ -39,10 +56,11 @@ name: ساخت حساب  —  Signup batch
 #      کشور مورد انتظار یکی نبود، کار همان‌جا با شکست تمام می‌شود.
 #
 # Secret های لازم (Settings → Secrets and variables → Actions):
-#   HUB_URL         آدرس هاب          (قبلاً هم ثبت شده)
-#   HUB_API_KEY     کلید dhk_… هاب     (قبلاً هم ثبت شده)
-#   PROXY           رشتهٔ پروکسی پیش‌فرض (host:port:user:pass)
-#   GMAILDUCK_PAT   توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck
+#   HUB_URL           آدرس هاب          (قبلاً هم ثبت شده)
+#   HUB_API_KEY       کلید dhk_… هاب     (قبلاً هم ثبت شده)
+#   PROXY             سکرت نوع اول:     host:port:user:pass
+#   PROXY_SCRAPEOPS   سکرت نوع دوم:     residential-proxy.scrapeops.io:8181:scrapeops:<API_KEY>
+#   GMAILDUCK_PAT     توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck
 
 on:
   workflow_dispatch:
@@ -70,7 +88,7 @@ on:
           - full
           - manual
       proxy:
-        description: '۴) رشتهٔ پروکسی (host:port:user:pass) — خالی یعنی از Secret پروکسی استفاده شود'
+        description: '۴) رشتهٔ پروکسی (host:port:user:pass) — برای نوع scrapeops خالی بگذار (از Secret PROXY_SCRAPEOPS خوانده می‌شود)'
         required: false
         default: ''
       proxy_country:
@@ -97,8 +115,17 @@ on:
           - in
           - br
           - mx
+      proxy_type:
+        description: '۶) نوع پروکسی — نوع اول (rainproxy) یا نوع دوم (scrapeops)؛ auto یعنی از روی آدرس تشخیص بده'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - rainproxy
+          - scrapeops
       use_proxy:
-        description: '۶) کلید پروکسی — on = فقط موقع ثبت‌نام روشن می‌شود، off = هیچ پروکسی‌ای در کار نیست'
+        description: '۷) کلید پروکسی — on = فقط موقع ثبت‌نام روشن می‌شود، off = هیچ پروکسی‌ای در کار نیست'
         required: true
         default: 'on'
         type: choice
@@ -132,13 +159,19 @@ jobs:
       GSA_METHOD: ${{ inputs.email_method }}
       # ۳) کاملاً اتوماتیک
       GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
-      # ۶) کلید اصلی: off → هیچ پروکسی‌ای در کل اجرا نیست (off در proxy.js
+      # ۷) کلید اصلی: off → هیچ پروکسی‌ای در کل اجرا نیست (off در proxy.js
       #    از ریشه خاموشش می‌کند؛ Chrome، چک کشور IP و هم‌ترازی زبان همه
       #    با همین یک مقدار تصمیم می‌گیرند).
       GSA_USE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
-      # ۴) پروکسی — وقتی کلید روشن است الزامی است؛ خالی بودنش یعنی `npm`
-      #    هم شروع نمی‌شود.
-      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || secrets.PROXY }}
+      # ۶) نوع پروکسی — auto دیالکت را از روی آدرس خودِ سکرت تشخیص می‌دهد
+      #    (میزبان scrapeops.io → نوع دوم، بقیه → نوع اول).
+      GSA_PROXY_TYPE: ${{ inputs.proxy_type }}
+      # ۴) پروکسی — کدام سکرت؟
+      #      ورودی ۴ مقدار داشته باشد → همان (تست دستی)
+      #      نوع scrapeops       → Secret PROXY_SCRAPEOPS (نوع دوم)
+      #      بقیه (auto/rainproxy) → Secret PROXY          (نوع اول)
+      #    خالی بودن هر دو یعنی `npm` هم شروع نمی‌شود.
+      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || inputs.proxy_type == 'scrapeops' && secrets.PROXY_SCRAPEOPS || secrets.PROXY }}
       GSA_PROXY_COUNTRY: ${{ inputs.proxy_country }}
       GSA_PROXY_STICKY: '1'   # یک IP ثابت برای کل یک ثبت‌نام
       GSA_PROXY_STRICT: '1'    # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
@@ -183,17 +216,26 @@ jobs:
         if: env.GSA_USE_PROXY == '0'
         run: Write-Host "GSA_USE_PROXY=0 — هیچ پروکسی‌ای در کار نیست؛ کل ترافیک با IP همین رانر می‌رود."
 
-      # ① بدون پروکسی هیچ‌چیز شروع نمی‌شود.
+      # ① بدون پروکسی هیچ‌چیز شروع نمی‌شود — و سکرتِ درست باید پر شده باشد.
       - name: ① بررسی وجود پروکسی
         if: env.GSA_USE_PROXY == '1'
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GSA_PROXY)) {
-            Write-Error "پروکسی تنظیم نشده — نه ورودی proxy مقداری دارد نه Secret پروکسی. اجرا بدون پروکسی فقط BAD_REQUEST می‌دهد."
+            if ($env:GSA_PROXY_TYPE -eq 'scrapeops') {
+              Write-Error "نوع پروکسی scrapeops است ولی Secret «PROXY_SCRAPEOPS» خالی است. مقدار آن باید این شکلی باشد: residential-proxy.scrapeops.io:8181:scrapeops:<API_KEY>"
+            } else {
+              Write-Error "پروکسی تنظیم نشده — نه ورودی proxy مقداری دارد نه Secret «PROXY». اجرا بدون پروکسی فقط BAD_REQUEST می‌دهد."
+            }
             exit 2
           }
-          # فقط آدرس سرور؛ رمز هرگز در لاگ نمی‌آید.
+          # نوع دوم انتخاب شده ولی سکرتِ نوع اول برگشته → سکرت ساخته نشده.
+          if ($env:GSA_PROXY_TYPE -eq 'scrapeops' -and $env:GSA_PROXY -notmatch 'scrapeops') {
+            Write-Error "نوع scrapeops انتخاب شده ولی Secret «PROXY_SCRAPEOPS» خالی است و مقدار از Secret «PROXY» آمده. سکرت نوع دوم را بساز."
+            exit 2
+          }
+          # فقط آدرس سرور؛ رمز/API-key هرگز در لاگ نمی‌آید.
           $server = (($env:GSA_PROXY -replace '^[a-z]+://', '') -split ':')[0..1] -join ':'
-          Write-Host "proxy = $server (country=$env:GSA_PROXY_COUNTRY)"
+          Write-Host "proxy = $server | type = $env:GSA_PROXY_TYPE | country = $env:GSA_PROXY_COUNTRY"
 
       # ②③ زبان و منطقهٔ زمانی دستگاه روی کشور پروکسی — جزئیات و همهٔ
       # تلاش‌های جایگزین در GmailDuck/scripts/align-os-geo.ps1 است. خلاصه:
