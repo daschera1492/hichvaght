@@ -1,0 +1,37 @@
+name: geo-align-test (temporary)
+
+# Temporary harness: proves scripts/align-os-geo.ps1 on a real windows-latest
+# runner, including the ja-JP case where Set-Culture is silently ignored.
+# Deleted right after the check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      country:
+        description: 'country code to align to'
+        required: true
+        default: 'jp'
+
+jobs:
+  align:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: checkout automation
+        uses: actions/checkout@v5
+        with:
+          repository: daschera1492/GmailDuck
+          ref: main
+          path: GmailDuck
+          token: ${{ secrets.GMAILDUCK_PAT }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: align (strict)
+        working-directory: GmailDuck
+        run: |
+          pwsh -NoProfile -File scripts/align-os-geo.ps1 -Country "${{ inputs.country }}" -Strict
+          Write-Host '--- after ---'
+          pwsh -NoProfile -Command "(Get-Culture).Name; (Get-TimeZone).Id; (Get-WinHomeLocation).GeoId"
