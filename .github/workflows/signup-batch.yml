@@ -18,8 +18,10 @@ name: ساخت حساب  —  Signup batch
 # می‌دهد. پس ترتیب اجرا این است و هر مرحله سخت‌گیرانه است:
 #
 #   ① پروکسی الزامی است — بدون آن اجرا اصلاً شروع نمی‌شود.
-#   ② زبان ویندوز و کروم دقیقاً روی کشور پروکسی ست می‌شود.
-#   ③ منطقهٔ زمانی ویندوز و کروم دقیقاً روی همان کشور ست می‌شود.
+#   ② زبان کروم دقیقاً روی کشور پروکسی ست می‌شود (و زبان ویندوز هم تا جای
+#      ممکن؛ اگر رانر بستهٔ زبان را نداشته باشد، فقط هشدار می‌دهد چون معیار
+#      واقعیِ گوگل زبانِ مرورگر است).
+#   ③ منطقهٔ زمانی کروم دقیقاً روی همان کشور ست می‌شود (و ویندوز هم همین‌طور).
 #   ④ سپس IP واقعیِ خروجی از دو سرویس مستقل پرسیده می‌شود؛ اگر کشورش با
 #      کشور مورد انتظار یکی نبود، کار همان‌جا با شکست تمام می‌شود.
 #
@@ -160,7 +162,19 @@ jobs:
           $server = (($env:GSA_PROXY -replace '^[a-z]+://', '') -split ':')[0..1] -join ':'
           Write-Host "proxy = $server (country=$env:GSA_PROXY_COUNTRY)"
 
-      # ②③ زبان و منطقهٔ زمانی دستگاه دقیقاً روی کشور پروکسی.
+      # ②③ زبان و منطقهٔ زمانی دستگاه روی کشور پروکسی.
+      #
+      # ویندوز culture کاربر را فقط برای زبانی قبول می‌کند که «زبان»ش در آن
+      # نصب شده باشد — برای همین en-CA (خانوادهٔ انگلیسی که از قبل هست) بی‌درنگ
+      # ست می‌شود ولی ja-JP نه، حتی وقتی Set-Culture خطا نمی‌دهد. پس اول بستهٔ
+      # زبان را نصب می‌کنیم، بعد culture را می‌نویسیم، و اگر باز هم ویندوز
+      # نپذیرفت مقدار را مستقیم در رجیستری کاربر می‌گذاریم.
+      #
+      # چیزی که گوگل می‌بیند اما زبانِ «مرورگر» است، نه زبان ویندوز؛ آن یکی
+      # مستقل از ویندوز با --lang و Emulation.setLocaleOverride ست می‌شود و
+      # در preflight با خواندن navigator.language و Intl اثبات می‌شود. پس
+      # سخت‌گیریِ اصلی همان‌جاست (قدم پیش‌بررسی)؛ اینجا فقط گزارش می‌کنیم تا
+      # یک رانر بدون بستهٔ زبان، اجرای درست را بی‌دلیل نسوزاند.
       - name: ②③ هم‌ترازی زبان و منطقهٔ زمانی ویندوز با کشور پروکسی
         run: |
           $geoJson = node -e "const g=require('./src/geo.js');process.stdout.write(JSON.stringify(g.geoProfile(process.argv[1])));" "$env:GSA_PROXY_COUNTRY"
@@ -170,39 +184,79 @@ jobs:
 
           Write-Host "هدف: $($g.region) | زبان $($g.locale) | تایم‌زون $($g.timezone) ($($g.windowsTimezone))"
 
-          # ③ منطقهٔ زمانی — این یکی باید قطعی موفق شود، وگرنه اجرا معنی ندارد.
-          Set-TimeZone -Id $g.windowsTimezone
+          # ③ منطقهٔ زمانی. TZ را حتی اگر Set-TimeZone ایراد بگیرد می‌نویسیم؛
+          # Node آن را می‌خواند و مرورگر هم با emulateTimezone اجبار می‌شود.
+          try {
+            Set-TimeZone -Id $g.windowsTimezone -ErrorAction Stop
+          } catch {
+            Write-Warning "Set-TimeZone: $($_.Exception.Message)"
+          }
           "TZ=$($g.timezone)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # ② زبان و فرمت‌ها. Set-Culture و Set-WinSystemLocale همیشه در دسترس‌اند؛
-          # تغییر زبانِ رابط کاربری به بستهٔ زبان نیاز دارد، پس best-effort است.
-          Set-Culture -CultureInfo $g.locale
-          try { Set-WinSystemLocale -SystemLocale $g.locale } catch { Write-Warning "Set-WinSystemLocale: $($_.Exception.Message)" }
-          try { Set-WinUserLanguageList -LanguageList $g.locale -Force } catch { Write-Warning "Set-WinUserLanguageList: $($_.Exception.Message)" }
-          try { Set-WinUILanguageOverride -Language $g.locale } catch { Write-Warning "Set-WinUILanguageOverride: $($_.Exception.Message)" }
-          try { Set-WinHomeLocation -GeoId $g.windowsGeoId } catch { Write-Warning "Set-WinHomeLocation: $($_.Exception.Message)" }
-
-          # اثبات: چیزی که ویندوز واقعاً گزارش می‌کند.
-          # Set-Culture کاربر جاری را در رجیستری می‌نویسد؛ برای همین اگر همین
-          # پروسه مقدار قبلی را کش کرده باشد، یک پروسهٔ تازه می‌پرسیم.
-          $tzId = (Get-TimeZone).Id
+          # ② اگر بستهٔ زبان نیست، نصبش کن تا culture قابل تغییر شود.
           $culture = (Get-Culture).Name
-          if ($culture -ne $g.locale) {
-            $culture = (pwsh -NoProfile -Command '(Get-Culture).Name' | Out-String).Trim()
+          $freshCulture = {
+            (pwsh -NoProfile -Command '(Get-Culture).Name' | Out-String).Trim()
           }
-          Write-Host "ویندوز الان: language=$culture timezone=$tzId"
-          if ($tzId -ne $g.windowsTimezone) { throw "منطقهٔ زمانی ست نشد: $tzId ≠ $($g.windowsTimezone)" }
-          if ($culture -ne $g.locale) { throw "زبان/فرهنگ ست نشد: $culture ≠ $($g.locale)" }
+          if ($culture -ne $g.locale) { $culture = & $freshCulture }
+
+          if ($culture -ne $g.locale -and (Get-Command Install-Language -ErrorAction SilentlyContinue)) {
+            Write-Host "بستهٔ زبان $($g.locale) نصب نیست — نصب می‌شود (ممکن است چند دقیقه طول بکشد)..."
+            try { Install-Language -Language $g.locale -ErrorAction Stop } catch { Write-Warning "Install-Language: $($_.Exception.Message)" }
+          }
+
+          try { Set-WinUserLanguageList -LanguageList $g.locale -Force -ErrorAction Stop } catch { Write-Warning "Set-WinUserLanguageList: $($_.Exception.Message)" }
+          try { Set-Culture -CultureInfo $g.locale -ErrorAction Stop } catch { Write-Warning "Set-Culture: $($_.Exception.Message)" }
+          try { Set-WinSystemLocale -SystemLocale $g.locale -ErrorAction Stop } catch { Write-Warning "Set-WinSystemLocale: $($_.Exception.Message)" }
+          try { Set-WinUILanguageOverride -Language $g.locale -ErrorAction Stop } catch { Write-Warning "Set-WinUILanguageOverride: $($_.Exception.Message)" }
+          try { Set-WinHomeLocation -GeoId $g.windowsGeoId -ErrorAction Stop } catch { Write-Warning "Set-WinHomeLocation: $($_.Exception.Message)" }
+
+          # اگر Set-Culture هنوز اثر نکرد، مقدار کاربر را مستقیم می‌نویسیم؛
+          # پروسه‌های تازه (و کرومی که بعداً بالا می‌آید) همین را می‌خوانند.
+          $culture = & $freshCulture
+          if ($culture -ne $g.locale) {
+            try {
+              $lcid = ([System.Globalization.CultureInfo]::new($g.locale)).LCID
+              Set-ItemProperty 'HKCU:\Control Panel\International' -Name LocaleName -Value $g.locale -ErrorAction Stop
+              Set-ItemProperty 'HKCU:\Control Panel\International' -Name Locale -Value ('{0:x8}' -f $lcid) -ErrorAction Stop
+              Write-Host "LocaleName در رجیستری کاربر نوشته شد ($($g.locale), LCID $('{0:x8}' -f $lcid))."
+            } catch {
+              Write-Warning "نوشتن LocaleName در رجیستری: $($_.Exception.Message)"
+            }
+            try { Set-Culture -CultureInfo $g.locale -ErrorAction Stop } catch { Write-Warning "Set-Culture (تلاش دوم): $($_.Exception.Message)" }
+            $culture = & $freshCulture
+          }
+
+          $tzId = (Get-TimeZone).Id
+          $tzOk = $tzId -eq $g.windowsTimezone
+          $cultureOk = $culture -eq $g.locale
+          Write-Host "ویندوز الان: language=$culture timezone=$tzId | target language=$($g.locale) timezone=$($g.windowsTimezone)"
+
+          if (-not $tzOk) {
+            Write-Warning "منطقهٔ زمانی ویندوز $tzId ماند، نه $($g.windowsTimezone) — کروم مستقل روی $($g.timezone) اجبار می‌شود و preflight همان را اثبات می‌کند."
+          }
+          if (-not $cultureOk) {
+            Write-Warning "زبان ویندوز $culture ماند، نه $($g.locale) — این رانر بستهٔ زبان را نپذیرفت. زبان کروم مستقل روی $($g.locale) اجبار می‌شود و preflight همان را اثبات می‌کند؛ برای گوگل همین معیار است."
+          }
+
+          $note = if ($cultureOk -and $tzOk) {
+            '✅ ویندوز و مرورگر هر دو روی کشور پروکسی'
+          } else {
+            '⚠️ ویندوز کامل ست نشد؛ زبان/تایم‌زونِ مرورگر جداگانه اجبار و در preflight اثبات می‌شود'
+          }
 
           @(
             '### ②③ هم‌ترازی دستگاه با کشور پروکسی'
             ''
-            '| مورد | مقدار |'
-            '| --- | --- |'
-            "| کشور | $($g.region) |"
-            "| زبان ویندوز | $culture |"
-            "| منطقهٔ زمانی ویندوز | $tzId |"
-            "| Accept-Language مرورگر | ``$($g.acceptLanguage)`` |"
+            '| مورد | هدف | مقدار واقعی |'
+            '| --- | --- | --- |'
+            "| کشور | $($g.region) | — |"
+            "| زبان ویندوز | $($g.locale) | $culture |"
+            "| منطقهٔ زمانی ویندوز | $($g.windowsTimezone) | $tzId |"
+            "| زبان کروم (اجباری) | $($g.locale) | $($g.acceptLanguage) |"
+            "| منطقهٔ زمانی کروم (اجباری) | $($g.timezone) | — |"
+            ''
+            $note
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       # ④ اثبات با پرسیدن از خودِ اینترنت: این IP واقعاً مال آن کشور است؟
