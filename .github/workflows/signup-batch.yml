@@ -13,7 +13,7 @@ name: ساخت حساب  —  Signup batch
 #   6. proxy_type    auto | rainproxy | scrapeops  — کدام نوع پروکسی
 #   7. use_proxy     on = پروکسی روشن، off = هیچ پروکسی‌ای در کار نیست
 #
-# ── دو نوع پروکسی (ورودی ۶) و سکرت هر کدام ────────────────────────────────────
+# ── سه نوع پروکسی (ورودی ۶) و سکرت هر کدام ────────────────────────────────────
 #   نوع اول  rainproxy   host:port:user:pass با پسوند session روی نام کاربری
 #                        (خط‌تیره‌ای):  user-country-us-session-<id>-sessTime-60
 #                        → از Secret «PROXY» خوانده می‌شود.
@@ -21,13 +21,17 @@ name: ساخت حساب  —  Signup batch
 #                        scrapeops.country=us.sticky_session=<n>.session_timeout=60
 #                        → از Secret «PROXY_SCRAPEOPS» خوانده می‌شود و کشورش را
 #                          همین ورودی ۵ تعیین می‌کند (پس سکرت را بدون country بنویس).
-#   auto (پیش‌فرض)       از روی آدرس خودِ سکرت تشخیص می‌دهد: scrapeops.io → نوع دوم.
-#                        یعنی اگر نوع را اشتباه بگیری auto معمولاً نجاتت می‌دهد.
+#   نوع سوم  oxylabs     نام کاربری دش‌دار: customer-…-cc-JP-sessid-<n>-sesstime-60
+#                        رمز = پسورد دشبورد (حاوی +، در URL نگذارش)
+#                        → از Secret «PROXY_OXYLABS» خوانده می‌شود:
+#                          pr.oxylabs.io:7777:customer-resi_<ID>:<PASSWORD>
+#                        کشور را همین ورودی ۵ تعیین می‌کند (پس سکرت را بدون cc- بنویس).
+#   auto (پیش‌فرض)       از روی آدرس خودِ سکرت تشخیص می‌دهد: scrapeops.io → نوع دوم،
+#                        oxylabs.io → نوع سوم، بقیه → نوع اول.
 #
-#   پروکسی نوع دوم هم مثل نوع اول «رزیدنتیال» است (اسکرین‌شات دشبورد ScrapeOps
-#   کشورهای us/ca/gb/de/fr/nl/es/it/se/pl/tr/ae/au/jp/kr/in/br/mx را می‌دهد و
-#   همهٔ همین‌ها عملاً تست شدند) و دروازهٔ روشن/خاموش (ورودی ۷) برای هر دو نوع
-#   یکسان کار می‌کند چون دروازه فقط یک HTTP-CONNECT relay است.
+#   هر سه نوع «رزیدنتیال» هستند (IPهای مسکونی واقعی، نه دیتاسنتر) و دروازهٔ
+#   روشن/خاموش (ورودی ۷) برای هر سه یکسان کار می‌کند چون دروازه فقط یک
+#   HTTP-CONNECT relay است.
 #
 # ── کلید پروکسی (use_proxy) و رفتارش ─────────────────────────────────────────
 #   off → GSA_USE_PROXY=0 یعنی هیچ‌جا پروکسی در کار نیست: نه Chrome با آن
@@ -60,6 +64,7 @@ name: ساخت حساب  —  Signup batch
 #   HUB_API_KEY       کلید dhk_… هاب     (قبلاً هم ثبت شده)
 #   PROXY             سکرت نوع اول:     host:port:user:pass
 #   PROXY_SCRAPEOPS   سکرت نوع دوم:     residential-proxy.scrapeops.io:8181:scrapeops:<API_KEY>
+#   PROXY_OXYLABS     سکرت نوع سوم:     pr.oxylabs.io:7777:customer-resi_<ID>:<PASSWORD>
 #   GMAILDUCK_PAT     توکن دسترسی به مخزن خصوصی daschera1492/GmailDuck
 
 on:
@@ -124,6 +129,7 @@ on:
           - auto
           - rainproxy
           - scrapeops
+          - oxylabs
       use_proxy:
         description: '۷) کلید پروکسی — on = فقط موقع ثبت‌نام روشن می‌شود، off = هیچ پروکسی‌ای در کار نیست'
         required: true
@@ -169,9 +175,10 @@ jobs:
       # ۴) پروکسی — کدام سکرت؟
       #      ورودی ۴ مقدار داشته باشد → همان (تست دستی)
       #      نوع scrapeops       → Secret PROXY_SCRAPEOPS (نوع دوم)
+      #      نوع oxylabs         → Secret PROXY_OXYLABS  (نوع سوم)
       #      بقیه (auto/rainproxy) → Secret PROXY          (نوع اول)
-      #    خالی بودن هر دو یعنی `npm` هم شروع نمی‌شود.
-      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || inputs.proxy_type == 'scrapeops' && secrets.PROXY_SCRAPEOPS || secrets.PROXY }}
+      #    خالی بودن همه یعنی `npm` هم شروع نمی‌شود.
+      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || inputs.proxy_type == 'scrapeops' && secrets.PROXY_SCRAPEOPS || inputs.proxy_type == 'oxylabs' && secrets.PROXY_OXYLABS || secrets.PROXY }}
       GSA_PROXY_COUNTRY: ${{ inputs.proxy_country }}
       GSA_PROXY_STICKY: '1'   # یک IP ثابت برای کل یک ثبت‌نام
       GSA_PROXY_STRICT: '1'    # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
@@ -223,14 +230,20 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:GSA_PROXY)) {
             if ($env:GSA_PROXY_TYPE -eq 'scrapeops') {
               Write-Error "نوع پروکسی scrapeops است ولی Secret «PROXY_SCRAPEOPS» خالی است. مقدار آن باید این شکلی باشد: residential-proxy.scrapeops.io:8181:scrapeops:<API_KEY>"
+            } elseif ($env:GSA_PROXY_TYPE -eq 'oxylabs') {
+              Write-Error "نوع پروکسی oxylabs است ولی Secret «PROXY_OXYLABS» خالی است. مقدار آن باید این شکلی باشد: pr.oxylabs.io:7777:customer-resi_<ID>:<PASSWORD>"
             } else {
               Write-Error "پروکسی تنظیم نشده — نه ورودی proxy مقداری دارد نه Secret «PROXY». اجرا بدون پروکسی فقط BAD_REQUEST می‌دهد."
             }
             exit 2
           }
-          # نوع دوم انتخاب شده ولی سکرتِ نوع اول برگشته → سکرت ساخته نشده.
+          # نوع دوم/سوم انتخاب شده ولی سکرتِ نوع اول برگشته → سکرت ساخته نشده.
           if ($env:GSA_PROXY_TYPE -eq 'scrapeops' -and $env:GSA_PROXY -notmatch 'scrapeops') {
             Write-Error "نوع scrapeops انتخاب شده ولی Secret «PROXY_SCRAPEOPS» خالی است و مقدار از Secret «PROXY» آمده. سکرت نوع دوم را بساز."
+            exit 2
+          }
+          if ($env:GSA_PROXY_TYPE -eq 'oxylabs' -and $env:GSA_PROXY -notmatch 'oxylabs') {
+            Write-Error "نوع oxylabs انتخاب شده ولی Secret «PROXY_OXYLABS» خالی است و مقدار از Secret «PROXY» آمده. سکرت نوع سوم را بساز."
             exit 2
           }
           # فقط آدرس سرور؛ رمز/API-key هرگز در لاگ نمی‌آید.
