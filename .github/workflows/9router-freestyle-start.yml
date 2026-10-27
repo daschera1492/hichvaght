@@ -9,10 +9,13 @@ name: 9Router Start
 on:
   workflow_dispatch:
     inputs:
-      with_backup:
-        description: "با بکاپ بالا بیاد (برداشتن تیک = خام، بکاپ لود نمی‌شه)"
-        type: boolean
-        default: true
+      mode:
+        description: "حالت شروع: با بکاپ (کانفیگ قبلی) یا خام (هیچ بکاپی لود نمی‌شه)"
+        type: choice
+        default: with-backup
+        options:
+          - with-backup
+          - fresh
       idle_timeout:
         description: "Seconds of inactivity before the VM auto-pauses"
         required: false
@@ -41,7 +44,7 @@ jobs:
       NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
       IDLE_TIMEOUT_SECONDS: ${{ inputs.idle_timeout }}
       FREESTYLE_SNAPSHOT: freestyle/ubuntu-sm
-      RESTORE_BACKUP: ${{ inputs.with_backup }}
+      RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
       GITHUB_TOKEN: ${{ github.token }}
       BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
 

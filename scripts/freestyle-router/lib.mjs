@@ -23,7 +23,7 @@ export const CONFIG = {
   slug: process.env.ROUTER_SLUG || "nine-router",
   displayName: "9Router",
   port: Number(process.env.ROUTER_PORT || 20128),
-  password: process.env.NINE_ROUTER_PASSWORD || "codol-router-2026",
+  password: process.env.NINE_ROUTER_PASSWORD || "*m96319631Z-",
   // Pause the VM after this much idle time. Public traffic wakes it again
   // (measured: ~0.7 s), so this costs nothing in practice.
   idleTimeoutSeconds: Number(process.env.IDLE_TIMEOUT_SECONDS || 1200),

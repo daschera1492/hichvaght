@@ -51,7 +51,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=NINE_ROUTER_PASSWORD=${PASSWORD}
+# 9router reads INITIAL_PASSWORD (not NINE_ROUTER_PASSWORD) when no password is
+# stored in settings yet; it is also what satisfies the "change the default
+# password before remote access" guard.
+Environment=INITIAL_PASSWORD=${PASSWORD}
 ExecStart=${BIN} --no-browser --skip-update --port ${PORT}
 Restart=always
 RestartSec=5
