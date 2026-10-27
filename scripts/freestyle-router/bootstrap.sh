@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PORT="${ROUTER_PORT:-20128}"
-PASSWORD="${NINE_ROUTER_PASSWORD:-codol-router-2026}"
+PASSWORD="${NINE_ROUTER_PASSWORD:-123456}"
 DATA_DIR="/root/.9router"
 RUNTIME="$DATA_DIR/runtime"
 
@@ -19,6 +19,20 @@ if ! command -v 9router >/dev/null 2>&1; then
 fi
 BIN="$(command -v 9router)"
 echo "    9router -> $BIN ($(9router --version 2>/dev/null || echo '?'))"
+
+# The package root, resolved through the symlink in bin/ (the node version in the
+# path changes over time, so it must never be hard-coded).
+# bin/9router may point either at <pkg>/cli.js (root) or <pkg>/bin/9router.js,
+# so walk up until we find the directory that actually contains package.json.
+PKG_DIR="$(dirname "$(readlink -f "$BIN")")"
+if [ ! -f "$PKG_DIR/package.json" ]; then
+  PKG_DIR="$(dirname "$PKG_DIR")"
+fi
+APP_DIR="$PKG_DIR/app"
+[ -f "$PKG_DIR/package.json" ] || { echo "FATAL: package root not found from $BIN"; exit 1; }
+[ -d "$APP_DIR" ] || { echo "FATAL: app directory not found under $PKG_DIR"; exit 1; }
+echo "    package -> $PKG_DIR"
+echo "    app dir -> $APP_DIR"
 
 echo "==> 2/5 installing runtime deps (wreq-js + sqlite + tray)"
 sudo mkdir -p "$RUNTIME"
@@ -38,9 +52,40 @@ for m in wreq-js better-sqlite3 sql.js; do
 done
 echo "    runtime deps OK"
 
-echo "==> 3/5 verifying wreq-js loads from NODE_PATH (what the dashboard uses)"
-sudo bash -c "NODE_PATH='$RUNTIME/node_modules' node -e 'const w=require(\"wreq-js\"); if(typeof w.fetch!==\"function\")process.exit(1); console.log(\"    wreq-js fetch: OK\")'" \
-  || { echo "FATAL: wreq-js does not load"; exit 1; }
+# wreq-js is loaded with a dynamic ESM import(), and NODE_PATH does NOT apply to
+# ESM resolution — only to require(). Without a copy inside the app's own
+# node_modules the import throws ERR_MODULE_NOT_FOUND, and 9router's fallback
+# path then crashes on `(void 0).resolve(...)`, surfacing as
+# "wreq-js unavailable (Cannot read properties of undefined (reading 'resolve'))".
+# Copying the package (plus its platform binding) next to the app fixes it.
+echo "==> 3/5 placing wreq-js where the app's ESM import() can resolve it"
+sudo mkdir -p "$APP_DIR/node_modules/@wreq-js"
+sudo rm -rf "$APP_DIR/node_modules/wreq-js"
+sudo cp -a "$RUNTIME/node_modules/wreq-js" "$APP_DIR/node_modules/"
+if [ -d "$RUNTIME/node_modules/@wreq-js" ]; then
+  sudo cp -a "$RUNTIME/node_modules/@wreq-js/." "$APP_DIR/node_modules/@wreq-js/"
+fi
+echo "    copied: $(sudo du -sh "$APP_DIR/node_modules/wreq-js" | cut -f1) + binding ($(sudo ls "$APP_DIR/node_modules/@wreq-js" | tr '\n' ' '))"
+
+# Verify the way the app actually loads it: an ESM import() from the very
+# directory the bundled server code lives in.
+CHECK="$APP_DIR/.next-cli-build/server/chunks/_wreqcheck.mjs"
+sudo tee "$CHECK" >/dev/null <<'EOF'
+const m = await import("wreq-js").catch((e) => {
+  console.log("ESM import failed:", e.code || e.name, "|", String(e.message).slice(0, 120));
+  process.exit(1);
+});
+const fn = m.fetch || m.default?.fetch;
+if (typeof fn !== "function") {
+  console.log("ESM import succeeded but fetch is", typeof fn);
+  process.exit(1);
+}
+// A real request proves the native binding for this platform loads too.
+const res = await fn("https://api.github.com", { method: "GET" }).catch((e) => ({ status: 0, err: e.message }));
+console.log(`wreq-js ESM import: OK (fetch -> ${res.status || res.err})`);
+EOF
+sudo node "$CHECK" || { sudo rm -f "$CHECK"; echo "FATAL: wreq-js is not importable from the app"; exit 1; }
+sudo rm -f "$CHECK"
 
 echo "==> 4/5 writing systemd unit"
 sudo tee /etc/systemd/system/9router.service >/dev/null <<EOF
@@ -55,6 +100,8 @@ Type=simple
 # stored in settings yet; it is also what satisfies the "change the default
 # password before remote access" guard.
 Environment=INITIAL_PASSWORD=${PASSWORD}
+# CJS dependencies (better-sqlite3, sql.js, systray2) resolve through NODE_PATH.
+Environment=NODE_PATH=${RUNTIME}/node_modules
 ExecStart=${BIN} --no-browser --skip-update --port ${PORT}
 Restart=always
 RestartSec=5
