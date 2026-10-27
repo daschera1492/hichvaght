@@ -37,6 +37,9 @@ export const CONFIG = {
 export const BACKUP = {
   tag: process.env.BACKUP_RELEASE_TAG || "router-backup",
   asset: process.env.BACKUP_ASSET_NAME || "9router-state.tar.gz.enc",
+  // One generation older than `asset`. Every upload moves the current archive
+  // here first, so a bad backup can never destroy the last good one.
+  prevAsset: process.env.BACKUP_PREV_NAME || "9router-state.prev.tar.gz.enc",
   // Baseline config: the owner's own 9router export. Applied only when no state
   // archive exists, i.e. right after Reset.
   seedAsset: process.env.BACKUP_SEED_NAME || "9router-seed.json.enc",
@@ -133,8 +136,12 @@ export async function exportState(vm, outPath = "/tmp/9router-export.json") {
   return { out, counts };
 }
 
+// A state with no provider connections, combos or custom models carries nothing
+// worth restoring, even if the app auto-created an API key for it. Treating such
+// a state as "not empty" once let an empty router overwrite a 140-provider
+// archive, so the API-key count alone must never keep a backup alive.
 export const stateIsEmpty = (counts) =>
-  !counts.providerConnections && !counts.combos && !counts.apiKeys && !counts.customModels;
+  !counts.providerConnections && !counts.combos && !counts.customModels;
 
 // ------------------------------------------------------------------ backup
 // AES-256-GCM with a key derived from BACKUP_ENCRYPTION_KEY. The repository is
@@ -257,8 +264,17 @@ async function deleteAsset(name) {
   return removed;
 }
 
-export const uploadBackup = (bytes) => uploadAsset(BACKUP.asset, bytes);
+export async function uploadBackup(bytes) {
+  // Rotate first: whatever is live now becomes the rollback copy, so a stop that
+  // archives a broken state still leaves the previous good archive recoverable.
+  const current = await downloadAsset(BACKUP.asset).catch(() => null);
+  if (current && current.length > 4096) {
+    await uploadAsset(BACKUP.prevAsset, current);
+  }
+  return uploadAsset(BACKUP.asset, bytes);
+}
 export const downloadBackup = () => downloadAsset(BACKUP.asset);
+export const downloadBackupPrev = () => downloadAsset(BACKUP.prevAsset);
 export const deleteBackup = () => deleteAsset(BACKUP.asset);
 export const uploadSeed = (bytes) => uploadAsset(BACKUP.seedAsset, bytes);
 export const downloadSeed = () => downloadAsset(BACKUP.seedAsset);

@@ -20,8 +20,10 @@ import {
   waitForListener,
   waitForState,
   downloadBackup,
+  downloadBackupPrev,
   downloadSeed,
   exportState,
+  stateIsEmpty,
   unseal,
 } from "./lib.mjs";
 
@@ -162,11 +164,20 @@ async function restoreState(vm) {
     return;
   }
 
-  // Preferred: the exact archive written by Stop.
-  const sealed = await downloadBackup();
-  if (sealed) {
-    const tar = unseal(sealed);
-    log(`• State: archive ${(tar.length / 1024).toFixed(1)} KiB from release "${BACKUP.tag}", restoring…`);
+  // Preferred: the exact archive written by Stop. Newest first, then the
+  // rollback copy — a Stop that archived an empty router must not be able to
+  // hide the previous good state.
+  const candidates = [];
+  const latest = await downloadBackup().catch(() => null);
+  if (latest) candidates.push({ label: "latest", sealed: latest });
+  const prev = await downloadBackupPrev().catch(() => null);
+  if (prev) candidates.push({ label: "previous", sealed: prev });
+
+  for (const candidate of candidates) {
+    const tar = unseal(candidate.sealed);
+    log(
+      `• State: ${candidate.label} archive ${(tar.length / 1024).toFixed(1)} KiB from release "${BACKUP.tag}", restoring…`,
+    );
     await vm.fs.writeFile("/tmp/9router-restore.tar.gz", new Uint8Array(tar));
 
     const out = await run(
@@ -192,20 +203,23 @@ async function restoreState(vm) {
     for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 
     const up = await waitForListener(vm, CONFIG.port, 90);
-    if (up) {
-      log(`• State: 9router is serving the restored database (up after ${up}s)`);
-      return;
+    if (!up) {
+      log(`• State: the ${candidate.label} database did not start`);
+      continue;
     }
-    log("• State: the archived database did not start — falling back to a fresh one");
-    await startEmpty(vm, "restore rolled back");
-    return;
+    log(`• State: 9router is serving the ${candidate.label} database (up after ${up}s)`);
+
+    const counts = await reportState(vm);
+    if (!stateIsEmpty(counts)) return;
+    log(`• State: the ${candidate.label} archive holds no config — trying an older copy`);
   }
 
-  // No archive yet: use the owner's baseline export, if one was published.
+  // No archive yet (or every archived copy was empty): use the owner's baseline
+  // export, if one was published.
   const seed = await downloadSeed();
   if (seed) {
     const json = unseal(seed);
-    log(`• State: no archive — importing the baseline seed (${(json.length / 1024).toFixed(1)} KiB)…`);
+    log(`• State: importing the baseline seed (${(json.length / 1024).toFixed(1)} KiB)…`);
     const up = await importSeed(vm, json);
     if (up) {
       log(`• State: baseline config imported (up after ${up}s)`);
