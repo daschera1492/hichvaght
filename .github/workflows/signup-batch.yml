@@ -6,9 +6,10 @@ name: ساخت حساب  —  Signup batch
 #
 # ورودی‌ها در لحظهٔ Start workflow (Run workflow) تعیین می‌شوند:
 #   1. count         تعداد حساب برای ساخت
-#   2. email_method  منبع ایمیل — «multiple» یعنی چند تیک بزنید؛ مقدار به‌صورت
-#                    کاما-جدول می‌آید (duck,erine) و چرخشی فقط بین همان‌هاست:
-#                    ۱ تیک = منبع ثابت · ۲–۳ تیک = چرخشی بین انتخاب‌شده‌ها
+#   2. use_duck/use_generated/use_erine
+#                    سه تیک جدا؛ مقدارشان کاما-جدول می‌شود (duck,erine) و
+#                    چرخشی فقط بین همان‌هاست: ۱ تیک = منبع ثابت، ۲–۳ تیک =
+#                    چرخشی، هیچ تیکی = توقف زودهنگام با پیام خطا.
 #   3. auto          full = کاملاً اتوماتیک (پیش‌فرض)
 #   4. proxy         رشتهٔ پروکسی host:port:user:pass (برای نوع scrapeops خالی بگذار)
 #   5. proxy_country کشور خروج پروکسی (پیش‌فرض us)
@@ -77,15 +78,21 @@ on:
         description: '۱) تعداد حساب برای ساخت'
         required: true
         default: '1'
-      email_method:
-        description: '۲) منبع ایمیل — چند تیک بزن = چرخشی بین همان‌ها؛ یک تیک = منبع ثابت؛ هر سه = rotate'
+      use_duck:
+        description: '۲ الف) منبع duck.com'
         required: true
-        default: 'duck'
-        type: multiple
-        options:
-          - duck
-          - generated
-          - erine
+        type: boolean
+        default: true
+      use_generated:
+        description: '۲ ب) منبع دامنهٔ خودمان (generated)'
+        required: false
+        type: boolean
+        default: true
+      use_erine:
+        description: '۲ ج) منبع erine.email'
+        required: false
+        type: boolean
+        default: true
       auto:
         description: '۳) حالت اجرا — full کاملاً اتوماتیک است (تیک و دکمهٔ آخر را هم ماشین می‌زند)'
         required: true
@@ -166,8 +173,13 @@ jobs:
       HUB_KEY: ${{ vars.HUB_KEY || secrets.HUB_API_KEY }}
       # ۱) تعداد
       GSA_COUNT: ${{ inputs.count }}
-      # ۲) منبع ایمیل
-      GSA_METHOD: ${{ inputs.email_method }}
+      # ۲) منبع ایمیل — از روی سه تیک use_duck/use_generated/use_erine ساخته
+      #    می‌شود: کاما-جدول (duck,erine) که اسکریپت چرخشی بین همان‌هاست.
+      #    ۱ تیک = منبع ثابت · ۲–۳ تیک = چرخشی · هیچ تیکی = خطای زودهنگام.
+      GSA_METHOD: ${{ format('{0}{1}{2}',
+        inputs.use_duck && 'duck,' || '',
+        inputs.use_generated && 'generated,' || '',
+        inputs.use_erine && 'erine' || '') }}
       # ۳) کاملاً اتوماتیک
       GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
       # ۷) کلید اصلی: off → هیچ پروکسی‌ای در کل اجرا نیست (off در proxy.js
@@ -204,6 +216,16 @@ jobs:
       GSA_CLAIM_BY: 'gha-${{ github.run_id }}'
 
     steps:
+      # تیک حداقل یک منبع باید خورده باشد؛ وگرنه GSA_METHOD خالی می‌ماند و
+      # اسکریپت بی‌سروصدا به پیش‌فرض duck برمی‌گردد — که دقیقاً چیزی نیست
+      # که کاربر انتخاب کرده است.
+      - name: ① بررسی تیک منابع ایمیل
+        if: env.GSA_METHOD == ''
+        run: |
+          Write-Host '❌ هیچ منبع ایمیلی تیک نخورده است.'
+          Write-Host '   حداقل یکی از use_duck / use_generated / use_erine باید روشن باشد.'
+          exit 1
+
       - name: دریافت کد اتوماسیون (مخزن خصوصی GmailDuck)
         uses: actions/checkout@v5
         with:
