@@ -1,0 +1,10 @@
+{
+  "name": "freestyle-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Start/stop a 9Router VM on Freestyle and keep it on a fixed domain",
+  "dependencies": {
+    "freestyle": "0.2.20"
+  }
+}

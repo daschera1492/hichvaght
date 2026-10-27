@@ -1,0 +1,50 @@
+name: 9Router Start
+
+# Creates (or resumes) the 9Router VM on Freestyle, installs it, and routes the
+# fixed hostname to it. Re-running is safe: every step is idempotent.
+on:
+  workflow_dispatch:
+    inputs:
+      idle_timeout:
+        description: "Seconds of inactivity before the VM auto-pauses"
+        required: false
+        default: "1200"
+
+# Never let two Start runs fight over the same VM.
+concurrency:
+  group: 9router-lifecycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      ROUTER_DOMAIN: router.codol.ir
+      ROUTER_SLUG: nine-router
+      ROUTER_PORT: "20128"
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+      IDLE_TIMEOUT_SECONDS: ${{ inputs.idle_timeout }}
+      FREESTYLE_SNAPSHOT: freestyle/ubuntu-sm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: scripts/freestyle-router
+        run: npm install --no-audit --no-fund
+
+      - name: Start 9Router
+        working-directory: scripts/freestyle-router
+        run: node start.mjs

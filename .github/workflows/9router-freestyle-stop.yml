@@ -1,0 +1,39 @@
+name: 9Router Stop
+
+# Destroys the 9Router VM and the route pointing at it, releasing the free-tier
+# quota. The hostname and its DNS records stay in place, so the next Start
+# brings the same URL back.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: 9router-lifecycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      ROUTER_DOMAIN: router.codol.ir
+      ROUTER_SLUG: nine-router
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: scripts/freestyle-router
+        run: npm install --no-audit --no-fund
+
+      - name: Stop 9Router
+        working-directory: scripts/freestyle-router
+        run: node stop.mjs
