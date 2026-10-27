@@ -1,27 +1,37 @@
 name: 9Router Stop
 
-# Destroys the 9Router VM and the route pointing at it, releasing the free-tier
-# quota. The hostname and its DNS records stay in place, so the next Start
-# brings the same URL back.
+# Archives the router state (official 9router export + SQLite database + secrets)
+# as an encrypted GitHub release asset, then destroys the VM and its route,
+# releasing the free-tier quota. The hostname and its DNS records stay in place,
+# so the next Start brings the same URL back.
 on:
   workflow_dispatch:
+    inputs:
+      force_backup:
+        description: "Archive even when the router is empty (overwrites the last good archive)"
+        type: boolean
+        default: false
 
 concurrency:
   group: 9router-lifecycle
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   stop:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     env:
       FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
       ROUTER_DOMAIN: router.codol.ir
       ROUTER_SLUG: nine-router
+      ROUTER_PORT: "20128"
+      GITHUB_TOKEN: ${{ github.token }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      FORCE_BACKUP: ${{ inputs.force_backup && '1' || '0' }}
 
     steps:
       - uses: actions/checkout@v4

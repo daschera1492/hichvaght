@@ -1,21 +1,42 @@
-// Start: create (or resume) the 9Router VM, install it, route the fixed domain.
+// Start: create the 9Router VM, install it, restore state (optionally), and
+// route the fixed domain to it.
 //
-// Tested end-to-end against the live API. Safe to re-run: every step is idempotent.
+// RESTORE_BACKUP=false starts from a blank database (the "fresh" tick in the
+// workflow); anything else restores the archive written by Stop, falling back to
+// the baseline seed config when no archive exists yet.
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { CONFIG, client, log, sleep, header, run, waitForState } from "./lib.mjs";
+import {
+  CONFIG,
+  BACKUP,
+  backupConfigured,
+  client,
+  log,
+  sleep,
+  header,
+  run,
+  tryRun,
+  waitForListener,
+  waitForState,
+  downloadBackup,
+  downloadSeed,
+  exportState,
+  unseal,
+} from "./lib.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const freestyle = client();
+const wantBackup = (process.env.RESTORE_BACKUP ?? "true").toLowerCase() !== "false";
 
 header(`9Router Start — ${CONFIG.domain} (VM "${CONFIG.slug}")`);
+log(`• Mode: ${wantBackup ? "restore the last Stop archive" : "fresh — ignore archive and seed"}`);
 
 // ---------------------------------------------------------------- 1. DNS
-// Done once, permanently. The CNAME must be PROXIED (orange cloud):
-// Cloudflare then serves a trusted certificate for the hostname and talks to
-// the Freestyle edge itself. This removes any dependency on Freestyle's ACME
-// pipeline, which does not issue for this zone.
+// Done once, permanently. The CNAME must be PROXIED (orange cloud): Cloudflare
+// then serves a trusted certificate for the hostname and talks to the Freestyle
+// edge itself. This removes any dependency on Freestyle's ACME pipeline, which
+// does not issue for this zone.
 async function ensureDns() {
   const token = process.env.CF_API_TOKEN;
   if (!token) {
@@ -90,7 +111,129 @@ async function provision(vm) {
   for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 }
 
-// ---------------------------------------------------------------- 4. TLS rule
+// ---------------------------------------------------------------- 4. state
+// The VM is disposable, so its state travels through encrypted GitHub release
+// assets. This runs before the route is created: the hostname never points at a
+// half-filled database.
+
+/** Start 9router with nothing but an empty database. */
+async function startEmpty(vm, reason) {
+  await run(
+    vm,
+    `sudo bash -c '
+      set -e
+      systemctl stop 9router || true
+      rm -rf ${CONFIG.dataDir}/db
+      rm -f ${CONFIG.dataDir}/db.json ${CONFIG.dataDir}/.migrated-from-json
+      systemctl start 9router
+    '`,
+  );
+  const up = await waitForListener(vm, CONFIG.port, 90);
+  if (!up) throw new Error("9router did not start on an empty database");
+  log(`• State: ${reason} — empty database, up after ${up}s`);
+}
+
+/** Drop a JSON export where 9router imports it on first boot. */
+async function importSeed(vm, seedBytes) {
+  await vm.fs.writeFile("/tmp/9router-seed.json", new Uint8Array(seedBytes));
+  await run(
+    vm,
+    `sudo bash -c '
+      set -e
+      systemctl stop 9router || true
+      rm -rf ${CONFIG.dataDir}/db
+      cp /tmp/9router-seed.json ${CONFIG.dataDir}/db.json
+      chown root:root ${CONFIG.dataDir}/db.json
+      chmod 644 ${CONFIG.dataDir}/db.json
+      rm -f ${CONFIG.dataDir}/.migrated-from-json
+      systemctl start 9router
+    '`,
+  );
+  return waitForListener(vm, CONFIG.port, 90);
+}
+
+async function restoreState(vm) {
+  if (!wantBackup) {
+    await startEmpty(vm, "fresh start requested, archive ignored");
+    return;
+  }
+  if (!backupConfigured()) {
+    log("• State: backup is not configured (BACKUP_ENCRYPTION_KEY / GITHUB_TOKEN) — starting empty");
+    return;
+  }
+
+  // Preferred: the exact archive written by Stop.
+  const sealed = await downloadBackup();
+  if (sealed) {
+    const tar = unseal(sealed);
+    log(`• State: archive ${(tar.length / 1024).toFixed(1)} KiB from release "${BACKUP.tag}", restoring…`);
+    await vm.fs.writeFile("/tmp/9router-restore.tar.gz", new Uint8Array(tar));
+
+    const out = await run(
+      vm,
+      `sudo bash -c '
+        set -e
+        systemctl stop 9router || true
+        rm -rf ${CONFIG.dataDir}/db
+        tar xzf /tmp/9router-restore.tar.gz -C ${CONFIG.dataDir}
+        # No database in the archive? Let 9router import the bundled JSON instead.
+        if [ ! -f ${CONFIG.dataDir}/db/data.sqlite ] && [ -f ${CONFIG.dataDir}/9router-export.json ]; then
+          cp ${CONFIG.dataDir}/9router-export.json ${CONFIG.dataDir}/db.json
+          rm -f ${CONFIG.dataDir}/.migrated-from-json
+        fi
+        chown -R root:root ${CONFIG.dataDir}/db 2>/dev/null || true
+        chown root:root ${CONFIG.dataDir}/9router-export.json 2>/dev/null || true
+        [ -f ${CONFIG.dataDir}/jwt-secret ] && chmod 600 ${CONFIG.dataDir}/jwt-secret
+        echo "--- restored ---"
+        ls -l ${CONFIG.dataDir}/db ${CONFIG.dataDir}/9router-export.json 2>/dev/null
+        systemctl start 9router
+      '`,
+    );
+    for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+
+    const up = await waitForListener(vm, CONFIG.port, 90);
+    if (up) {
+      log(`• State: 9router is serving the restored database (up after ${up}s)`);
+      return;
+    }
+    log("• State: the archived database did not start — falling back to a fresh one");
+    await startEmpty(vm, "restore rolled back");
+    return;
+  }
+
+  // No archive yet: use the owner's baseline export, if one was published.
+  const seed = await downloadSeed();
+  if (seed) {
+    const json = unseal(seed);
+    log(`• State: no archive — importing the baseline seed (${(json.length / 1024).toFixed(1)} KiB)…`);
+    const up = await importSeed(vm, json);
+    if (up) {
+      log(`• State: baseline config imported (up after ${up}s)`);
+      return;
+    }
+    log("• State: the baseline seed did not start — falling back to a fresh database");
+    await startEmpty(vm, "seed rolled back");
+    return;
+  }
+
+  log("• State: nothing archived yet — starting with a fresh database");
+  await startEmpty(vm, "first run");
+}
+
+/** Report what the running instance actually holds. */
+async function reportState(vm) {
+  // The app creates its database lazily, so touch an API route first.
+  await tryRun(vm, `curl -s -o /dev/null http://127.0.0.1:${CONFIG.port}/api/providers || true`);
+  await sleep(1000);
+  const { counts } = await exportState(vm, "/tmp/9router-verify.json");
+  log(
+    `• State: providers=${counts.providerConnections ?? 0} nodes=${counts.providerNodes ?? 0} ` +
+      `combos=${counts.combos ?? 0} apiKeys=${counts.apiKeys ?? 0} customModels=${counts.customModels ?? 0}`,
+  );
+  return counts;
+}
+
+// ---------------------------------------------------------------- 5. TLS rule
 async function ensureRoute(vmId) {
   const { rules } = await freestyle.tls.rules.list();
   const mine = (rules ?? []).filter((r) => r.domain === CONFIG.domain);
@@ -114,9 +257,9 @@ async function ensureRoute(vmId) {
   log(`• Route: created ${rule.id} — ${CONFIG.domain} -> ${vmId}:${CONFIG.port}`);
 }
 
-// ---------------------------------------------------------------- 5. verify
+// ---------------------------------------------------------------- 6. verify
 async function verify() {
-  // Verified from the runner itself, i.e. the real public path through Cloudflare.
+  // Checked from the runner itself, i.e. the real public path through Cloudflare.
   // /dashboard redirects to /login once the router is up, so following is expected.
   const url = `https://${CONFIG.domain}/dashboard`;
   log(`• Verify: waiting for ${url} to answer…`);
@@ -143,6 +286,8 @@ const data = await vm.data();
 log(`• VM: ${data.id} state=${data.state} slug=${data.slug}`);
 
 await provision(vm);
+await restoreState(vm);
+const counts = await reportState(vm);
 await ensureRoute(data.id);
 await verify();
 
@@ -150,5 +295,7 @@ header("READY");
 log(`  URL      : https://${CONFIG.domain}/dashboard`);
 log(`  Password : ${CONFIG.password}`);
 log(`  VM       : ${data.id} (${CONFIG.slug})`);
-log(`  Idle     : pauses after ${CONFIG.idleTimeoutSeconds}s, wakes on next request`);
-log(`  Stop     : run the "9Router Stop" workflow to destroy it`);
+log(`  Dataset  : ${wantBackup ? "restored" : "fresh (archive kept untouched)"}`);
+log(`  Contents : providers=${counts.providerConnections ?? 0} combos=${counts.combos ?? 0} apiKeys=${counts.apiKeys ?? 0} customModels=${counts.customModels ?? 0}`);
+log(`  Idle     : pauses after ${CONFIG.idleTimeoutSeconds}s, public traffic wakes it in <1s`);
+log(`  Stop     : run "9Router Stop" to archive this state and destroy the VM`);

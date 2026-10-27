@@ -1,16 +1,24 @@
 name: 9Router Start
 
-# Creates (or resumes) the 9Router VM on Freestyle, installs it, and routes the
-# fixed hostname to it. Re-running is safe: every step is idempotent.
+# Creates the 9Router VM on Freestyle, installs it, optionally restores the state
+# archived by the last Stop, and routes the fixed hostname to it.
+#
+# with_backup ticked  -> restore the last archive (or the baseline seed on a
+#                        brand-new setup)
+# with_backup unticked -> "khām": a blank 9router, nothing loaded into it
 on:
   workflow_dispatch:
     inputs:
+      with_backup:
+        description: "با بکاپ بالا بیاد (برداشتن تیک = خام، بکاپ لود نمی‌شه)"
+        type: boolean
+        default: true
       idle_timeout:
         description: "Seconds of inactivity before the VM auto-pauses"
         required: false
         default: "1200"
 
-# Never let two Start runs fight over the same VM.
+# Never let two lifecycle runs fight over the same VM.
 concurrency:
   group: 9router-lifecycle
   cancel-in-progress: false
@@ -21,7 +29,7 @@ permissions:
 jobs:
   start:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
@@ -33,6 +41,9 @@ jobs:
       NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
       IDLE_TIMEOUT_SECONDS: ${{ inputs.idle_timeout }}
       FREESTYLE_SNAPSHOT: freestyle/ubuntu-sm
+      RESTORE_BACKUP: ${{ inputs.with_backup }}
+      GITHUB_TOKEN: ${{ github.token }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
 
     steps:
       - uses: actions/checkout@v4
