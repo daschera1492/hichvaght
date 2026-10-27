@@ -47,6 +47,10 @@ jobs:
       RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
       GITHUB_TOKEN: ${{ github.token }}
       BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      # Clean egress for the OpenCode free lane (oc/*). Without it every oc/*
+      # model answers 429 from a datacenter IP, even though the lane itself is
+      # free and keyless. Format: http://user:pass@host:port
+      OUTBOUND_PROXY_URL: ${{ secrets.OUTBOUND_PROXY_URL }}
 
     steps:
       - uses: actions/checkout@v4

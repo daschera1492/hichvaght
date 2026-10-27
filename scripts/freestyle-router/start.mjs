@@ -234,6 +234,52 @@ async function restoreState(vm) {
   await startEmpty(vm, "first run");
 }
 
+// ---------------------------------------------------------------- 4b. egress
+// 9Router's OpenCode free lane (`oc/*`) answers 429 from Freestyle's own exit
+// address, from Azure/GitHub runners and from Cloudflare WARP — every datacenter
+// range that has already burned the daily free window. The same request from a
+// clean residential-grade IP answers 200 with no key at all.
+//
+// So the lane is not broken, the exit IP is. `outboundProxyUrl` is 9Router's own
+// switch for this and it covers the wreq-js transport: with it set, the call
+// leaves through the proxy and returns 200 in ~1-2s. These settings live in the
+// database, so they are (re)applied here after a restore — an old archive must
+// never be able to bring back the 429.
+async function applyOutboundProxy(vm) {
+  const url = (process.env.OUTBOUND_PROXY_URL ?? "").trim();
+  if (!url) {
+    log("• Egress: OUTBOUND_PROXY_URL not set — oc/* will fall back to this VM's own IP (429)");
+    return false;
+  }
+
+  const mask = url.replace(/\/\/[^@/]*@/, "//***@");
+  const payload = JSON.stringify({ outboundProxyEnabled: true, outboundProxyUrl: url, outboundNoProxy: "" });
+  const auth = JSON.stringify({ password: CONFIG.password });
+  const base = `http://127.0.0.1:${CONFIG.port}`;
+
+  const out = await run(
+    vm,
+    `set -e
+JAR=$(mktemp)
+LOGIN=$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" -X POST ${base}/api/auth/login \
+  -H 'Content-Type: application/json' --data '${auth}')
+if [ "$LOGIN" != "200" ]; then echo "login=$LOGIN"; rm -f "$JAR"; exit 1; fi
+SAVED=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X PATCH ${base}/api/settings \
+  -H 'Content-Type: application/json' --data '${payload}')
+ENABLED=$(curl -s -b "$JAR" ${base}/api/settings | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).outboundProxyEnabled))}catch(e){process.stdout.write("unreadable")}})')
+rm -f "$JAR"
+echo "login=$LOGIN patch=$SAVED enabled=$ENABLED"`,
+  );
+
+  const line = (out.split("\n").find((l) => l.includes("login=")) ?? out).trim();
+  if (!/enabled=true/.test(line)) {
+    log(`• Egress: proxy was NOT applied (${line}) — oc/* will 429`);
+    return false;
+  }
+  log(`• Egress: oc/* leaves through ${mask} (${line.replace(/\s*enabled=true/, "")})`);
+  return true;
+}
+
 /** Report what the running instance actually holds. */
 async function reportState(vm) {
   // The app creates its database lazily, so touch an API route first.
@@ -301,6 +347,7 @@ log(`• VM: ${data.id} state=${data.state} slug=${data.slug}`);
 
 await provision(vm);
 await restoreState(vm);
+const egressProxied = await applyOutboundProxy(vm);
 const counts = await reportState(vm);
 await ensureRoute(data.id);
 await verify();
@@ -311,5 +358,6 @@ log(`  Password : ${CONFIG.password}`);
 log(`  VM       : ${data.id} (${CONFIG.slug})`);
 log(`  Dataset  : ${wantBackup ? "restored" : "fresh (archive kept untouched)"}`);
 log(`  Contents : providers=${counts.providerConnections ?? 0} combos=${counts.combos ?? 0} apiKeys=${counts.apiKeys ?? 0} customModels=${counts.customModels ?? 0}`);
+log(`  Egress   : ${egressProxied ? "oc/* via OUTBOUND_PROXY_URL (free lane answers 200)" : "direct — oc/* will 429"}`);
 log(`  Idle     : pauses after ${CONFIG.idleTimeoutSeconds}s, public traffic wakes it in <1s`);
 log(`  Stop     : run "9Router Stop" to archive this state and destroy the VM`);
