@@ -171,7 +171,9 @@ jobs:
           $ids = Get-ChildItem $accDir -Directory | Select-Object -ExpandProperty Name
           if (-not $ids) { throw 'هیچ اکانتی در آرشیو نبود' }
           Write-Host "اکانت‌های بازیابی‌شده: $($ids -join ', ')"
-          & $env:FXA_CORE_BIN -list-accounts -data-dir $env:FXA_DATA_DIR
+          # list-accounts را صدا نمی‌زنیم: ایمیل کامل را در لاگ عمومی چاپ می‌کند
+          $files = (Get-ChildItem $accDir -Recurse -File).Count
+          Write-Host "فایل‌های اکانت: $files"
 
       # ---------------------------------------------------------------- 7
       - name: شروع فایرفاکس-VPN
@@ -179,6 +181,12 @@ jobs:
           $log = Join-Path $env:GITHUB_WORKSPACE 'vpn.log'
           $err = Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log'
           Remove-Item $log, $err -ErrorAction SilentlyContinue
+
+          # GitHub Actions هر پروسه‌ای که داخل یک step استارت شود را در پایان
+          # همان step می‌کشد (با شناسه RUNNER_TRACKING_ID). اگر این متغیر را
+          # حذف نکنیم، core بعد از پایان این step کشته می‌شود.
+          Remove-Item Env:RUNNER_TRACKING_ID -ErrorAction SilentlyContinue
+
           $proc = Start-Process -FilePath $env:FXA_CORE_BIN `
             -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
             -RedirectStandardOutput $log `
@@ -195,17 +203,33 @@ jobs:
         id: wait
         run: |
           $pidFile = Join-Path $env:GITHUB_WORKSPACE 'vpn.pid'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'vpn.log'
+          $err = Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log'
           $vpnPid  = [int](Get-Content $pidFile)
+          $restarts = 0
           $ip = ''
           $ok = $false
 
+          function Start-Vpn {
+            Remove-Item Env:RUNNER_TRACKING_ID -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $env:FXA_CORE_BIN `
+              -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
+              -RedirectStandardOutput $log -RedirectStandardError $err `
+              -PassThru -NoNewWindow
+            $p.Id | Set-Content $pidFile
+            return $p.Id
+          }
+
           for ($i = 1; $i -le 45; $i++) {
             if (-not (Get-Process -Id $vpnPid -ErrorAction SilentlyContinue)) {
-              Write-Host '--- vpn.log ---'
-              Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.log') -ErrorAction SilentlyContinue
-              Write-Host '--- vpn.err.log ---'
-              Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log') -ErrorAction SilentlyContinue
-              throw 'core از کار افتاد (پروسه تمام شد)'
+              if ($restarts -lt 2) {
+                $restarts++
+                Write-Host "::warning::core متوقف شد؛ راه‌اندازی مجدد ($restarts/2)"
+                $vpnPid = Start-Vpn
+                Start-Sleep -Seconds 3
+                continue
+              }
+              throw 'core سه بار متوقف شد (پروسه تمام شد)'
             }
 
             $out = (& curl.exe -s --max-time 20 --socks5-hostname "127.0.0.1:$env:FXA_PROXY_PORT" https://api.ipify.org 2>$null | Out-String).Trim()
