@@ -15,10 +15,18 @@ export PATH="$PATH:$(npm prefix -g)/bin"
 
 echo "==> 1/5 installing 9router (if missing)"
 if ! command -v 9router >/dev/null 2>&1; then
-  # npm >= 11 blocks postinstall scripts unless allow-listed; older npm rejects the flag.
-  sudo npm i -g 9router --allow-scripts=9router --no-audit --no-fund >/tmp/npm-i.log 2>&1 \
-    || sudo npm i -g 9router --no-audit --no-fund >>/tmp/npm-i.log 2>&1 \
+  # npm >= 11 blocks postinstall scripts unless allow-listed; older npm rejects the
+  # flag. Pick the flag by asking npm itself instead of failing a 2-minute install
+  # and retrying it (measured on run 40654240428: the failed attempt cost ~2 min).
+  SCRIPT_FLAG=""
+  if npm help install 2>/dev/null | grep -q -- '--allow-scripts'; then
+    SCRIPT_FLAG="--allow-scripts=9router"
+  fi
+  echo "    npm $(npm --version), script flag: ${SCRIPT_FLAG:-none}"
+  { echo "attempt 1 at $(date -u +%H:%M:%S)"; sudo npm i -g 9router $SCRIPT_FLAG --no-audit --no-fund; } >/tmp/npm-i.log 2>&1 \
+    || { echo "attempt 2 at $(date -u +%H:%M:%S)" >>/tmp/npm-i.log; sudo npm i -g 9router --no-audit --no-fund >>/tmp/npm-i.log 2>&1; } \
     || { tail -20 /tmp/npm-i.log; echo "FATAL: 9router install failed"; exit 1; }
+  echo "    installed in the time shown by: $(grep -E 'added [0-9]+ package' /tmp/npm-i.log | tail -1)"
 fi
 BIN="$(command -v 9router)"
 echo "    9router -> $BIN ($(9router --version 2>/dev/null || echo '?'))"
