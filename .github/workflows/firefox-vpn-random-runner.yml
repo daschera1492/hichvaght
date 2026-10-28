@@ -191,7 +191,7 @@ jobs:
             -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
             -RedirectStandardOutput $log `
             -RedirectStandardError $err `
-            -PassThru -NoNewWindow
+            -PassThru -WindowStyle Hidden
           $proc.Id | Set-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.pid')
           Write-Host "Firefox VPN شروع شد (PID: $($proc.Id)) | کشور: $env:SELECTED_COUNTRY"
 
@@ -215,7 +215,7 @@ jobs:
             $p = Start-Process -FilePath $env:FXA_CORE_BIN `
               -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
               -RedirectStandardOutput $log -RedirectStandardError $err `
-              -PassThru -NoNewWindow
+              -PassThru -WindowStyle Hidden
             $p.Id | Set-Content $pidFile
             return $p.Id
           }
@@ -284,6 +284,22 @@ jobs:
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
           Write-Host "کشور=$env:SELECTED_COUNTRY | SOCKS5=127.0.0.1:$env:FXA_PROXY_PORT | IP=$env:VPN_EXIT_IP"
 
+      # ---------------------------------------------------------------- 10b
+      # مهم: این step تضمین می‌کند تونل بعد از پایان step قبلی هم زنده مانده،
+      # چون GitHub Actions پروسه‌های هر step را در پایان همان step می‌کشد.
+      # ---------------------------------------------------------------- 10b
+      - name: تأیید زنده بودن تونل تا step بعد
+        run: |
+          $ip = (& curl.exe -s --max-time 25 --socks5-hostname "127.0.0.1:$env:FXA_PROXY_PORT" https://api.ipify.org 2>$null | Out-String).Trim()
+          if ($ip -notmatch '^[0-9a-fA-F:.]{3,45}$') {
+            & $env:FXA_CORE_BIN -status -data-dir $env:FXA_DATA_DIR 2>&1 | Out-String | Write-Host
+            throw 'تونل بین stepها قطع شد — پروسه core زنده نمانده'
+          }
+          Write-Host "✅ تونل بین stepها زنده است — IP: $ip | کشور: $env:SELECTED_COUNTRY"
+          if ($ip -ne $env:VPN_EXIT_IP) {
+            Write-Host "::warning::IP خروجی عوض شد: قبلی=$env:VPN_EXIT_IP الان=$ip"
+          }
+
       # ---------------------------------------------------------------- 11
       - name: اجرای مرحله بعدی (اختیاری)
         if: ${{ inputs.run_task }}
@@ -318,3 +334,4 @@ jobs:
             Stop-Process -Id $vpnPid -Force -ErrorAction SilentlyContinue
             Write-Host "Firefox VPN بسته شد (PID: $vpnPid)"
           }
+          Get-Process -Name 'firefox-vpn-core' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
