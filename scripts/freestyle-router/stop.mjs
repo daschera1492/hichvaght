@@ -54,13 +54,19 @@ if (target) {
     try {
       await ensureRunning(freestyle, vm);
 
-      // A start that failed before provision leaves a VM with no ${CONFIG.dataDir}
-      // and no better-sqlite3, so exportState() would crash. There is genuinely
-      // nothing to archive — skip the backup and let teardown delete the VM rather
-      // than aborting and leaking it.
-      const provisioned = (await tryRun(vm, `test -d ${CONFIG.dataDir} && echo yes || echo no`)).out.includes("yes");
+      // A start that failed before provision leaves a VM without the systemd unit
+      // or the runtime node_modules that exportState() needs (better-sqlite3), so
+      // the export would throw and this script would abort — leaking the VM. There
+      // is genuinely nothing to archive in that case, so skip the backup and let
+      // the teardown delete the VM.
+      const provisioned = (
+        await tryRun(
+          vm,
+          `test -f /etc/systemd/system/9router.service && test -d ${CONFIG.runtimeNodePath} && echo yes || echo no`,
+        )
+      ).out.includes("yes");
       if (!provisioned) {
-        log(`• Backup: skipped — ${CONFIG.dataDir} absent (VM was never provisioned), nothing to archive`);
+        log("• Backup: skipped — 9router was never installed in this VM, nothing to archive");
       } else {
       // Export before touching anything: this is the official, portable format.
       const exported = await exportState(vm, "/tmp/9router-export.json");

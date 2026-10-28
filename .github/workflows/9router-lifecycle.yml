@@ -153,6 +153,10 @@ jobs:
       # Creates the VM, routes ALL of its traffic through the exit node above,
       # installs 9router + wreq-js, and points the domain at it.
       - name: Start 9Router (VM routed through the exit node)
+        # Hard ceiling for the whole start phase (install + provision + restore).
+        # Without it, a stuck guest call could sit here until the 6-hour job cap and
+        # burn the whole session. On timeout the teardown below still runs.
+        timeout-minutes: 30
         working-directory: scripts/freestyle-router
         run: node start.mjs
 

@@ -114,9 +114,21 @@ async function provision(vm) {
   // the run() helper echoes the whole command on failure, and an inline value would
   // also be injectable if it ever contained a shell quote.
   await vm.fs.writeTextFile("/tmp/9router-pw", CONFIG.password);
+  // vm.exec is NOT root, and the file is chmod 600 root-owned, so the password
+  // must be read by the same root shell that runs bootstrap.sh. `sudo VAR="$(cat
+  // ...)"` expands the substitution in the *caller's* (non-root) shell and hands
+  // sudo an empty value — bootstrap.sh then aborts on its fail-hard check.
   const out = await run(
     vm,
-    `sudo chmod 600 /tmp/9router-pw && sudo ROUTER_PORT=${CONFIG.port} NINE_ROUTER_PASSWORD="$(cat /tmp/9router-pw)" bash /tmp/bootstrap.sh; rc=$?; sudo rm -f /tmp/9router-pw; exit $rc`,
+    `sudo bash -c '
+      chmod 600 /tmp/9router-pw
+      export ROUTER_PORT=${CONFIG.port}
+      export NINE_ROUTER_PASSWORD="$(cat /tmp/9router-pw)"
+      bash /tmp/bootstrap.sh
+      rc=$?
+      rm -f /tmp/9router-pw
+      exit $rc
+    '`,
   );
   for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 }
@@ -254,62 +266,178 @@ async function restoreState(vm) {
 async function routeThroughExitNode(vm) {
   const exitNode = CONFIG.exitNode.trim();
   const authKey = CONFIG.tailscaleAuthKey.trim();
+  const want = CONFIG.runnerPublicIp.trim();
   if (!exitNode || !authKey) {
     log("• Egress: EXIT_NODE / TAILSCALE_AUTH_KEY not set — VM keeps its own IP (oc/* may 429)");
     return false;
   }
 
-  log(`• Egress: routing ALL VM traffic through Tailscale exit node ${exitNode}…`);
-  // The auth key goes into a 600-mode file so the real value never appears in the
-  // command string (the run() helper echoes the command on failure). We pass it via
-  // --authkey (read from the file at runtime) — `TS_AUTHKEY=... tailscale up` did
-  // NOT apply the key and fell back to an interactive login prompt that hung forever.
-  //
-  // `timeout 120` wraps the up call so a bad key or an interactive prompt can never
-  // hang the whole job: the guest kills it and we fail fast instead. (The run()
-  // timeoutMs alone is not enough — vm.exec does not reliably enforce it.)
-  await vm.fs.writeTextFile("/tmp/ts-auth.key", authKey);
-  const out = await run(
-    vm,
-    `set -e
-sudo chmod 600 /tmp/ts-auth.key
-if ! command -v tailscale >/dev/null 2>&1; then
-  curl -fsSL https://tailscale.com/install.sh | sh >/tmp/ts-install.log 2>&1 \
+  // Everything here is FAIL-SOFT: a broken exit node must never cost the whole
+  // session. The router works on the VM's own IP, so the worst case is "oc/* may
+  // 429", not "no router at all".
+  try {
+    // ---- 1. client ------------------------------------------------------
+    log("• Egress 1/4: Tailscale client…");
+    const install = await run(
+      vm,
+      `set -e
+if command -v tailscale >/dev/null 2>&1; then
+  echo "already installed: $(tailscale version | head -n1)"
+else
+  curl -fsSL https://tailscale.com/install.sh -o /tmp/ts-install.sh
+  sudo bash /tmp/ts-install.sh >/tmp/ts-install.log 2>&1 \
     || { tail -20 /tmp/ts-install.log; echo "FATAL: tailscale install failed"; exit 1; }
-fi
+  echo "installed: $(tailscale version | head -n1)"
+fi`,
+      420_000,
+    );
+    for (const line of install.split("\n").filter(Boolean)) log(`    ${line}`);
+
+    // ---- 2. auth only ---------------------------------------------------
+    // No --exit-node here on purpose: this step cannot cut the VM's network, so
+    // an auth failure is reported cleanly instead of breaking vm.exec.
+    log("• Egress 2/4: joining the tailnet with the shared auth key…");
+    await vm.fs.writeTextFile("/tmp/ts-auth.key", authKey);
+    const auth = await run(
+      vm,
+      `set -e
+sudo chmod 600 /tmp/ts-auth.key
 sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
 for i in $(seq 1 30); do sudo systemctl is-active --quiet tailscaled && break; sleep 1; done
 sudo timeout 120 tailscale up \
   --authkey="$(sudo cat /tmp/ts-auth.key)" \
-  --exit-node=${exitNode} \
-  --exit-node-allow-lan-access=true \
   --accept-dns=false \
   --hostname=${CONFIG.slug}-vm \
-  || { echo "FATAL: tailscale up failed or timed out"; sudo tailscale status || true; sudo rm -f /tmp/ts-auth.key; exit 1; }
+  || { echo "AUTH-FAILED (bad/expired/already-used auth key?)"; sudo tailscale status 2>&1 | head -5; sudo rm -f /tmp/ts-auth.key; exit 1; }
 sudo rm -f /tmp/ts-auth.key
-sudo tailscale status || true
-E=""
-for i in $(seq 1 20); do
-  E=$(curl -s --max-time 8 https://api.ipify.org || true)
-  if [ -n "$E" ]; then break; fi
-  sleep 3
-done
-echo "egress=\${E:-unknown}"`,
-  );
-  for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+# A previous attempt may have left an exit node configured — start from a clean,
+# working direct route so the probes below mean something.
+sudo timeout 60 tailscale set --exit-node= --accept-dns=false || true
+echo "baseline=$(curl -s --max-time 10 https://api.ipify.org || echo none)"`,
+      240_000,
+    );
+    for (const line of auth.split("\n").filter(Boolean)) log(`    ${line}`);
+    const baseline = (auth.split("\n").find((l) => l.startsWith("baseline=")) ?? "").slice(9).trim();
+    if (!baseline || baseline === "none") {
+      log("• Egress: the VM has no internet before the switch — leaving the direct route as is");
+      return false;
+    }
 
-  const egress = (out.split("\n").find((l) => l.startsWith("egress=")) ?? "").slice(7).trim();
-  const want = CONFIG.runnerPublicIp.trim();
-  if (egress && want && egress === want) {
-    log(`• Egress: verified — VM leaves from the runner IP ${egress}`);
-    return true;
-  }
-  if (egress && want && egress !== want) {
-    log(`• Egress: WARNING — VM egress is ${egress}, expected the runner IP ${want}`);
+    // ---- 2b. can this VM even SEE the exit node? -------------------------
+    // This is the check that was missing. `tailscale set --exit-node=…` happily
+    // installs a 0.0.0.0/0 route into tailscale0 even when the exit node is not in
+    // the VM's netmap; every packet is then black-holed (no DNS, no HTTPS) and,
+    // because Freestyle's control channel rides the same network, vm.exec hangs
+    // too. Observed in run 40654240428: EXITNODE=100.123.186.114 but
+    // `tailscale ping` -> "no matching peer", egress=unknown, VM unreachable.
+    //
+    // In that run the VM was tagged tag:exit-node (the shared auth key is tagged)
+    // and its netmap contained ONLY untagged member devices — every tagged node,
+    // including the runner/exit node, was hidden by the tailnet policy. Switching
+    // routes there can never work, so refuse to switch and say why.
+    log(`• Egress 2b/4: checking that this VM can reach the exit node ${exitNode}…`);
+    const probe = await tryRun(vm, `sudo tailscale ping -c 2 --timeout 4s ${exitNode} 2>&1 || true`, 120_000);
+    const probeOut = probe.out;
+    if (!/pong|via DERP|via direct/i.test(probeOut)) {
+      log(`    ${probeOut.split("\n")[0] || "no response"}`);
+      log("• Egress: the VM cannot reach the exit node — NOT switching routes (this would");
+      log("          black-hole all traffic). The router still works on the VM's own IP.");
+      log("          Fix one of these, then re-run:");
+      log("            a) Tailscale admin -> Access controls: allow this device to reach");
+      log("               tag:exit-node (the shared auth key tags BOTH nodes, and this");
+      log(`               tailnet hides tagged peers from each other), or`);
+      log("            b) use an UNTAGGED reusable auth key for the runner/exit node.");
+      return false;
+    }
+    log("    reachable");
+
+    // ---- 3. switch, in a detached self-reverting watchdog ----------------
+    // `tailscale set --exit-node=…` reroutes 0.0.0.0/0 through the runner. If the
+    // runner cannot actually forward (ip_forward, NAT, ACL, exit-node approval),
+    // the VM loses the internet — and Freestyle's control channel with it, so an
+    // exec running the switch never returns. (That is exactly the 30-minute
+    // "hang": output stops right after this log line.) The watchdog therefore runs
+    // detached, probes the internet, and reverts to the direct route by itself, so
+    // the VM can never be left unreachable and vm.exec can never block forever.
+    log(`• Egress 3/4: switching the default route to exit node ${exitNode} (self-reverting watchdog)…`);
+    await vm.fs.writeTextFile("/tmp/ts-exit.sh", `#!/bin/bash
+EXIT_NODE=${exitNode}
+LOG=/tmp/ts-exit.log
+RES=/tmp/ts-exit.result
+rm -f "$RES" "$LOG"
+exec >>"$LOG" 2>&1
+echo "watchdog start $(date -u +%H:%M:%S) exit-node=$EXIT_NODE"
+timeout 60 tailscale set --exit-node="$EXIT_NODE" --exit-node-allow-lan-access=true --accept-dns=false
+echo "set --exit-node rc=$?"
+OK=""
+for i in $(seq 1 8); do
+  sleep 3
+  IP=$(curl -s --max-time 6 https://api.ipify.org || true)
+  echo "probe $i egress=\${IP:-none}"
+  if [ -n "$IP" ]; then OK="$IP"; break; fi
+done
+if [ -n "$OK" ]; then
+  echo "RESULT=ok egress=$OK" > "$RES"
+else
+  echo "no egress through the exit node — reverting to the direct route"
+  timeout 60 tailscale set --exit-node= --accept-dns=false
+  sleep 4
+  BACK=$(curl -s --max-time 8 https://api.ipify.org || true)
+  echo "RESULT=failed reverted_egress=\${BACK:-none}" > "$RES"
+fi
+chmod 644 "$RES" "$LOG" 2>/dev/null
+echo "watchdog done"
+`);
+    await run(
+      vm,
+      `chmod +x /tmp/ts-exit.sh
+sudo rm -f /tmp/ts-exit.result /tmp/ts-exit.log
+sudo setsid nohup /tmp/ts-exit.sh >/dev/null 2>&1 &
+echo launched`,
+      60_000,
+    );
+
+    // ---- 4. verdict -----------------------------------------------------
+    log("• Egress 4/4: waiting for the watchdog verdict…");
+    let verdict = "";
+    let tail = "";
+    for (let attempt = 1; attempt <= 2 && !verdict; attempt++) {
+      const poll = await run(
+        vm,
+        `timeout 45 bash -c 'for i in $(seq 1 20); do [ -s /tmp/ts-exit.result ] && break; sleep 2; done; cat /tmp/ts-exit.result 2>/dev/null || echo RESULT=pending'
+tail -n 6 /tmp/ts-exit.log 2>/dev/null || true`,
+        180_000,
+      );
+      tail = poll;
+      const m = poll.match(/RESULT=(ok|failed)\b[^\n]*/);
+      if (m) verdict = m[0];
+    }
+    for (const line of tail.split("\n").filter(Boolean)) log(`    ${line}`);
+
+    const ok = verdict.match(/^RESULT=ok egress=(\S+)/);
+    if (ok) {
+      const egress = ok[1];
+      if (want && egress !== want) {
+        log(`• Egress: routed through the exit node, but egress is ${egress} (runner IP ${want}) — check the runner's NAT`);
+      } else {
+        log(`• Egress: verified — ALL VM traffic leaves from ${egress} (the runner's IP)`);
+      }
+      return true;
+    }
+    if (/^RESULT=failed/.test(verdict)) {
+      log("• Egress: the exit node does not forward traffic — reverted to the direct route.");
+      log("          Usual causes: exit node not APPROVED in the Tailscale admin console,");
+      log("          tailnet ACL blocking it, or ip_forward/NAT missing on the runner.");
+      log("          Continuing without it: the router works, but oc/* requests may 429.");
+      return false;
+    }
+    log("• Egress: watchdog verdict still pending — leaving the direct route in place.");
+    return false;
+  } catch (e) {
+    log(`• Egress: FAILED — ${String(e.message).split("\n")[0]}`);
+    log("          Continuing WITHOUT the exit node (the router still works; oc/* may 429).");
     return false;
   }
-  log(`• Egress: exit node set (egress ${egress || "unknown"}, runner IP ${want || "not provided"})`);
-  return Boolean(egress);
 }
 
 /** Report what the running instance actually holds. */
