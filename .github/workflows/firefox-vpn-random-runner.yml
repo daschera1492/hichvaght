@@ -178,22 +178,26 @@ jobs:
       # ---------------------------------------------------------------- 7
       - name: شروع فایرفاکس-VPN
         run: |
+          # GitHub Actions در پایان هر step کل درخت پروسه‌های همان step را
+          # می‌کشد (حتی با حذف RUNNER_TRACKING_ID یا WindowStyle Hidden).
+          # پس core را با WMI می‌سازیم: والدش WmiPrvSE می‌شود و از درخت
+          # پروسه‌های step خارج است، بنابراین تا پایان job زنده می‌ماند.
           $log = Join-Path $env:GITHUB_WORKSPACE 'vpn.log'
           $err = Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log'
           Remove-Item $log, $err -ErrorAction SilentlyContinue
 
-          # GitHub Actions هر پروسه‌ای که داخل یک step استارت شود را در پایان
-          # همان step می‌کشد (با شناسه RUNNER_TRACKING_ID). اگر این متغیر را
-          # حذف نکنیم، core بعد از پایان این step کشته می‌شود.
-          Remove-Item Env:RUNNER_TRACKING_ID -ErrorAction SilentlyContinue
+          $cmd = '"{0}" -data-dir "{1}" -plain' -f $env:FXA_CORE_BIN, $env:FXA_DATA_DIR
+          Write-Host "CommandLine: $cmd"
+          $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd }
+          if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create ناموفق بود (ReturnValue=$($r.ReturnValue))" }
 
-          $proc = Start-Process -FilePath $env:FXA_CORE_BIN `
-            -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
-            -RedirectStandardOutput $log `
-            -RedirectStandardError $err `
-            -PassThru -WindowStyle Hidden
-          $proc.Id | Set-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.pid')
-          Write-Host "Firefox VPN شروع شد (PID: $($proc.Id)) | کشور: $env:SELECTED_COUNTRY"
+          $vpnPid = [int]$r.ProcessId
+          $vpnPid | Set-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.pid')
+          Start-Sleep -Seconds 2
+          if (-not (Get-Process -Id $vpnPid -ErrorAction SilentlyContinue)) {
+            throw 'core بلافاصله بعد از استارت خارج شد'
+          }
+          Write-Host "Firefox VPN شروع شد (PID: $vpnPid) | کشور: $env:SELECTED_COUNTRY"
 
       # ---------------------------------------------------------------- 8
       # تنها معیار واقعی موفقیت: یک درخواست HTTPS از داخل تونل جواب بدهد.
@@ -211,13 +215,11 @@ jobs:
           $ok = $false
 
           function Start-Vpn {
-            Remove-Item Env:RUNNER_TRACKING_ID -ErrorAction SilentlyContinue
-            $p = Start-Process -FilePath $env:FXA_CORE_BIN `
-              -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
-              -RedirectStandardOutput $log -RedirectStandardError $err `
-              -PassThru -WindowStyle Hidden
-            $p.Id | Set-Content $pidFile
-            return $p.Id
+            $c = '"{0}" -data-dir "{1}" -plain' -f $env:FXA_CORE_BIN, $env:FXA_DATA_DIR
+            $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $c }
+            if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create ناموفق بود ($($r.ReturnValue))" }
+            $r.ProcessId | Set-Content $pidFile
+            return [int]$r.ProcessId
           }
 
           for ($i = 1; $i -le 45; $i++) {
@@ -248,12 +250,13 @@ jobs:
           }
 
           if (-not $ok) {
-            Write-Host '--- vpn.log ---'
-            Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.log') -ErrorAction SilentlyContinue
-            Write-Host '--- vpn.err.log ---'
-            Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log') -ErrorAction SilentlyContinue
+            Write-Host '--- core logs ---'
+            Get-ChildItem (Join-Path $env:FXA_DATA_DIR 'logs') -File -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "--- $($_.Name) ---"; Get-Content $_.FullName -Tail 40 }
+            Write-Host '--- stdout/stderr ---'
+            Get-Content $log, $err -ErrorAction SilentlyContinue
             & $env:FXA_CORE_BIN -status -data-dir $env:FXA_DATA_DIR 2>&1 | Out-String | Write-Host
-            throw "تونل در ۴۵ تلاش (~۱۵ دقیقه) برقرار نشد — کشور: $env:SELECTED_COUNTRY"
+            throw "تونل در ۴۵ تلاش (~۱۵ دقیقه) برقرار نشد - کشور: $env:SELECTED_COUNTRY"
           }
 
           "VPN_EXIT_IP=$ip" | Add-Content -Path $env:GITHUB_ENV
@@ -319,6 +322,7 @@ jobs:
           path: |
             vpn.log
             vpn.err.log
+            firefox-vpn-data/logs
             firefox-vpn-data/config.json
             firefox-vpn-data/servers.json
           if-no-files-found: ignore
