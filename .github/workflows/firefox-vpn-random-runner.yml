@@ -281,7 +281,7 @@ jobs:
             'GSA_USE_PROXY=1',
             "GSA_PROXY=127.0.0.1:$env:FXA_PROXY_PORT",
             "FXA_SOCKS5=socks5h://127.0.0.1:$env:FXA_PROXY_PORT",
-            'GSA_PROXY_TYPE=firefox-vpn',
+            'GSA_PROXY_TYPE=rainproxy',
             "GSA_PROXY_COUNTRY=$env:SELECTED_COUNTRY",
             'FXA_VPN_ACTIVE=1'
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
