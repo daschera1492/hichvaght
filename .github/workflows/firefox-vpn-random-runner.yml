@@ -281,7 +281,6 @@ jobs:
             vpn.err.log
             firefox-vpn-data/config.json
             firefox-vpn-data/servers.json
-            firefox-vpn-data/status.json
           if-no-files-found: ignore
           retention-days: 7
 
