@@ -1,6 +1,6 @@
 // Start: create the 9Router VM, install it, restore state (optionally), route the
-// fixed domain to it, and — first — point all of the VM's traffic through the
-// GitHub runner's Tailscale exit node so its egress is a clean IP.
+// fixed domain to it, and point all of the VM's traffic through the GitHub runner's
+// Tailscale exit node so its egress is a clean IP.
 //
 // RESTORE_BACKUP=false starts from a blank database (the "fresh" tick in the
 // workflow); anything else restores the archive written by Stop, falling back to
@@ -369,10 +369,21 @@ exec >>"$LOG" 2>&1
 echo "watchdog start $(date -u +%H:%M:%S) exit-node=$EXIT_NODE"
 timeout 60 tailscale set --exit-node="$EXIT_NODE" --exit-node-allow-lan-access=true --accept-dns=false
 echo "set --exit-node rc=$?"
+
+# Freestyle's edge reaches this VM from a PRIVATE network (measured: 10.31.252.x ->
+# 169.254.77.2:20128). Private destinations are never on the public internet, so
+# they must stay on eth0. Without these rules the SYN-ACK to the edge goes into the
+# tunnel and every public request answers 502 (verified: 0/10 -> 12/12 with them).
+ip rule add pref 4990 to 10.0.0.0/8 lookup main 2>/dev/null
+ip rule add pref 4991 to 192.168.0.0/16 lookup main 2>/dev/null
+ip -6 rule add pref 4992 to fc00::/7 lookup main 2>/dev/null
+ip -6 rule add pref 4993 to fe80::/64 lookup main 2>/dev/null
+echo "lan rules: $(ip rule show | grep -c '^49')"
+
 OK=""
 for i in $(seq 1 8); do
   sleep 3
-  IP=$(curl -s --max-time 6 https://api.ipify.org || true)
+  IP=$(curl -s --max-time 8 https://api.ipify.org || true)
   echo "probe $i egress=\${IP:-none}"
   if [ -n "$IP" ]; then OK="$IP"; break; fi
 done
@@ -381,6 +392,7 @@ if [ -n "$OK" ]; then
 else
   echo "no egress through the exit node — reverting to the direct route"
   timeout 60 tailscale set --exit-node= --accept-dns=false
+  for p in 4990 4991 4992 4993; do ip rule del pref $p 2>/dev/null; ip -6 rule del pref $p 2>/dev/null; done
   sleep 4
   BACK=$(curl -s --max-time 8 https://api.ipify.org || true)
   echo "RESULT=failed reverted_egress=\${BACK:-none}" > "$RES"
@@ -505,14 +517,19 @@ const vm = await ensureVm();
 const data = await vm.data();
 log(`• VM: ${data.id} state=${data.state} slug=${data.slug}`);
 
-// Route the VM's traffic through the runner's exit node FIRST, so everything
-// below — npm install, 9router's own outbound, the free oc/* lane — leaves from
-// the runner's clean IP instead of Freestyle's datacenter address.
-const egressRouted = await routeThroughExitNode(vm);
-
+// Install and restore FIRST, then switch the route. npm downloads ~100 MB and the
+// exit node is DERP-relayed in practice, so installing through it is much slower;
+// nothing is public yet either way (the TLS rule is created last).
 await provision(vm);
 await restoreState(vm);
 const counts = await reportState(vm);
+
+// Now point ALL of the VM's traffic at the runner's exit node, so everything the
+// router does from here on — the free oc/* lane in particular — leaves from the
+// runner's clean IP. Ingress keeps working because the watchdog also keeps
+// Freestyle's private edge network out of the tunnel.
+const egressRouted = await routeThroughExitNode(vm);
+
 await ensureRoute(data.id);
 await verify();
 
