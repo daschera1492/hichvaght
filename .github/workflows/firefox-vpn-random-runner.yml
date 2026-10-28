@@ -1,0 +1,297 @@
+# Runner جدید و مستقل: Firefox VPN با لوکیشن تصادفی در هر اجرا
+# -----------------------------------------------------------------------------
+# این فایل کاملاً جدید است و هیچ‌یک از فایل‌های قبلی (مثل signup-batch.yml)
+# را تغییر نمی‌دهد.
+#
+# کارهایی که انجام می‌دهد:
+#   1) سورس armanlife/firefox-vpn-client را جدا کلون می‌کند (بدون دست‌زدن به مخزن تو)
+#   2) firefox-vpn-core.exe را می‌سازد
+#   3) یک کشور تصادفی انتخاب می‌کند — به‌طور پیش‌فرض فقط کشورهای آزاد (رایگان)
+#   4) اکانت فایرفاکس را از Secret بازیابی می‌کند
+#   5) SOCKS5/HTTP محلی را روی 127.0.0.1:10810 بالا می‌آورد
+#   6) با curl از داخل تونل واقعاً تست می‌کند و IP خروجی را می‌گیرد
+#   7) متغیرهای پروکسی را برای مراحل بعدی export می‌کند
+#
+# پیش‌نیاز (یک‌بار):
+#   Secret با نام FXA_ACCOUNTS_TGZ_B64  (خروجی add-account.ps1)
+# -----------------------------------------------------------------------------
+
+name: Firefox VPN - Random Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      country:
+        description: 'کد کشور مشخص (خالی = تصادفی). آزاد: ar au de jp us za'
+        required: false
+        default: ''
+      transport:
+        description: 'ترنسپورت'
+        required: true
+        default: 'h2'
+        type: choice
+        options:
+          - h2
+          - h3
+      include_locked:
+        description: 'شامل کشورهای Plus (قفل‌شده) هم باشد؟ (اکانت رایگان شکست می‌خورد)'
+        required: true
+        type: boolean
+        default: false
+      run_task:
+        description: 'اجرای مرحله بعدی (اسکریپت شما) پس از آماده شدن VPN'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  firefox-vpn:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      FXA_DATA_DIR: ${{ github.workspace }}\firefox-vpn-data
+      FXA_PROXY_PORT: '10810'
+      FXA_DASHBOARD_PORT: '10820'
+      FXA_CORE_BIN: ${{ github.workspace }}\firefox-vpn-core.exe
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+
+    steps:
+      # ---------------------------------------------------------------- 1
+      - name: دریافت سورس فایرفاکس-VPN
+        uses: actions/checkout@v5
+        with:
+          repository: armanlife/firefox-vpn-client
+          ref: main
+          path: firefox-vpn-src
+          fetch-depth: 1
+
+      # ---------------------------------------------------------------- 2
+      - name: نصب Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: firefox-vpn-src/core/go.mod
+          cache: true
+          cache-dependency-path: firefox-vpn-src/core/go.sum
+
+      # ---------------------------------------------------------------- 3
+      - name: ساخت firefox-vpn-core.exe
+        working-directory: firefox-vpn-src\core
+        run: |
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -o "$env:FXA_CORE_BIN" ./cmd/firefox-vpn-core
+          if (-not (Test-Path $env:FXA_CORE_BIN)) { throw 'ساخت باینری ناموفق بود' }
+          & $env:FXA_CORE_BIN -version
+
+      # ---------------------------------------------------------------- 4
+      # کشورهای "locked" فقط برای اشتراک Plus هستند و اکانت رایگان روی آن‌ها
+      # وصل نمی‌شود؛ پس به‌طور پیش‌فرض از استخر آزاد انتخاب می‌کنیم.
+      # (لیست از پاسخ زنده vpn-serverlist موزیلا، فیلد locked)
+      # ---------------------------------------------------------------- 4
+      - name: انتخاب لوکیشن تصادفی
+        id: pick
+        env:
+          INPUT_COUNTRY: ${{ inputs.country }}
+          INCLUDE_LOCKED: ${{ inputs.include_locked }}
+        run: |
+          $free   = @('ar','au','de','jp','us','za')
+          $locked = @('at','be','bg','br','ca','cl','co','dk','es','fi','fr','gb',
+                      'gh','ie','it','kr','mx','my','nl','no','nz','pe','ph','pt',
+                      'se','sg','th')
+
+          if ($env:INCLUDE_LOCKED -eq 'true') { $pool = $free + $locked } else { $pool = $free }
+          $pool = $pool | Select-Object -Unique
+          $inputCountry = ($env:INPUT_COUNTRY ?? '').Trim().ToLower()
+
+          if ($inputCountry) {
+            if ($inputCountry -notin ($free + $locked)) {
+              throw "کد کشور نامعتبر: '$inputCountry'. معتبر: $(($free + $locked) -join ', ')"
+            }
+            if ($inputCountry -in $locked -and $env:INCLUDE_LOCKED -ne 'true') {
+              Write-Host "::warning::کشور '$inputCountry' قفل است (Plus)؛ با اکانت رایگان احتمال شکست بالا است."
+            }
+            $picked = $inputCountry
+            Write-Host "کشور از ورودی: $picked"
+          } else {
+            $picked = Get-Random -InputObject $pool
+            Write-Host "کشور تصادفی از استخر ($($pool.Count) کشور): $picked"
+          }
+
+          "SELECTED_COUNTRY=$picked" | Add-Content -Path $env:GITHUB_ENV
+          "picked_country=$picked"   | Add-Content -Path $env:GITHUB_OUTPUT
+          Write-Host "استخر: $($pool -join ' ')"
+
+      # ---------------------------------------------------------------- 5
+      - name: ایجاد config.json
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:FXA_DATA_DIR | Out-Null
+          $cfg = [ordered]@{
+            version = 2
+            proxy = [ordered]@{
+              listen      = "127.0.0.1:$env:FXA_PROXY_PORT"
+              country     = $env:SELECTED_COUNTRY
+              transport   = '${{ inputs.transport }}'
+              idle_sleep  = '0s'
+            }
+            routing = [ordered]@{
+              enabled = $false
+              region  = ''
+            }
+            dashboard = [ordered]@{
+              enabled = $true
+              listen  = "127.0.0.1:$env:FXA_DASHBOARD_PORT"
+            }
+          }
+          $cfg | ConvertTo-Json -Depth 6 |
+            Set-Content -Path (Join-Path $env:FXA_DATA_DIR 'config.json') -Encoding utf8NoBOM
+          Get-Content (Join-Path $env:FXA_DATA_DIR 'config.json')
+
+      # ---------------------------------------------------------------- 6
+      - name: بازیابی اکانت فایرفاکس از Secret
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:FXA_ACCOUNTS_TGZ_B64)) {
+            throw 'Secret «FXA_ACCOUNTS_TGZ_B64» تنظیم نشده است. ابتدا add-account.ps1 را اجرا کن.'
+          }
+          New-Item -ItemType Directory -Force -Path $env:FXA_DATA_DIR | Out-Null
+          $tgz = Join-Path $env:GITHUB_WORKSPACE 'accounts.tar.gz'
+          [IO.File]::WriteAllBytes($tgz, [Convert]::FromBase64String($env:FXA_ACCOUNTS_TGZ_B64.Trim()))
+          & tar -xzf $tgz -C $env:FXA_DATA_DIR
+          if ($LASTEXITCODE -ne 0) { throw "باز کردن آرشیو ناموفق بود (tar exit $LASTEXITCODE)" }
+          Remove-Item $tgz -Force
+
+          $accDir = Join-Path $env:FXA_DATA_DIR 'accounts'
+          if (-not (Test-Path $accDir)) { throw 'پوشه accounts/ بازیابی نشد' }
+          if (-not (Test-Path (Join-Path $accDir 'secret.key'))) { throw 'secret.key در آرشیو نیست' }
+          $ids = Get-ChildItem $accDir -Directory | Select-Object -ExpandProperty Name
+          if (-not $ids) { throw 'هیچ اکانتی در آرشیو نبود' }
+          Write-Host "اکانت‌های بازیابی‌شده: $($ids -join ', ')"
+          & $env:FXA_CORE_BIN -list-accounts -data-dir $env:FXA_DATA_DIR
+
+      # ---------------------------------------------------------------- 7
+      - name: شروع فایرفاکس-VPN
+        run: |
+          $log = Join-Path $env:GITHUB_WORKSPACE 'vpn.log'
+          $err = Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log'
+          Remove-Item $log, $err -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath $env:FXA_CORE_BIN `
+            -ArgumentList @('-data-dir', $env:FXA_DATA_DIR, '-plain') `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError $err `
+            -PassThru -NoNewWindow
+          $proc.Id | Set-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.pid')
+          Write-Host "Firefox VPN شروع شد (PID: $($proc.Id)) | کشور: $env:SELECTED_COUNTRY"
+
+      # ---------------------------------------------------------------- 8
+      # تنها معیار واقعی موفقیت: یک درخواست HTTPS از داخل تونل جواب بدهد.
+      # (status خط «connected» را زودتر نشان می‌دهد، چون تونل lazy است)
+      # ---------------------------------------------------------------- 8
+      - name: انتظار برای اتصال واقعی (تست با curl)
+        id: wait
+        run: |
+          $pidFile = Join-Path $env:GITHUB_WORKSPACE 'vpn.pid'
+          $vpnPid  = [int](Get-Content $pidFile)
+          $ip = ''
+          $ok = $false
+
+          for ($i = 1; $i -le 45; $i++) {
+            if (-not (Get-Process -Id $vpnPid -ErrorAction SilentlyContinue)) {
+              Write-Host '--- vpn.log ---'
+              Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.log') -ErrorAction SilentlyContinue
+              Write-Host '--- vpn.err.log ---'
+              Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log') -ErrorAction SilentlyContinue
+              throw 'core از کار افتاد (پروسه تمام شد)'
+            }
+
+            $out = (& curl.exe -s --max-time 20 --socks5-hostname "127.0.0.1:$env:FXA_PROXY_PORT" https://api.ipify.org 2>$null | Out-String).Trim()
+            if ($out -match '^[0-9a-fA-F:.]{3,45}$') {
+              $ip = $out
+              $ok = $true
+              Write-Host "✅ تونل کار می‌کند (تلاش $i) — IP خروجی: $ip"
+              break
+            }
+
+            if ($i % 5 -eq 0) {
+              Write-Host "--- وضعیت (تلاش $i/45) ---"
+              & $env:FXA_CORE_BIN -status -data-dir $env:FXA_DATA_DIR 2>&1 | Out-String | Write-Host
+            }
+            Start-Sleep -Seconds 10
+          }
+
+          if (-not $ok) {
+            Write-Host '--- vpn.log ---'
+            Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.log') -ErrorAction SilentlyContinue
+            Write-Host '--- vpn.err.log ---'
+            Get-Content (Join-Path $env:GITHUB_WORKSPACE 'vpn.err.log') -ErrorAction SilentlyContinue
+            & $env:FXA_CORE_BIN -status -data-dir $env:FXA_DATA_DIR 2>&1 | Out-String | Write-Host
+            throw "تونل در ۴۵ تلاش (~۱۵ دقیقه) برقرار نشد — کشور: $env:SELECTED_COUNTRY"
+          }
+
+          "VPN_EXIT_IP=$ip" | Add-Content -Path $env:GITHUB_ENV
+          "exit_ip=$ip"     | Add-Content -Path $env:GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------- 9
+      - name: مقایسه با IP مستقیم رنر
+        run: |
+          Write-Host "VPN   : $env:VPN_EXIT_IP"
+          $direct = (& curl.exe -s --max-time 20 https://api.ipify.org | Out-String).Trim()
+          Write-Host "Direct: $direct"
+          if ($direct -and $direct -eq $env:VPN_EXIT_IP) {
+            Write-Host '::warning::IP خروجی با IP مستقیم یکی است — ممکن است ترافیک از تونل نرفته باشد.'
+          } else {
+            Write-Host '✅ IP خروجی با IP رنر فرق دارد (ترافیک از VPN می‌رود).'
+          }
+
+      # ---------------------------------------------------------------- 10
+      - name: export متغیرهای پروکسی برای مراحل بعدی
+        run: |
+          @(
+            'GSA_USE_PROXY=1',
+            "GSA_PROXY=127.0.0.1:$env:FXA_PROXY_PORT",
+            "FXA_SOCKS5=socks5h://127.0.0.1:$env:FXA_PROXY_PORT",
+            'GSA_PROXY_TYPE=firefox-vpn',
+            "GSA_PROXY_COUNTRY=$env:SELECTED_COUNTRY",
+            'FXA_VPN_ACTIVE=1'
+          ) | ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ }
+          Write-Host "کشور=$env:SELECTED_COUNTRY | SOCKS5=127.0.0.1:$env:FXA_PROXY_PORT | IP=$env:VPN_EXIT_IP"
+
+      # ---------------------------------------------------------------- 11
+      - name: اجرای مرحله بعدی (اختیاری)
+        if: ${{ inputs.run_task }}
+        run: |
+          Write-Host 'VPN آماده است. متغیرهای موجود:'
+          Write-Host "  GSA_PROXY=$env:GSA_PROXY"
+          Write-Host "  GSA_PROXY_COUNTRY=$env:GSA_PROXY_COUNTRY"
+          Write-Host '--- دستور واقعی خود را اینجا بگذار ---'
+          # & node scripts/run-batch.js --count 1 --method duck --require-proxy
+
+      # ---------------------------------------------------------------- 12
+      - name: آپلود لاگ‌ها
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-vpn-logs-${{ github.run_id }}
+          path: |
+            vpn.log
+            vpn.err.log
+            firefox-vpn-data/config.json
+            firefox-vpn-data/servers.json
+            firefox-vpn-data/status.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---------------------------------------------------------------- 13
+      - name: بستن فایرفاکس-VPN
+        if: always()
+        run: |
+          $pidFile = Join-Path $env:GITHUB_WORKSPACE 'vpn.pid'
+          if (Test-Path $pidFile) {
+            $vpnPid = [int](Get-Content $pidFile)
+            Stop-Process -Id $vpnPid -Force -ErrorAction SilentlyContinue
+            Write-Host "Firefox VPN بسته شد (PID: $vpnPid)"
+          }
