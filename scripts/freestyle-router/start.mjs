@@ -1,5 +1,6 @@
-// Start: create the 9Router VM, install it, restore state (optionally), and
-// route the fixed domain to it.
+// Start: create the 9Router VM, install it, restore state (optionally), route the
+// fixed domain to it, and — first — point all of the VM's traffic through the
+// GitHub runner's Tailscale exit node so its egress is a clean IP.
 //
 // RESTORE_BACKUP=false starts from a blank database (the "fresh" tick in the
 // workflow); anything else restores the archive written by Stop, falling back to
@@ -109,7 +110,14 @@ async function provision(vm) {
   log("• Provisioning 9Router inside the VM (this takes ~1–2 min)…");
   const script = await readFile(join(here, "bootstrap.sh"), "utf8");
   await vm.fs.writeTextFile("/tmp/bootstrap.sh", script);
-  const out = await run(vm, `sudo ROUTER_PORT=${CONFIG.port} NINE_ROUTER_PASSWORD='${CONFIG.password}' bash /tmp/bootstrap.sh`);
+  // Hand the password to the guest through a 600-mode file instead of inlining it:
+  // the run() helper echoes the whole command on failure, and an inline value would
+  // also be injectable if it ever contained a shell quote.
+  await vm.fs.writeTextFile("/tmp/9router-pw", CONFIG.password);
+  const out = await run(
+    vm,
+    `sudo chmod 600 /tmp/9router-pw && sudo ROUTER_PORT=${CONFIG.port} NINE_ROUTER_PASSWORD="$(cat /tmp/9router-pw)" bash /tmp/bootstrap.sh; rc=$?; sudo rm -f /tmp/9router-pw; exit $rc`,
+  );
   for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 }
 
@@ -235,49 +243,57 @@ async function restoreState(vm) {
 }
 
 // ---------------------------------------------------------------- 4b. egress
-// 9Router's OpenCode free lane (`oc/*`) answers 429 from Freestyle's own exit
-// address, from Azure/GitHub runners and from Cloudflare WARP — every datacenter
-// range that has already burned the daily free window. The same request from a
-// clean residential-grade IP answers 200 with no key at all.
+// 9Router's OpenCode free lane (`oc/*`) answers 429 from every datacenter range
+// that has already burned its daily free window — Freestyle's own exit address,
+// Azure, GitHub runners, Cloudflare WARP. The lane is fine; the exit IP is not.
 //
-// So the lane is not broken, the exit IP is. `outboundProxyUrl` is 9Router's own
-// switch for this and it covers the wreq-js transport: with it set, the call
-// leaves through the proxy and returns 200 in ~1-2s. These settings live in the
-// database, so they are (re)applied here after a restore — an old archive must
-// never be able to bring back the 429.
-async function applyOutboundProxy(vm) {
-  const url = (process.env.OUTBOUND_PROXY_URL ?? "").trim();
-  if (!url) {
-    log("• Egress: OUTBOUND_PROXY_URL not set — oc/* will fall back to this VM's own IP (429)");
+// The GitHub runner that launched this job advertises itself as a Tailscale exit
+// node. We install Tailscale in the VM and point it at that exit node, so 100% of
+// the VM's outbound traffic leaves from the runner's IP. This replaces the old
+// OUTBOUND_PROXY_URL switch entirely.
+async function routeThroughExitNode(vm) {
+  const exitNode = CONFIG.exitNode.trim();
+  const authKey = CONFIG.tailscaleAuthKey.trim();
+  if (!exitNode || !authKey) {
+    log("• Egress: EXIT_NODE / TAILSCALE_AUTH_KEY not set — VM keeps its own IP (oc/* may 429)");
     return false;
   }
 
-  const mask = url.replace(/\/\/[^@/]*@/, "//***@");
-  const payload = JSON.stringify({ outboundProxyEnabled: true, outboundProxyUrl: url, outboundNoProxy: "" });
-  const auth = JSON.stringify({ password: CONFIG.password });
-  const base = `http://127.0.0.1:${CONFIG.port}`;
-
+  log(`• Egress: routing ALL VM traffic through Tailscale exit node ${exitNode}…`);
+  // The auth key goes into a 600-mode file so it never appears in the command
+  // string (the run() helper echoes the command on failure).
+  await vm.fs.writeTextFile("/tmp/ts-auth.key", authKey);
   const out = await run(
     vm,
     `set -e
-JAR=$(mktemp)
-LOGIN=$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" -X POST ${base}/api/auth/login \
-  -H 'Content-Type: application/json' --data '${auth}')
-if [ "$LOGIN" != "200" ]; then echo "login=$LOGIN"; rm -f "$JAR"; exit 1; fi
-SAVED=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X PATCH ${base}/api/settings \
-  -H 'Content-Type: application/json' --data '${payload}')
-ENABLED=$(curl -s -b "$JAR" ${base}/api/settings | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).outboundProxyEnabled))}catch(e){process.stdout.write("unreadable")}})')
-rm -f "$JAR"
-echo "login=$LOGIN patch=$SAVED enabled=$ENABLED"`,
+sudo chmod 600 /tmp/ts-auth.key
+if ! command -v tailscale >/dev/null 2>&1; then
+  curl -fsSL https://tailscale.com/install.sh | sh >/tmp/ts-install.log 2>&1 \
+    || { tail -20 /tmp/ts-install.log; echo "FATAL: tailscale install failed"; exit 1; }
+fi
+sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
+sudo TS_AUTHKEY="$(cat /tmp/ts-auth.key)" tailscale up \
+  --exit-node=${exitNode} \
+  --exit-node-allow-lan-access=true \
+  --accept-dns=false \
+  --hostname=${CONFIG.slug}-vm
+sudo rm -f /tmp/ts-auth.key
+echo "egress=$(curl -s --max-time 15 https://api.ipify.org || echo unknown)"`,
   );
+  for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 
-  const line = (out.split("\n").find((l) => l.includes("login=")) ?? out).trim();
-  if (!/enabled=true/.test(line)) {
-    log(`• Egress: proxy was NOT applied (${line}) — oc/* will 429`);
+  const egress = (out.split("\n").find((l) => l.startsWith("egress=")) ?? "").slice(7).trim();
+  const want = CONFIG.runnerPublicIp.trim();
+  if (egress && want && egress === want) {
+    log(`• Egress: verified — VM leaves from the runner IP ${egress}`);
+    return true;
+  }
+  if (egress && want && egress !== want) {
+    log(`• Egress: WARNING — VM egress is ${egress}, expected the runner IP ${want}`);
     return false;
   }
-  log(`• Egress: oc/* leaves through ${mask} (${line.replace(/\s*enabled=true/, "")})`);
-  return true;
+  log(`• Egress: exit node set (egress ${egress || "unknown"}, runner IP ${want || "not provided"})`);
+  return Boolean(egress);
 }
 
 /** Report what the running instance actually holds. */
@@ -345,9 +361,13 @@ const vm = await ensureVm();
 const data = await vm.data();
 log(`• VM: ${data.id} state=${data.state} slug=${data.slug}`);
 
+// Route the VM's traffic through the runner's exit node FIRST, so everything
+// below — npm install, 9router's own outbound, the free oc/* lane — leaves from
+// the runner's clean IP instead of Freestyle's datacenter address.
+const egressRouted = await routeThroughExitNode(vm);
+
 await provision(vm);
 await restoreState(vm);
-const egressProxied = await applyOutboundProxy(vm);
 const counts = await reportState(vm);
 await ensureRoute(data.id);
 await verify();
@@ -358,6 +378,6 @@ log(`  Password : ${CONFIG.password}`);
 log(`  VM       : ${data.id} (${CONFIG.slug})`);
 log(`  Dataset  : ${wantBackup ? "restored" : "fresh (archive kept untouched)"}`);
 log(`  Contents : providers=${counts.providerConnections ?? 0} combos=${counts.combos ?? 0} apiKeys=${counts.apiKeys ?? 0} customModels=${counts.customModels ?? 0}`);
-log(`  Egress   : ${egressProxied ? "oc/* via OUTBOUND_PROXY_URL (free lane answers 200)" : "direct — oc/* will 429"}`);
+log(`  Egress   : ${egressRouted ? `via Tailscale exit node ${CONFIG.exitNode} (runner IP — oc/* answers 200)` : "direct — oc/* may 429"}`);
 log(`  Idle     : pauses after ${CONFIG.idleTimeoutSeconds}s, public traffic wakes it in <1s`);
-log(`  Stop     : run "9Router Stop" to archive this state and destroy the VM`);
+log(`  Session  : the lifecycle workflow archives this state and deletes the VM at the deadline`);

@@ -4,7 +4,10 @@
 set -euo pipefail
 
 PORT="${ROUTER_PORT:-20128}"
-PASSWORD="${NINE_ROUTER_PASSWORD:-123456}"
+# No default password: this repo is public, so a baked-in value would be visible
+# to everyone. The caller must always provide one.
+: "${NINE_ROUTER_PASSWORD:?NINE_ROUTER_PASSWORD must be set (no default password allowed)}"
+PASSWORD="$NINE_ROUTER_PASSWORD"
 DATA_DIR="/root/.9router"
 RUNTIME="$DATA_DIR/runtime"
 

@@ -23,7 +23,15 @@ export const CONFIG = {
   slug: process.env.ROUTER_SLUG || "nine-router",
   displayName: "9Router",
   port: Number(process.env.ROUTER_PORT || 20128),
-  password: process.env.NINE_ROUTER_PASSWORD || "*m96319631Z-",
+  // Read lazily (a getter) so a missing password only breaks the workflow that
+  // actually needs it — stop.mjs never touches it. This repo is public: a baked-in
+  // default would be visible to everyone, so we refuse to fall back and fail fast
+  // instead of silently protecting the router with a public password.
+  get password() {
+    const pw = process.env.NINE_ROUTER_PASSWORD;
+    if (!pw) throw new Error("NINE_ROUTER_PASSWORD is not set — refusing to fall back to a default password");
+    return pw;
+  },
   // Pause the VM after this much idle time. Public traffic wakes it again
   // (measured: ~0.7 s), so this costs nothing in practice.
   idleTimeoutSeconds: Number(process.env.IDLE_TIMEOUT_SECONDS || 1200),
@@ -32,6 +40,13 @@ export const CONFIG = {
   zoneId: process.env.CF_ZONE_ID || "bf636ce15fffa706d4c393463276b6ee",
   dataDir: "/root/.9router",
   runtimeNodePath: "/root/.9router/runtime/node_modules",
+  // The GitHub runner advertises itself as a Tailscale exit node; the VM joins the
+  // same tailnet and routes ALL of its traffic through it, so the VM's egress IP
+  // becomes the runner's clean IP instead of Freestyle's datacenter address (the
+  // free oc/* lane answers 200 rather than 429).
+  exitNode: process.env.EXIT_NODE || "",
+  tailscaleAuthKey: process.env.TAILSCALE_AUTH_KEY || "",
+  runnerPublicIp: process.env.RUNNER_PUBLIC_IP || "",
 };
 
 export const BACKUP = {

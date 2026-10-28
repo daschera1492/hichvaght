@@ -1,0 +1,178 @@
+name: 9Router Lifecycle
+
+# One job owns the whole ~6 hour session:
+#
+#   1. This GitHub runner becomes a Tailscale EXIT NODE and stays up for the whole
+#      session — it does not stop on its own.
+#   2. A Freestyle VM is created, joins the same tailnet and routes ALL of its
+#      traffic through that exit node, so its egress IP is the runner's clean IP
+#      (the free oc/* lane answers 200 instead of 429). This replaces the old
+#      OUTBOUND_PROXY_URL switch.
+#   3. 9router + wreq-js are installed inside the VM and the domain is pointed at
+#      it via Cloudflare.
+#   4. At the session deadline (or on any failure) the state is archived and the
+#      VM is DELETED, freeing the free-tier quota. The exit node logs out last.
+#
+# GitHub caps free-tier jobs at 6 hours (21600 s), so the session runs just under
+# that and reserves the last few minutes for a guaranteed teardown. To stop early,
+# cancel this run — the teardown below still runs via `if: always()`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "حالت شروع: با بکاپ (کانفیگ قبلی) یا خام (هیچ بکاپی لود نمی‌شه)"
+        type: choice
+        default: with-backup
+        options:
+          - with-backup
+          - fresh
+      idle_timeout:
+        description: "Seconds of inactivity before the VM auto-pauses"
+        required: false
+        default: "1200"
+      session_seconds:
+        description: "Session length in seconds (GitHub free tier caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+# Never let two lifecycle runs fight over the same VM.
+concurrency:
+  group: 9router-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    # Hard ceiling. The teardown below is scheduled to finish several minutes
+    # before this, so the VM is always deleted and the quota released.
+    timeout-minutes: 360
+
+    # contents: write is required because the teardown archives state to a release
+    # asset. start.mjs itself only reads.
+    permissions:
+      contents: write
+
+    env:
+      # Tailscale — one shared key for the runner (exit node) and the VM.
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # Set to tag:exit-node if your auth key is tag-restricted; leave empty for an
+      # unrestricted reusable key.
+      TAILSCALE_EXIT_TAG: tag:exit-node
+      # Freestyle + router
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      ROUTER_DOMAIN: router.codol.ir
+      ROUTER_SLUG: nine-router
+      ROUTER_PORT: "20128"
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+      IDLE_TIMEOUT_SECONDS: ${{ inputs.idle_timeout }}
+      FREESTYLE_SNAPSHOT: freestyle/ubuntu-sm
+      RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
+      GITHUB_TOKEN: ${{ github.token }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: scripts/freestyle-router
+        run: npm install --no-audit --no-fund
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------------- exit node
+      # Bring this runner up as a Tailscale exit node (mirrors the byCountry
+      # runners). Everything after this depends on it being online.
+      - name: Bring up exit node (this runner)
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -y
+          sudo apt-get install -y curl lsb-release iptables
+
+          # Tailscale repo + key
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" \
+            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y tailscale
+
+          # An exit node needs forwarding + NAT on the default interface.
+          printf 'net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n' \
+            | sudo tee /etc/sysctl.d/99-tailscale.conf >/dev/null
+          sudo sysctl --system >/dev/null
+          sudo systemctl enable --now tailscaled
+
+          DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+          sudo iptables -A FORWARD -i tailscale0 -o "$DEFAULT_IF" -j ACCEPT
+          sudo iptables -A FORWARD -i "$DEFAULT_IF" -o tailscale0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          sudo iptables -t nat -A POSTROUTING -o "$DEFAULT_IF" -j MASQUERADE
+
+          # Unique hostname per session, like the byCountry runners.
+          CITY=$(curl -s --max-time 10 https://ipinfo.io/city | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          CITY="${CITY:-runner}"
+          HOSTNAME="${CITY}--$(TZ=Asia/Tehran date +'%H-%M')"
+
+          TAG_ARGS=()
+          if [ -n "${TAILSCALE_EXIT_TAG:-}" ]; then
+            TAG_ARGS+=(--advertise-tags="$TAILSCALE_EXIT_TAG")
+          fi
+
+          # TS_AUTHKEY keeps the key out of the command string; GitHub also masks it.
+          sudo TS_AUTHKEY="$TAILSCALE_AUTH_KEY" tailscale up \
+            --advertise-exit-node \
+            --accept-dns=false \
+            --hostname="$HOSTNAME" \
+            "${TAG_ARGS[@]}"
+
+          # Give the control plane a moment to publish the exit node.
+          sleep 5
+          tailscale status
+
+          # Export what the VM needs to select and verify this exit node.
+          echo "EXIT_NODE=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
+          echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 10 https://api.ipify.org)" >> "$GITHUB_ENV"
+          echo "Exit node ready."
+
+      # ------------------------------------------------------------ start VM
+      # Creates the VM, routes ALL of its traffic through the exit node above,
+      # installs 9router + wreq-js, and points the domain at it.
+      - name: Start 9Router (VM routed through the exit node)
+        working-directory: scripts/freestyle-router
+        run: node start.mjs
+
+      # ----------------------------------------------------------- keep alive
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300   # reserve the last 5 minutes for a clean teardown
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          NOW=$(date +%s)
+          SLEEP=$(( DEADLINE - NOW ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      # ------------------------------------------------------------ teardown
+      # Runs even if a middle step failed, so a broken start never leaks a VM. (A
+      # hard timeout kill is the one case that skips this — that is why the session
+      # is kept under the 360-minute ceiling.) If the backup fails, stop.mjs aborts
+      # and keeps the VM rather than destroying un-archived state.
+      - name: Archive state and delete VM
+        if: always()
+        working-directory: scripts/freestyle-router
+        run: node stop.mjs
+
+      - name: Log out of Tailscale
+        if: always()
+        run: sudo tailscale logout || true
