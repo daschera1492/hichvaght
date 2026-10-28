@@ -260,8 +260,14 @@ async function routeThroughExitNode(vm) {
   }
 
   log(`• Egress: routing ALL VM traffic through Tailscale exit node ${exitNode}…`);
-  // The auth key goes into a 600-mode file so it never appears in the command
-  // string (the run() helper echoes the command on failure).
+  // The auth key goes into a 600-mode file so the real value never appears in the
+  // command string (the run() helper echoes the command on failure). We pass it via
+  // --authkey (read from the file at runtime) — `TS_AUTHKEY=... tailscale up` did
+  // NOT apply the key and fell back to an interactive login prompt that hung forever.
+  //
+  // `timeout 120` wraps the up call so a bad key or an interactive prompt can never
+  // hang the whole job: the guest kills it and we fail fast instead. (The run()
+  // timeoutMs alone is not enough — vm.exec does not reliably enforce it.)
   await vm.fs.writeTextFile("/tmp/ts-auth.key", authKey);
   const out = await run(
     vm,
@@ -272,13 +278,23 @@ if ! command -v tailscale >/dev/null 2>&1; then
     || { tail -20 /tmp/ts-install.log; echo "FATAL: tailscale install failed"; exit 1; }
 fi
 sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
-sudo TS_AUTHKEY="$(cat /tmp/ts-auth.key)" tailscale up \
+for i in $(seq 1 30); do sudo systemctl is-active --quiet tailscaled && break; sleep 1; done
+sudo timeout 120 tailscale up \
+  --authkey="$(cat /tmp/ts-auth.key)" \
   --exit-node=${exitNode} \
   --exit-node-allow-lan-access=true \
   --accept-dns=false \
-  --hostname=${CONFIG.slug}-vm
+  --hostname=${CONFIG.slug}-vm \
+  || { echo "FATAL: tailscale up failed or timed out"; sudo tailscale status || true; sudo rm -f /tmp/ts-auth.key; exit 1; }
 sudo rm -f /tmp/ts-auth.key
-echo "egress=$(curl -s --max-time 15 https://api.ipify.org || echo unknown)"`,
+sudo tailscale status || true
+E=""
+for i in $(seq 1 20); do
+  E=$(curl -s --max-time 8 https://api.ipify.org || true)
+  if [ -n "$E" ]; then break; fi
+  sleep 3
+done
+echo "egress=\${E:-unknown}"`,
   );
   for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 

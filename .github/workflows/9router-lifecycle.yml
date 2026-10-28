@@ -127,12 +127,18 @@ jobs:
             TAG_ARGS+=(--advertise-tags="$TAILSCALE_EXIT_TAG")
           fi
 
-          # TS_AUTHKEY keeps the key out of the command string; GitHub also masks it.
-          sudo TS_AUTHKEY="$TAILSCALE_AUTH_KEY" tailscale up \
+          # Use --authkey (the exact flag the working byCountry runners use).
+          # `sudo TS_AUTHKEY=... tailscale up` did NOT apply the key here — tailscale
+          # fell back to the interactive login URL. GitHub masks the secret value
+          # in logs, so the flag form is safe. `timeout 120` guarantees a bad key
+          # fails fast instead of hanging on the interactive prompt for hours.
+          sudo timeout 120 tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
             --advertise-exit-node \
             --accept-dns=false \
             --hostname="$HOSTNAME" \
-            "${TAG_ARGS[@]}"
+            "${TAG_ARGS[@]}" \
+            || { echo "FATAL: tailscale up failed or timed out (bad/expired TAILSCALE_AUTH_KEY?)"; tailscale status || true; exit 1; }
 
           # Give the control plane a moment to publish the exit node.
           sleep 5
