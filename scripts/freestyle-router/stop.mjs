@@ -54,6 +54,14 @@ if (target) {
     try {
       await ensureRunning(freestyle, vm);
 
+      // A start that failed before provision leaves a VM with no ${CONFIG.dataDir}
+      // and no better-sqlite3, so exportState() would crash. There is genuinely
+      // nothing to archive — skip the backup and let teardown delete the VM rather
+      // than aborting and leaking it.
+      const provisioned = (await tryRun(vm, `test -d ${CONFIG.dataDir} && echo yes || echo no`)).out.includes("yes");
+      if (!provisioned) {
+        log(`• Backup: skipped — ${CONFIG.dataDir} absent (VM was never provisioned), nothing to archive`);
+      } else {
       // Export before touching anything: this is the official, portable format.
       const exported = await exportState(vm, "/tmp/9router-export.json");
       counts = exported.counts;
@@ -90,6 +98,7 @@ if (target) {
       } else {
         await uploadBackup(seal(raw));
         backupOk = true;
+      }
       }
     } catch (e) {
       log(`• Backup: FAILED — ${e.message}`);

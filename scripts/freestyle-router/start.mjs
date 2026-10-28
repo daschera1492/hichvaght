@@ -280,7 +280,7 @@ fi
 sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
 for i in $(seq 1 30); do sudo systemctl is-active --quiet tailscaled && break; sleep 1; done
 sudo timeout 120 tailscale up \
-  --authkey="$(cat /tmp/ts-auth.key)" \
+  --authkey="$(sudo cat /tmp/ts-auth.key)" \
   --exit-node=${exitNode} \
   --exit-node-allow-lan-access=true \
   --accept-dns=false \
