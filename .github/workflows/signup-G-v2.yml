@@ -200,7 +200,7 @@ jobs:
       GSA_METHOD: ${{ inputs.email_method }}
       GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
 
-      GSA_USE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
+      GSA_USE_PROXY: ${{ (inputs.use_proxy == 'off' || inputs.use_proxy == 'false' || inputs.use_proxy == false) && '0' || '1' }}
       GSA_PROXY_TYPE: ${{ inputs.proxy_type }}
       # نوع صریح → سکرت همان نوع. نوع auto → اول PROXY، بعد پروکسی‌های دیگر
       # (v1 فقط PROXY را می‌دید و اگر کلید scrapeops/oxylabs بود، دست خالی می‌ماند).
@@ -209,7 +209,7 @@ jobs:
       GSA_PROXY_STICKY: '1' # یک IP ثابت برای کل یک ثبت‌نام
       GSA_PROXY_STRICT: '1' # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
       GSA_PROXY_SESSION_MIN: '60'
-      GSA_REQUIRE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
+      GSA_REQUIRE_PROXY: ${{ (inputs.use_proxy == 'off' || inputs.use_proxy == 'false' || inputs.use_proxy == false) && '0' || '1' }}
       GSA_GEO_STRICT: '1'
       GSA_GEO_CHECK_EACH: '1'
 
@@ -221,12 +221,12 @@ jobs:
       GSA_CLAIM_BY: gha-${{ github.run_id }}-${{ github.run_attempt }}
 
       # ── لایهٔ اثرانگشت ────────────────────────────────────────────────
-      GSA_FP: ${{ inputs.fp_random == 'off' && '0' || '1' }}
+      GSA_FP: ${{ (inputs.fp_random == 'off' || inputs.fp_random == 'false' || inputs.fp_random == false) && '0' || '1' }}
       GSA_FP_SEED: ${{ needs.pick.outputs.seed }}
       GSA_FP_REPORT: ${{ github.workspace }}/GmailDuck/fingerprint-report.jsonl
       # «گرم‌کردن»: قبل از اولین صفحهٔ ثبت‌نام، دو صفحهٔ گوگلِ همان کشور باز
       # می‌شود تا پروفایل تازه، کوکی و سابقهٔ یک مرورگر واقعی را داشته باشد.
-      GSA_WARMUP: ${{ inputs.warmup == 'off' && '0' || '1' }}
+      GSA_WARMUP: ${{ (inputs.warmup == 'off' || inputs.warmup == 'false' || inputs.warmup == false) && '0' || '1' }}
       GSA_WARMUP_MS: '30000'
 
     steps:
