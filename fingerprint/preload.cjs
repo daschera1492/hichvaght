@@ -420,14 +420,35 @@ async function clickByText(page, pattern) {
  */
 async function warmUp(page) {
   const t0 = Date.now();
+  const deadline = t0 + WARMUP_MS;
   const tld = googleTld();
-  const left = () => WARMUP_MS - (Date.now() - t0);
-  const go = (url) =>
-    page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.max(5000, Math.min(20000, left())) }).catch(() => null);
+  const left = () => deadline - Date.now();
+
+  // هر ناوبری سقف سخت دارد؛ و اگر اولی خطا داد، کل گرم‌کردن همان‌جا تمام
+  // می‌شود. (در اجرای US، پروکسی تونل www.gstatic.com را ۵۰۲ داد و این
+  // مرحله ۷۲ ثانیه از وقت را خورد — نباید تکرار شود.)
+  const go = async (url) => {
+    const budget = left();
+    if (budget < 2500) return { ok: false, reason: 'budget' };
+    try {
+      const res = await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: Math.min(15000, budget)
+      });
+      if (!res) return { ok: false, reason: 'no-response' };
+      return { ok: true, status: res.status() };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+  };
 
   try {
     // ۱) دامنهٔ کشوریِ همان IP (فرانسه → google.fr) — برای هم‌خوانی زبان/منطقه.
-    await go(`https://www.google.${tld}/`);
+    const first = await go(`https://www.google.${tld}/`);
+    if (!first.ok) {
+      console.log(`[warm] aborted after ${((Date.now() - t0) / 1000).toFixed(1)}s (${first.reason})`);
+      return;
+    }
     await sleep(900 + Math.random() * 1400);
     const accepted = await clickByText(page, CONSENT_BUTTON);
     await sleep(700 + Math.random() * 1200);
@@ -436,34 +457,38 @@ async function warmUp(page) {
     //    `accounts.cloud.google.com` فقط همین را می‌بیند. بدون این، «گرم‌کردن»
     //    عملاً هیچ کوکی‌ای به صفحهٔ ثبت‌نام نمی‌رساند.
     if (tld !== 'com' && left() > 6000) {
-      await go('https://www.google.com/');
-      await sleep(800 + Math.random() * 1000);
-      await clickByText(page, CONSENT_BUTTON);
-      await sleep(500 + Math.random() * 800);
+      const second = await go('https://www.google.com/');
+      if (second.ok) {
+        await sleep(800 + Math.random() * 1000);
+        await clickByText(page, CONSENT_BUTTON);
+        await sleep(500 + Math.random() * 800);
+      }
     }
 
     if (left() > 4000) {
       const q = WARM_QUERIES[Math.floor(Math.random() * WARM_QUERIES.length)];
-      await go(`https://www.google.${tld}/search?q=${encodeURIComponent(q)}`);
-      await sleep(900 + Math.random() * 1200);
-      // کمی حرکت ماوس و اسکرول، مثل کسی که نتایج را نگاه می‌کند.
-      try {
-        const size = await page.evaluate(() => ({
-          w: window.innerWidth || 1000,
-          h: window.innerHeight || 700
-        }));
-        for (let i = 0; i < 3; i++) {
-          await page.mouse.move(
-            size.w * (0.25 + Math.random() * 0.5),
-            size.h * (0.2 + Math.random() * 0.5),
-            { steps: 6 + Math.floor(Math.random() * 8) }
-          );
-          await sleep(150 + Math.random() * 250);
+      const third = await go(`https://www.google.${tld}/search?q=${encodeURIComponent(q)}`);
+      if (third.ok) {
+        await sleep(900 + Math.random() * 1200);
+        // کمی حرکت ماوس و اسکرول، مثل کسی که نتایج را نگاه می‌کند.
+        try {
+          const size = await page.evaluate(() => ({
+            w: window.innerWidth || 1000,
+            h: window.innerHeight || 700
+          }));
+          for (let i = 0; i < 3; i++) {
+            await page.mouse.move(
+              size.w * (0.25 + Math.random() * 0.5),
+              size.h * (0.2 + Math.random() * 0.5),
+              { steps: 6 + Math.floor(Math.random() * 8) }
+            );
+            await sleep(150 + Math.random() * 250);
+          }
+          await page.mouse.wheel({ deltaY: 180 + Math.floor(Math.random() * 260) });
+          await sleep(250 + Math.random() * 400);
+        } catch (e) {
+          /* حرکت ماوس اختیاری است */
         }
-        await page.mouse.wheel({ deltaY: 180 + Math.floor(Math.random() * 260) });
-        await sleep(250 + Math.random() * 400);
-      } catch (e) {
-        /* حرکت ماوس اختیاری است */
       }
     }
 
