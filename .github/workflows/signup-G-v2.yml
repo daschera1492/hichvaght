@@ -130,8 +130,16 @@ on:
         options:
           - on
           - off
+      warmup:
+        description: '۱۲) گرم‌کردن مرورگر — on = قبل از ثبت‌نام، یک بازدید کوتاه از گوگل (کوکی/سابقه)'
+        required: true
+        default: 'on'
+        type: choice
+        options:
+          - on
+          - off
       gmailduck_ref:
-        description: '۱۲) شاخه/تگ مخزن GmailDuck'
+        description: '۱۳) شاخه/تگ مخزن GmailDuck'
         required: false
         default: 'main'
 
@@ -216,6 +224,10 @@ jobs:
       GSA_FP: ${{ inputs.fp_random == 'off' && '0' || '1' }}
       GSA_FP_SEED: ${{ needs.pick.outputs.seed }}
       GSA_FP_REPORT: ${{ github.workspace }}/GmailDuck/fingerprint-report.jsonl
+      # «گرم‌کردن»: قبل از اولین صفحهٔ ثبت‌نام، دو صفحهٔ گوگلِ همان کشور باز
+      # می‌شود تا پروفایل تازه، کوکی و سابقهٔ یک مرورگر واقعی را داشته باشد.
+      GSA_WARMUP: ${{ inputs.warmup == 'off' && '0' || '1' }}
+      GSA_WARMUP_MS: '30000'
 
     steps:
       - name: دریافت کد اتوماسیون (مخزن خصوصی GmailDuck)

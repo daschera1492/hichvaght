@@ -66,6 +66,40 @@ function installFp(fp) {
     patchGl(window.WebGLRenderingContext);
     patchGl(window.WebGL2RenderingContext);
 
+    // ------------------------------------------------------------------ WebGPU
+    // WebGL می‌گوید «کارت NVIDIA» ولی WebGPU همان SwiftShader را نشان می‌دهد؟
+    // این تناقض از خودِ WebGL بدتر است. اطلاعات آداپتور هم‌خوان می‌شود.
+    try {
+      if (fp.webgpuVendor && window.GPU && GPU.prototype && GPU.prototype.requestAdapter) {
+        var origAdapter = GPU.prototype.requestAdapter;
+        GPU.prototype.requestAdapter = mask(function () {
+          var p = origAdapter.apply(this, arguments);
+          if (!p || typeof p.then !== 'function') return p;
+          return p.then(function (adapter) {
+            try {
+              var info = adapter && adapter.info;
+              if (info) {
+                var put = function (name, value) {
+                  try {
+                    Object.defineProperty(info, name, {
+                      configurable: true,
+                      enumerable: true,
+                      get: function () {
+                        return value;
+                      }
+                    });
+                  } catch (e) {}
+                };
+                put('vendor', fp.webgpuVendor);
+                put('architecture', fp.webgpuArch || '');
+              }
+            } catch (e) {}
+            return adapter;
+          });
+        }, 'requestAdapter');
+      }
+    } catch (e) {}
+
     // ------------------------------------------------------------------ canvas
     // نویز روی یک کپی اعمال می‌شود تا بوم اصلی (و رندر واقعی صفحه) دست‌نخورده
     // بماند؛ خروجی toDataURL/toBlob همان چیزی است که اثرانگشت‌گیر می‌خواند.

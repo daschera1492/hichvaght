@@ -26,6 +26,7 @@
 const Module = require('module');
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PATCHED = Symbol.for('gmailduck.fingerprint.patched');
@@ -42,6 +43,25 @@ const ENABLED = String(process.env.GSA_FP || '1').trim() !== '0';
 
 const REPORT = process.env.GSA_FP_REPORT || '';
 
+/**
+ * «گرم‌کردن» مرورگر — پیش‌فرض روشن (GSA_WARMUP=0 خاموشش می‌کند).
+ *
+ * چرا: روی رانر گیت‌هاب، پروفایل Chrome لحظه‌ای ساخته می‌شود و یک ثانیه بعد
+ * مرورگر مستقیم می‌رود روی `accounts.cloud.google.com/signup`. هیچ آدمی این
+ * کار را نمی‌کند؛ هیچ کوکی گوگل، هیچ بازدید قبلی، هیچ نشانه‌ای از یک مرورگرِ
+ * استفاده‌شده وجود ندارد. گوگل توکن reCAPTCHA را از همین جلسه می‌سازد و
+ * امتیازش پایین می‌آید → `?error=BAD_REQUEST` در POST نهایی.
+ *
+ * پس قبل از اولین صفحهٔ گوگل، دو صفحهٔ بی‌ضرر (همان دامنه‌ای که پروکسی در آن
+ * کشور است) باز می‌شود تا کوکی NID/CONSENT ساخته شود و جلسه «سابقه» پیدا کند.
+ */
+const WARMUP = String(process.env.GSA_WARMUP || '1').trim() !== '0';
+const WARMUP_MS = Math.max(0, Math.min(120000, Number(process.env.GSA_WARMUP_MS || 30000) || 0));
+
+const WARM = Symbol.for('gmailduck.fingerprint.warmed');
+const NET = Symbol.for('gmailduck.fingerprint.net');
+const NET_WARMED = Symbol.for('gmailduck.fingerprint.net-warmed');
+
 // --------------------------------------------------------------------- tables
 
 /**
@@ -49,33 +69,64 @@ const REPORT = process.env.GSA_FP_REPORT || '';
  * SwiftShader است — یکی از واضح‌ترین نشانه‌های «این ماشین واقعی نیست».
  * هر جفت vendor/renderer عیناً همان چیزی است که Chrome روی آن سخت‌افزار
  * برمی‌گرداند (شکل ANGLE/D3D11).
+ *
+ * `tier` و `arch` عمداً این‌جا هستند:
+ *   • هسته/حافظه با کلاس کارت هم‌خوان می‌شود (RTX 3060 با ۴ هسته/۴ گیگ
+ *     ترکیبی است که در دنیای واقعی وجود ندارد؛ UHD 630 با ۱۶ هسته هم همین‌طور).
+ *   • WebGPU هم باید همان کارت را گزارش کند، وگرنه یک WebGL با کارت NVIDIA
+ *     و یک `navigator.gpu` خالی روی هم یک تناقض قابل‌مشاهده‌اند.
  */
 const GPU_TABLE = [
-  [
-    'Google Inc. (Intel)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ],
-  [
-    'Google Inc. (Intel)',
-    'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ],
-  [
-    'Google Inc. (NVIDIA)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ],
-  [
-    'Google Inc. (NVIDIA)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ],
-  [
-    'Google Inc. (AMD)',
-    'ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ],
-  [
-    'Google Inc. (AMD)',
-    'ANGLE (AMD, AMD Radeon(TM) Graphics (0x00001638) Direct3D11 vs_5_0 ps_5_0, D3D11)'
-  ]
+  {
+    vendor: 'Google Inc. (Intel)',
+    renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'integrated',
+    arch: 'gen-9'
+  },
+  {
+    vendor: 'Google Inc. (Intel)',
+    renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'integrated',
+    arch: 'gen-12lp'
+  },
+  {
+    vendor: 'Google Inc. (NVIDIA)',
+    renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'discrete-mid',
+    arch: 'turing'
+  },
+  {
+    vendor: 'Google Inc. (NVIDIA)',
+    renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'discrete-high',
+    arch: 'ampere'
+  },
+  {
+    vendor: 'Google Inc. (AMD)',
+    renderer: 'ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'discrete-mid',
+    arch: 'gcn-4'
+  },
+  {
+    vendor: 'Google Inc. (AMD)',
+    renderer: 'ANGLE (AMD, AMD Radeon(TM) Graphics (0x00001638) Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    tier: 'integrated',
+    arch: 'rdna-2'
+  }
 ];
+
+/** هسته/حافظهٔ محتمل برای هر کلاس کارت — نه یک عدد دلبخواه. */
+const TIER_HW = {
+  integrated: { cores: [4, 8], memory: [4, 8] },
+  'discrete-mid': { cores: [6, 8, 12], memory: [8, 16] },
+  'discrete-high': { cores: [8, 12, 16], memory: [8, 16] }
+};
+
+const WEBGPU_VENDOR = {
+  'Google Inc. (Intel)': 'intel',
+  'Google Inc. (NVIDIA)': 'nvidia',
+  'Google Inc. (AMD)': 'amd'
+};
 
 /** قالب‌های GREASE که Chrome در sec-ch-ua می‌فرستد (بسته به نسخه عوض می‌شود). */
 const GREASE_BRANDS = [
@@ -87,10 +138,19 @@ const GREASE_BRANDS = [
   'Not A(Brand'
 ];
 
-/** Chrome روی Win10 = 10.0.0 و روی Win11 = 13/14/15.0.0 گزارش می‌کند. */
-const PLATFORM_VERSIONS = ['10.0.0', '13.0.0', '14.0.0', '15.0.0'];
-const CORES = [4, 6, 8, 12, 16];
-const MEMORY = [4, 8, 16];
+/**
+ * Chrome نسخهٔ ویندوز را این‌طور گزارش می‌کند (Client Hints):
+ *   Win10 (build < 22000) → 10.0.0   ·   Win11 21H2 → 13.0.0
+ *   Win11 22H2 → 14.0.0              ·   Win11 23H2/24H2 → 15.0.0
+ * پس مقدار درست از build خودِ ماشین خوانده می‌شود، نه با تاس انداختن.
+ */
+function platformVersionFor(release) {
+  const build = Number(String(release || '10.0.0').split('.')[2] || 0) || 0;
+  if (build >= 22631) return '15.0.0';
+  if (build >= 22621) return '14.0.0';
+  if (build >= 22000) return '13.0.0';
+  return '10.0.0';
+}
 
 // ----------------------------------------------------------------- derivation
 
@@ -112,15 +172,23 @@ function rotate3(list, n) {
 
 /**
  * اثرانگشت یک «دستگاه» = تابعی از (seed اجرا, نام پوشهٔ پروفایل).
- * `actualMajor` از نسخهٔ واقعیِ Chrome خوانده می‌شود تا UA ادعای نسخه‌ای
- * خیلی دور از واقعیت نکند (۳ تا ۵ نسخه عقب‌تر = کاملاً عادی).
+ *
+ * چیزهایی که عمداً از ماشین واقعی خوانده می‌شوند (نه تصادفی):
+ *   • نسخهٔ اصلی Chrome — ادعای ۵ نسخه عقب‌تر از موتور واقعی، خودش یک
+ *     تناقضِ قابل‌کشف است (موتور ۱۵۶ چیزی را دارد که ۱۵۱ ندارد).
+ *   • platformVersion — از build ویندوز.
+ *   • هسته/حافظه — هم‌خوان با کلاس کارت گرافیک.
+ * «متفاوت بودن» از canvas/audio/GPU/هسته/حافظه و seed اجرا می‌آید، نه از
+ * دروغ گفتن دربارهٔ چیزی که خود مرورگر لو می‌دهد.
  */
-function fingerprintFor(key, actualMajor) {
+function fingerprintFor(key, actualMajor, osInfo) {
   const d = derive(key);
   const gpu = d.at(0, GPU_TABLE);
+  const hw = TIER_HW[gpu.tier] || TIER_HW.integrated;
 
-  // A browser that is a few versions behind is the most common real case.
-  const major = Math.max(100, actualMajor - d.between(1, 0, 5));
+  // ۰ یا ۱ نسخه عقب‌تر: چیزی که در دنیای واقعی هر روز دیده می‌شود، و
+  // چیزی که موتورِ واقعی هم نمی‌تواند تکذیبش کند.
+  const major = Math.max(100, actualMajor - d.between(1, 0, 1));
   const full = `${major}.0.${d.between(2, 6200, 7800)}.${d.between(3, 0, 240)}`;
   const grease = d.at(4, GREASE_BRANDS);
   const greaseVersion = d.at(5, ['8', '24', '99']);
@@ -143,10 +211,14 @@ function fingerprintFor(key, actualMajor) {
     d.between(7, 0, 2)
   );
 
-  const hardwareConcurrency = d.at(8, CORES);
-  const deviceMemory = d.at(9, MEMORY);
+  const hardwareConcurrency = d.at(8, hw.cores);
+  const deviceMemory = d.at(9, hw.memory);
   const canvasSeed = d.u(10);
   const audioSeed = d.u(11);
+  const platformVersion =
+    osInfo && osInfo.platformVersion
+      ? osInfo.platformVersion
+      : platformVersionFor(osInfo && osInfo.release);
 
   return {
     key,
@@ -159,7 +231,7 @@ function fingerprintFor(key, actualMajor) {
       fullVersionList,
       fullVersion: full,
       platform: 'Windows',
-      platformVersion: d.at(12, PLATFORM_VERSIONS),
+      platformVersion,
       architecture: 'x86',
       model: '',
       mobile: false,
@@ -168,8 +240,10 @@ function fingerprintFor(key, actualMajor) {
     },
     hardwareConcurrency,
     deviceMemory,
-    webglVendor: gpu[0],
-    webglRenderer: gpu[1],
+    webglVendor: gpu.vendor,
+    webglRenderer: gpu.renderer,
+    webgpuVendor: WEBGPU_VENDOR[gpu.vendor] || 'intel',
+    webgpuArch: gpu.arch,
     canvasSeed,
     audioSeed
   };
@@ -182,6 +256,8 @@ function pageData(fp) {
     deviceMemory: fp.deviceMemory,
     webglVendor: fp.webglVendor,
     webglRenderer: fp.webglRenderer,
+    webgpuVendor: fp.webgpuVendor,
+    webgpuArch: fp.webgpuArch,
     canvasSeed: fp.canvasSeed,
     audioSeed: fp.audioSeed
   };
@@ -241,7 +317,7 @@ async function injectPage(page, fp, depth) {
     if (!depth) console.log(`[fp] UA override failed (${e.message}) — continuing`);
   }
 
-  // ۲) اث اثرانگشت داخل هر سند، قبل از هر اسکریپت سایت.
+  // ۲) اثرانگشت داخل هر سند، قبل از هر اسکریپت سایت.
   try {
     // eslint-disable-next-line global-require
     const installFp = require('./page-fp.cjs');
@@ -249,7 +325,233 @@ async function injectPage(page, fp, depth) {
   } catch (e) {
     if (!depth) console.log(`[fp] in-page injection failed (${e.message}) — continuing`);
   }
+
+  // ۳) هوک‌های رفتاری/تشخیصی (گرم‌کردن + رصد درخواست نهایی گوگل).
+  installPageHooks(page);
   return page;
+}
+
+// ------------------------------------------------------------------- warm-up
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** دامنهٔ گوگلِ همان کشوری که پروکسی در آن است. */
+const GOOGLE_TLD = {
+  fr: 'fr',
+  de: 'de',
+  gb: 'co.uk',
+  uk: 'co.uk',
+  us: 'com',
+  ca: 'ca',
+  nl: 'nl',
+  es: 'es',
+  it: 'it',
+  se: 'se',
+  pl: 'pl',
+  tr: 'com.tr',
+  ae: 'ae',
+  au: 'com.au',
+  jp: 'co.jp',
+  kr: 'co.kr',
+  in: 'co.in',
+  br: 'com.br',
+  mx: 'com.mx'
+};
+
+function googleTld() {
+  const c = String(process.env.GSA_PROXY_COUNTRY || '').trim().toLowerCase();
+  return GOOGLE_TLD[c] || 'com';
+}
+
+/** دکمهٔ «همه را قبول کن» صفحهٔ رضایت گوگل، به زبان‌های ممکن. */
+const CONSENT_BUTTON =
+  'tout accepter|j\u2019accepte|accept all|alle akzeptieren|accetta tutto|aceptar todo|aceitar tudo|alles accepteren|godta alle|acceptera alla';
+
+/** چند جستجوی بی‌آزار و متداول. */
+const WARM_QUERIES = [
+  'meteo',
+  'actualites',
+  'recette crepe',
+  'horaires train',
+  'traduction anglais',
+  'boulangerie pres de moi'
+];
+
+/**
+ * یک کلیک با ماوس واقعی روی عنصری که متنش با الگو می‌خواند.
+ * (کلیک مصنوعی روی صفحهٔ رضایت گوگل هم می‌تواند مشکل بسازد؛ ماوس ارزان است.)
+ */
+async function clickByText(page, pattern) {
+  let box = null;
+  try {
+    box = await page.evaluate((src) => {
+      const rx = new RegExp('^(?:' + src + ')$', 'i');
+      const nodes = Array.prototype.slice.call(
+        document.querySelectorAll('button, div[role="button"], a[role="button"], span[role="button"]')
+      );
+      for (let i = 0; i < nodes.length; i++) {
+        const t = (nodes[i].innerText || nodes[i].textContent || '').trim();
+        if (!rx.test(t)) continue;
+        const r = nodes[i].getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }
+      return null;
+    }, pattern);
+  } catch (e) {
+    return false;
+  }
+  if (!box) return false;
+  try {
+    await page.mouse.click(box.x, box.y);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * پیش‌درآمد انسانی: یک بازدید کوتاه از گوگلِ همان کشور، قبول صفحهٔ رضایت،
+ * یک جستجوی معمولی، کمی حرکت ماوس و اسکرول. بعد از آن، همان صفحه به
+ * `accounts.cloud.google.com/signup/...` می‌رود.
+ *
+ * کل بودجه با GSA_WARMUP_MS محدود است (پیش‌فرض ۲۰ ثانیه) و مهلتِ خودِ
+ * GmailDuck روی این goto ۶۰ ثانیه است، پس هرگز باعث تایم‌اوت نمی‌شود.
+ */
+async function warmUp(page) {
+  const t0 = Date.now();
+  const tld = googleTld();
+  const left = () => WARMUP_MS - (Date.now() - t0);
+  const go = (url) =>
+    page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.max(5000, Math.min(20000, left())) }).catch(() => null);
+
+  try {
+    // ۱) دامنهٔ کشوریِ همان IP (فرانسه → google.fr) — برای هم‌خوانی زبان/منطقه.
+    await go(`https://www.google.${tld}/`);
+    await sleep(900 + Math.random() * 1400);
+    const accepted = await clickByText(page, CONSENT_BUTTON);
+    await sleep(700 + Math.random() * 1200);
+
+    // ۲) خودِ google.com — چون کوکی NID را روی `.google.com` می‌گذارد و
+    //    `accounts.cloud.google.com` فقط همین را می‌بیند. بدون این، «گرم‌کردن»
+    //    عملاً هیچ کوکی‌ای به صفحهٔ ثبت‌نام نمی‌رساند.
+    if (tld !== 'com' && left() > 6000) {
+      await go('https://www.google.com/');
+      await sleep(800 + Math.random() * 1000);
+      await clickByText(page, CONSENT_BUTTON);
+      await sleep(500 + Math.random() * 800);
+    }
+
+    if (left() > 4000) {
+      const q = WARM_QUERIES[Math.floor(Math.random() * WARM_QUERIES.length)];
+      await go(`https://www.google.${tld}/search?q=${encodeURIComponent(q)}`);
+      await sleep(900 + Math.random() * 1200);
+      // کمی حرکت ماوس و اسکرول، مثل کسی که نتایج را نگاه می‌کند.
+      try {
+        const size = await page.evaluate(() => ({
+          w: window.innerWidth || 1000,
+          h: window.innerHeight || 700
+        }));
+        for (let i = 0; i < 3; i++) {
+          await page.mouse.move(
+            size.w * (0.25 + Math.random() * 0.5),
+            size.h * (0.2 + Math.random() * 0.5),
+            { steps: 6 + Math.floor(Math.random() * 8) }
+          );
+          await sleep(150 + Math.random() * 250);
+        }
+        await page.mouse.wheel({ deltaY: 180 + Math.floor(Math.random() * 260) });
+        await sleep(250 + Math.random() * 400);
+      } catch (e) {
+        /* حرکت ماوس اختیاری است */
+      }
+    }
+
+    console.log(
+      `[warm] ${page.url().replace(/^https?:\/\//, '').split('/')[0]} — ` +
+        `${((Date.now() - t0) / 1000).toFixed(1)}s · consent=${accepted ? 'clicked' : 'n/a'}`
+    );
+  } catch (e) {
+    console.log(`[warm] skipped after ${((Date.now() - t0) / 1000).toFixed(1)}s (${e.message})`);
+  }
+}
+
+/**
+ * رصد درخواست نهاییِ گوگل. اگر `bgResponse` (توکن reCAPTCHA) خالی/کوتاه بود،
+ * مشکل «امتیاز ریسک» نیست — توکن اصلاً ساخته نشده، و آن یک باگ جداگانه است.
+ * این خط‌ها فقط لاگ می‌کنند و هیچ‌چیز را عوض نمی‌کنند.
+ */
+function installNetworkWatch(page) {
+  if (!page || page[NET]) return;
+  try {
+    Object.defineProperty(page, NET, { value: true, configurable: true });
+  } catch (e) {}
+  try {
+    page.on('request', (req) => {
+      try {
+        const url = req.url();
+        if (!/accounts\.cloud\.google\.com\/signup\/create-account/.test(url)) return;
+        const body = req.postData() || '';
+        const field = (name) => {
+          const m = new RegExp('(?:^|&)' + name + '=([^&]*)').exec(body);
+          return m ? decodeURIComponent(m[1]) : '';
+        };
+        const tos = field('tosIdList');
+        const bg = field('bgResponse');
+        const at = field('at');
+        console.log(
+          `[net] POST create-account · region=${field('region') || '?'} · tos=${tos ? 'yes' : 'MISSING'} · ` +
+            `at=${at.length}B · bgResponse=${bg.length}B · body=${body.length}B`
+        );
+        if (!bg) console.log('[net] ⚠️ bgResponse خالی است — توکن reCAPTCHA ساخته نشده.');
+      } catch (e) {}
+    });
+  } catch (e) {}
+  try {
+    page.on('response', (res) => {
+      try {
+        const url = res.url();
+        if (!/accounts\.cloud\.google\.com\/signup\//.test(url)) return;
+        const headers = res.headers() || {};
+        const loc = headers.location ? ` → ${headers.location}` : '';
+        console.log(`[net] ${res.status()} ${res.request().method()} ${url.replace(/^https?:\/\//, '')}${loc}`);
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+/**
+ * هوک‌های هر صفحه: رصد شبکه، و یک پیش‌درآمد انسانی قبل از اولین صفحهٔ
+ * ثبت‌نام گوگل (فقط یک بار برای هر صفحه).
+ */
+function installPageHooks(page) {
+  installNetworkWatch(page);
+  if (!WARMUP || !page || page[WARM]) return;
+  try {
+    Object.defineProperty(page, WARM, { value: true, configurable: true });
+  } catch (e) {
+    return;
+  }
+  let orig;
+  try {
+    orig = page.goto.bind(page);
+  } catch (e) {
+    return;
+  }
+  page.goto = async function (url, options) {
+    const target = String(url || '');
+    if (!page[NET_WARMED] && /^https:\/\/accounts\.cloud\.google\.com\/signup\//.test(target)) {
+      try {
+        Object.defineProperty(page, NET_WARMED, { value: true, configurable: true });
+      } catch (e) {}
+      try {
+        await warmUp(page);
+      } catch (e) {
+        console.log(`[warm] failed (${e.message}) — continuing`);
+      }
+    }
+    return orig(url, options);
+  };
 }
 
 function instrumentBrowser(browser, fp) {
@@ -340,7 +642,11 @@ function patchPuppeteer(ns) {
         const raw = String((await browser.version()) || '');
         const m = /Chrome\/(\d+)\./.exec(raw);
         const actualMajor = m ? Number(m[1]) : 140;
-        const fp = fingerprintFor(key, actualMajor);
+        // نسخهٔ ویندوز هم از خودِ ماشین خوانده می‌شود، نه با تاس انداختن.
+        const fp = fingerprintFor(key, actualMajor, {
+          release: os.release(),
+          platformVersion: platformVersionFor(os.release())
+        });
         try {
           Object.defineProperty(browser, FP_KEY, { value: fp, configurable: true });
         } catch (e) {}
