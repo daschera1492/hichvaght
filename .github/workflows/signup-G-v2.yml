@@ -1,0 +1,383 @@
+name: ساخت حساب — Signup G v2 (اثرانگشت تصادفی)
+
+# نسخهٔ دوم — بازنویسیِ کامل signup-G.yml با این تفاوت‌های بنیادی:
+#
+# ① هر اجرا روی یک ایمیجِ تصادفیِ ویندوز بالا می‌آید (2025 یا 2022) تا فونت‌ها،
+#   نسخهٔ Chrome و جزئیات سیستم‌عامل از run قبلی متفاوت باشد.
+# ② یک لایهٔ اثرانگشت (fingerprint/preload.cjs) بدون دست‌زدن به کد GmailDuck
+#   روی puppeteer سوار می‌شود: UA + Client Hints هم‌خوان، کارت گرافیک واقعی‌نما،
+#   تعداد هسته/حافظه، نویز canvas و صدا — همه از یک seed مشتق می‌شوند، پس
+#   هر worker یک «دستگاه» ثابت است و هر run یک دستگاه کاملاً نو.
+# ③ خودِ اثرانگشت قبل از claim شدن حتی یک ایمیل تست می‌شود (verify.cjs) و اگر
+#   دو اسلات یکسان درآمدند یا UA با sec-ch-ua تناقض داشت، اجرا همان‌جا می‌میرد.
+# ④ اشکال‌های v1: «--require-proxy»ِ بی‌قید (با use_proxy=off کل job را می‌کشت)،
+#   نبودِ concurrency group، و نبودِ fallback برای HUB_API_KEY.
+#
+# ورودی‌های Start workflow:
+#   count / email_method / auto / proxy / proxy_country / proxy_type / use_proxy
+#   concurrency    ۱..۶ ثبت‌نام هم‌زمان؛ هر کدام اثرانگشت و IP خودش را دارد
+#   fresh_profile  0 = یک دستگاه ثابت برای هر worker در طول دسته (پیش‌فرض)
+#                  1 = هر ثبت‌نام یک پروفایل و یک دستگاه کاملاً نو
+#   runner_image   auto (تصادفی بین 2025/2022) یا یک ایمیج مشخص
+#   fp_random      on/off — خاموش کردن لایهٔ اثرانگشت (برای عیب‌یابی)
+#   gmailduck_ref  شاخه/تگ مخزن GmailDuck
+#
+# Secret ها: HUB_URL, HUB_API_KEY, PROXY / PROXY_SCRAPEOPS / PROXY_OXYLABS,
+#            GMAILDUCK_PAT
+#
+# ⚠️ نکتهٔ صادقانه: رانر گیت‌هاب هر بار یک ماشین نو است، پس «پروفایل پایدار بین
+# دسته‌ها» — که طراحیِ GmailDuck روی آن حساب کرده — این‌جا ممکن نیست. این نسخه
+# آن را با «اثرانگشت تصادفیِ منسجم» جبران می‌کند، نه با تکرارِ همان دستگاه.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: '۱) تعداد حساب برای ساخت'
+        required: true
+        default: '1'
+      email_method:
+        description: '۲) منبع ایمیل — rotate یعنی تلفیقیِ هر سه (duck ← generated ← erine)'
+        required: true
+        default: 'duck'
+        type: choice
+        options:
+          - duck
+          - generated
+          - erine
+          - rotate
+      auto:
+        description: '۳) حالت اجرا — full کاملاً اتوماتیک است'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - manual
+      proxy:
+        description: '۴) رشتهٔ پروکسی (host:port:user:pass) — برای scrapeops خالی بگذار'
+        required: false
+        default: ''
+      proxy_country:
+        description: '۵) کشور خروج پروکسی — زبان و منطقهٔ زمانی هم روی همین ست می‌شود'
+        required: true
+        default: 'us'
+        type: choice
+        options:
+          - us
+          - ca
+          - gb
+          - de
+          - fr
+          - nl
+          - es
+          - it
+          - se
+          - pl
+          - tr
+          - ae
+          - au
+          - jp
+          - kr
+          - in
+          - br
+          - mx
+      proxy_type:
+        description: '۶) نوع پروکسی — auto یعنی از روی آدرس تشخیص بده'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - rainproxy
+          - scrapeops
+          - oxylabs
+      use_proxy:
+        description: '۷) کلید پروکسی — on = فقط موقع ثبت‌نام روشن می‌شود، off = بدون پروکسی'
+        required: true
+        default: 'on'
+        type: choice
+        options:
+          - on
+          - off
+      concurrency:
+        description: '۸) هم‌زمانی (۱ تا ۶) — هر کدام IP و اثرانگشت جدا دارد'
+        required: true
+        default: '1'
+      fresh_profile:
+        description: '۹) 0 = یک دستگاه ثابت برای هر worker · 1 = هر ثبت‌نام یک دستگاه نو'
+        required: true
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+      runner_image:
+        description: '۱۰) ایمیج رانر — auto = تصادفی بین windows-2025 و windows-2022'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - windows-2025
+          - windows-2022
+          - windows-latest
+      fp_random:
+        description: '۱۱) لایهٔ اثرانگشت — on = تصادفی، off = مرورگر دست‌نخورده'
+        required: true
+        default: 'on'
+        type: choice
+        options:
+          - on
+          - off
+      gmailduck_ref:
+        description: '۱۲) شاخه/تگ مخزن GmailDuck'
+        required: false
+        default: 'main'
+
+# دو اجرای هم‌زمان روی یک شاخه، هنگام پوش کردن results/ به هم می‌خورند.
+concurrency:
+  group: signup-g-v2
+  cancel-in-progress: false
+
+permissions:
+  contents: write # ثبت نتیجهٔ هر اجرا در results/
+
+jobs:
+  # ───────────────────────────────────────────────────────────── انتخاب رانر
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.pick.outputs.image }}
+      seed: ${{ steps.pick.outputs.seed }}
+      delay: ${{ steps.pick.outputs.delay }}
+    steps:
+      - id: pick
+        name: انتخاب تصادفی ایمیج + ساخت seed
+        shell: bash
+        env:
+          REQ: ${{ inputs.runner_image }}
+        run: |
+          set -euo pipefail
+          req="${REQ:-auto}"
+          if [ "$req" = "auto" ]; then
+            arr=(windows-2025 windows-2022)
+            req="${arr[$((RANDOM % 2))]}"
+          fi
+          seed="${{ github.run_id }}-${{ github.run_attempt }}-${RANDOM}${RANDOM}"
+          # تأخیر بین ثبت‌نام‌ها هم هر اجرا کمی فرق می‌کند (۲۵..۴۰ ثانیه).
+          delay=$((25 + RANDOM % 16))
+          echo "image=$req"  >> "$GITHUB_OUTPUT"
+          echo "seed=$seed"   >> "$GITHUB_OUTPUT"
+          echo "delay=$delay" >> "$GITHUB_OUTPUT"
+          echo "رانر: $req · seed: $seed · delay: ${delay}s"
+
+  # ──────────────────────────────────────────────────────────────── اجرای دسته
+  batch:
+    needs: pick
+    runs-on: ${{ needs.pick.outputs.image }}
+    timeout-minutes: 350 # زیر سقف ۶ ساعتهٔ job ها؛ خودِ اسکریپت سقف ۳۰۰ دقیقه دارد.
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: GmailDuck
+
+    env:
+      HUB_URL: ${{ vars.HUB_URL || secrets.HUB_URL }}
+      # v1 فقط HUB_KEY را می‌خواند؛ اگر کلید به اسم HUB_API_KEY ساخته شده باشد
+      # (که duck-collector همین را می‌خواهد) دست خالی می‌ماند. این‌جا هر چهار.
+      HUB_KEY: ${{ vars.HUB_KEY || vars.HUB_API_KEY || secrets.HUB_API_KEY || secrets.HUB_KEY }}
+
+      GSA_COUNT: ${{ inputs.count }}
+      GSA_METHOD: ${{ inputs.email_method }}
+      GSA_AUTO_FINISH: ${{ inputs.auto == 'full' && '1' || '0' }}
+
+      GSA_USE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
+      GSA_PROXY_TYPE: ${{ inputs.proxy_type }}
+      # نوع صریح → سکرت همان نوع. نوع auto → اول PROXY، بعد پروکسی‌های دیگر
+      # (v1 فقط PROXY را می‌دید و اگر کلید scrapeops/oxylabs بود، دست خالی می‌ماند).
+      GSA_PROXY: ${{ inputs.proxy != '' && inputs.proxy || inputs.proxy_type == 'scrapeops' && secrets.PROXY_SCRAPEOPS || inputs.proxy_type == 'oxylabs' && secrets.PROXY_OXYLABS || inputs.proxy_type == 'rainproxy' && secrets.PROXY || secrets.PROXY || secrets.PROXY_SCRAPEOPS || secrets.PROXY_OXYLABS }}
+      GSA_PROXY_COUNTRY: ${{ inputs.proxy_country }}
+      GSA_PROXY_STICKY: '1' # یک IP ثابت برای کل یک ثبت‌نام
+      GSA_PROXY_STRICT: '1' # بدون تعویض بی‌خبر IP در وسط ثبت‌نام
+      GSA_PROXY_SESSION_MIN: '60'
+      GSA_REQUIRE_PROXY: ${{ inputs.use_proxy == 'off' && '0' || '1' }}
+      GSA_GEO_STRICT: '1'
+      GSA_GEO_CHECK_EACH: '1'
+
+      GSA_CONCURRENCY: ${{ inputs.concurrency }}
+      GSA_DELAY_SEC: ${{ needs.pick.outputs.delay }}
+      GSA_FRESH_PROFILE: ${{ inputs.fresh_profile }}
+      GSA_OTP_TIMEOUT_SEC: '240'
+      GSA_TIMEOUT_MIN: '300'
+      GSA_CLAIM_BY: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── لایهٔ اثرانگشت ────────────────────────────────────────────────
+      GSA_FP: ${{ inputs.fp_random == 'off' && '0' || '1' }}
+      GSA_FP_SEED: ${{ needs.pick.outputs.seed }}
+      GSA_FP_REPORT: ${{ github.workspace }}/GmailDuck/fingerprint-report.jsonl
+
+    steps:
+      - name: دریافت کد اتوماسیون (مخزن خصوصی GmailDuck)
+        uses: actions/checkout@v5
+        with:
+          repository: daschera1492/GmailDuck
+          ref: ${{ inputs.gmailduck_ref }}
+          path: GmailDuck
+          token: ${{ secrets.GMAILDUCK_PAT }}
+
+      - name: دریافت مخزن این ورک‌فلو (لایهٔ اثرانگشت + ثبت نتیجه)
+        uses: actions/checkout@v5
+        with:
+          path: hichvaght
+
+      - name: Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: GmailDuck/package-lock.json
+
+      - name: ⓪ بررسی تنظیمات (fail fast)
+        run: |
+          $fail = $false
+          if ([string]::IsNullOrWhiteSpace($env:HUB_URL)) { Write-Host "::error::HUB_URL تنظیم نشده (Variable یا Secret)."; $fail = $true }
+          if ([string]::IsNullOrWhiteSpace($env:HUB_KEY)) { Write-Host "::error::HUB_KEY / HUB_API_KEY تنظیم نشده."; $fail = $true }
+          if ($env:GSA_USE_PROXY -eq '1' -and [string]::IsNullOrWhiteSpace($env:GSA_PROXY)) {
+            Write-Host "::error::پروکسی روشن است ولی سکرت خالی است (PROXY / PROXY_SCRAPEOPS / PROXY_OXYLABS)."
+            $fail = $true
+          }
+          if ($env:GSA_USE_PROXY -eq '0') {
+            Write-Host "ℹ️ GSA_USE_PROXY=0 — کل ترافیک با IP همین رانر می‌رود."
+          }
+          if ($fail) { exit 2 }
+
+      - name: ① پیدا کردن Chrome (و نصب در صورت نبود)
+        run: |
+          $paths = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+            "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+          )
+          $chrome = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $chrome) {
+            Write-Host "Chrome روی این ایمیج نیست — نصب با choco…"
+            choco install googlechrome -y --no-progress
+            $chrome = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $chrome) { Write-Host "::error::Chrome پیدا نشد."; exit 2 }
+          "CHROME_PATH=$chrome" >> $env:GITHUB_ENV
+          Write-Host "Chrome: $chrome"
+
+      - name: ②③ هم‌ترازی زبان و منطقهٔ زمانی ویندوز با کشور پروکسی
+        if: env.GSA_USE_PROXY == '1'
+        run: pwsh -NoProfile -File scripts/align-os-geo.ps1 -Country "$env:GSA_PROXY_COUNTRY"
+
+      - name: ④ تأیید کشور واقعی IP پروکسی
+        if: env.GSA_USE_PROXY == '1'
+        run: node scripts/verify-geo.js --country "$env:GSA_PROXY_COUNTRY" --require-proxy
+
+      - name: نصب وابستگی‌ها
+        run: |
+          npm ci --omit=dev --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::npm ci شکست خورد (احتمالاً package-lock قدیمی است) — با npm install ادامه می‌دهیم."
+            npm install --omit=dev --no-audit --no-fund
+          }
+
+      # 🧬 اثباتِ اثرانگشت — قبل از claim شدن حتی یک ایمیل.
+      # دو «کاربر» با دو پروفایل بالا می‌آیند؛ اگر UA/canvas یکسان بود یا
+      # sec-ch-ua با UA نمی‌خواند، همین‌جا با کد ۱ می‌میرد.
+      - name: ⑤ تست لایهٔ اثرانگشت (۲ اسلات)
+        env:
+          NODE_OPTIONS: --require ${{ github.workspace }}/hichvaght/fingerprint/preload.cjs
+        run: node "$env:GITHUB_WORKSPACE/hichvaght/fingerprint/verify.cjs" --slots 2
+
+      # خطای v1: این قدم همیشه «--require-proxy» می‌فرستاد و با use_proxy=off
+      # کل job را قبل از اولین claim می‌کشت (پرچم، env را override می‌کند).
+      - name: بررسی پیش از اجرا (هاب + Chrome + زبان/تایم‌زون/کشور IP)
+        env:
+          NODE_OPTIONS: --require ${{ github.workspace }}/hichvaght/fingerprint/preload.cjs
+        run: |
+          $extra = @()
+          if ($env:GSA_USE_PROXY -eq '1') { $extra += '--require-proxy' }
+          node scripts/run-batch.js --preflight --count "$env:GSA_COUNT" --method "$env:GSA_METHOD" --concurrency "$env:GSA_CONCURRENCY" @extra
+
+      - name: ساخت حساب‌ها
+        env:
+          NODE_OPTIONS: --require ${{ github.workspace }}/hichvaght/fingerprint/preload.cjs
+        run: node scripts/run-batch.js
+
+      - name: ⑥ خلاصهٔ اثرانگشت در صفحهٔ اجرا
+        if: always()
+        run: |
+          $file = Join-Path $env:GITHUB_WORKSPACE 'GmailDuck/fingerprint-report.jsonl'
+          $lines = @(
+            '',
+            '### 🧬 اثرانگشت این اجرا',
+            '',
+            "| اجرا | رانر | seed |" ,
+            "| --- | --- | --- |",
+            "| run ${{ github.run_id }} (attempt ${{ github.run_attempt }}) | ${{ needs.pick.outputs.image }} | ``${{ needs.pick.outputs.seed }}`` |",
+            ''
+          )
+          if (Test-Path $file) {
+            $rows = Get-Content $file |
+              ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+              Where-Object { $_ } |
+              Group-Object slot |
+              ForEach-Object { $_.Group | Select-Object -Last 1 }
+            $lines += '| اسلات | Chrome (نصب‌شده ← ادعاشده) | هسته | حافظه | GPU |'
+            $lines += '| --- | --- | --- | --- | --- |'
+            foreach ($r in ($rows | Sort-Object slot)) {
+              $lines += "| ``$($r.slot)`` | $($r.actualChrome) ← $($r.claimedChrome) | $($r.hardwareConcurrency) | $($r.deviceMemory) GB | $($r.webgl) |"
+            }
+          } else {
+            $lines += '_گزارشی ساخته نشد (لایهٔ اثرانگشت خاموش بود یا هیچ مرورگری بالا نیامد)._'
+          }
+          $lines | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: آپلود نتیجه‌ها
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signup-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            GmailDuck/result.txt
+            GmailDuck/used-addresses.txt
+            GmailDuck/preflight.png
+            GmailDuck/fingerprint-report.jsonl
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # حافظهٔ قابل مرور: هر اجرا یک فایل در results/ تا بدون باز کردن لاگ هم
+      # معلوم باشد کدام آدرس‌ها ساخته شدند. شکست این قدم شغل را خراب نمی‌کند.
+      - name: ثبت نتیجه در مخزن
+        if: always()
+        working-directory: hichvaght
+        continue-on-error: true
+        run: |
+          $stamp = (Get-Date).ToString('yyyy-MM-dd-HHmm')
+          $src = Join-Path $env:GITHUB_WORKSPACE 'GmailDuck\result.txt'
+          New-Item -ItemType Directory -Force -Path results | Out-Null
+          $out = "results/$stamp-run${{ github.run_id }}.txt"
+          if (Test-Path $src) {
+            Copy-Item $src $out -Force
+          } else {
+            Set-Content -Path $out -Value "no result.txt in this run"
+          }
+          git config user.name  "signup-batch"
+          git config user.email "actions@users.noreply.github.com"
+          git add $out
+          if (git diff --cached --quiet) {
+            Write-Host "نتیجه‌ای برای ثبت نبود."
+            exit 0
+          }
+          git commit -m "batch v2: ${{ github.run_id }} (${env:GSA_COUNT} requested, method=${env:GSA_METHOD})"
+          for ($i = 1; $i -le 3; $i++) {
+            git pull --rebase --autostash origin "${env:GITHUB_REF_NAME}" 2>$null
+            git push
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "::warning::push تلاش $i شکست خورد — تلاش دوباره…"
+            Start-Sleep -Seconds (5 * $i)
+          }
