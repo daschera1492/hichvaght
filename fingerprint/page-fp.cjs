@@ -36,6 +36,28 @@ function installFp(fp) {
       define(Navigator.prototype, 'deviceMemory', fp.deviceMemory);
     }
 
+    // ------------------------------------------------------------------- screen
+    // رانر گیت‌هاب یک نمایشگر ۱۰۲۴×۷۶۸ دارد ولی پنجرهٔ GmailDuck ۱۱۲۰×۸۶۰ است —
+    // یعنی ویوپورت از خودِ صفحهٔ نمایش بزرگ‌تر می‌شود؛ چیزی که در دنیای واقعی
+    // ممکن نیست و هر اثرانگشت‌گیرِ ساده‌ای (از جمله browserinfo گوگل) می‌بیند.
+    // این‌جا اندازهٔ نمایشگر روی یک رزولوشن معمولی و بزرگ‌تر از پنجره ست می‌شود،
+    // تا screen ≥ outer ≥ inner شود.
+    if (fp.screen && fp.screen.length === 2) {
+      var sw = fp.screen[0];
+      var sh = fp.screen[1];
+      var S = window.Screen && Screen.prototype;
+      if (S) {
+        define(S, 'width', sw);
+        define(S, 'height', sh);
+        define(S, 'availWidth', sw);
+        define(S, 'availHeight', Math.max(600, sh - 40)); // نوار وظیفهٔ ویندوز
+        define(S, 'availLeft', 0);
+        define(S, 'availTop', 0);
+        define(S, 'colorDepth', 24);
+        define(S, 'pixelDepth', 24);
+      }
+    }
+
     // ------------------------------------- توابع پچ‌شده نباید «سورس» لو بدهند
     var nativeToString = Function.prototype.toString;
     var masked = new WeakMap();

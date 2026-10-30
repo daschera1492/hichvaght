@@ -171,6 +171,20 @@ function rotate3(list, n) {
 }
 
 /**
+ * رزولوشن‌های رایجِ دسکتاپ که از پنجرهٔ ۱۱۲۰×۸۶۰ گیت‌هاب بزرگ‌ترند.
+ * (اگر screen از پنجره کوچک‌تر باشد، innerWidth > screen.width می‌شود و
+ * همان تناقضی است که می‌خواهیم حذف کنیم.)
+ */
+const SCREENS = [
+  [1920, 1080],
+  [1600, 900],
+  [1536, 864],
+  [1440, 900],
+  [2560, 1440],
+  [1680, 1050]
+];
+
+/**
  * اثرانگشت یک «دستگاه» = تابعی از (seed اجرا, نام پوشهٔ پروفایل).
  *
  * چیزهایی که عمداً از ماشین واقعی خوانده می‌شوند (نه تصادفی):
@@ -219,6 +233,7 @@ function fingerprintFor(key, actualMajor, osInfo) {
     osInfo && osInfo.platformVersion
       ? osInfo.platformVersion
       : platformVersionFor(osInfo && osInfo.release);
+  const screen = d.at(13, SCREENS);
 
   return {
     key,
@@ -244,6 +259,7 @@ function fingerprintFor(key, actualMajor, osInfo) {
     webglRenderer: gpu.renderer,
     webgpuVendor: WEBGPU_VENDOR[gpu.vendor] || 'intel',
     webgpuArch: gpu.arch,
+    screen,
     canvasSeed,
     audioSeed
   };
@@ -258,6 +274,7 @@ function pageData(fp) {
     webglRenderer: fp.webglRenderer,
     webgpuVendor: fp.webgpuVendor,
     webgpuArch: fp.webgpuArch,
+    screen: fp.screen,
     canvasSeed: fp.canvasSeed,
     audioSeed: fp.audioSeed
   };
@@ -278,13 +295,15 @@ function report(fp) {
     hardwareConcurrency: fp.hardwareConcurrency,
     deviceMemory: fp.deviceMemory,
     webgl: fp.webglRenderer,
+    screen: `${fp.screen[0]}x${fp.screen[1]}`,
     canvasSeed: fp.canvasSeed,
     audioSeed: fp.audioSeed
   };
   try {
     console.log(
       `[fp] slot=${fp.key} chrome=${fp.chrome.full} (installed ${fp.chrome.actual}) ` +
-        `hw=${fp.hardwareConcurrency} mem=${fp.deviceMemory} gpu=${fp.webglVendor}`
+        `hw=${fp.hardwareConcurrency} mem=${fp.deviceMemory} gpu=${fp.webglVendor} ` +
+        `screen=${fp.screen[0]}x${fp.screen[1]}`
     );
   } catch (e) {}
   if (!REPORT) return;
