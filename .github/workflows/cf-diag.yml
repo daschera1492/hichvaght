@@ -1,0 +1,83 @@
+name: CF token diagnostic (temporary)
+
+# Throwaway probe: prints exactly what the Cloudflare API says for each tunnel
+# endpoint, so the 10000 "Authentication error" can be pinned to a cause
+# (missing permission vs. Zero Trust not enabled vs. wrong scope).
+# Delete this file once the tunnel works.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+
+    steps:
+      - name: Probe the Cloudflare API
+        run: |
+          node --input-type=module -e '
+          const tok = process.env.CF_API_TOKEN;
+          const zone = process.env.CF_ZONE_ID;
+          const call = async (method, path, body) => {
+            const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+              method,
+              headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
+              body: body ? JSON.stringify(body) : undefined,
+            });
+            let json;
+            try { json = await res.json(); } catch { json = { parse: "failed" }; }
+            return { status: res.status, json };
+          };
+          const show = (label, r) => {
+            const j = r.json || {};
+            const errs = (j.errors || []).map((e) => `${e.code}:${e.message}`).join(" | ") || "-";
+            const msgs = (j.messages || []).map((m) => `${m.code}:${m.message}`).join(" | ") || "-";
+            const n = Array.isArray(j.result) ? `result[${j.result.length}]` : typeof j.result;
+            console.log(`${label.padEnd(42)} http=${r.status} success=${j.success} ${n}`);
+            if (errs !== "-") console.log(`    errors  : ${errs}`);
+            if (msgs !== "-") console.log(`    messages: ${msgs}`);
+          };
+
+          show("GET  /user/tokens/verify", await call("GET", "/user/tokens/verify"));
+
+          const acc = await call("GET", "/accounts");
+          show("GET  /accounts", acc);
+          const accountId = acc.json?.result?.[0]?.id;
+          console.log(`    account : ${accountId} (${acc.json?.result?.[0]?.name})`);
+
+          show("GET  /zones", await call("GET", "/zones"));
+
+          if (accountId) {
+            show("GET  cfd_tunnel", await call("GET", `/accounts/${accountId}/cfd_tunnel`));
+            show("GET  cfd_tunnel?is_deleted=false",
+              await call("GET", `/accounts/${accountId}/cfd_tunnel?is_deleted=false`));
+            show("GET  access/organizations",
+              await call("GET", `/accounts/${accountId}/access/organizations`));
+            show("GET  tunnels (legacy /tunnels)",
+              await call("GET", `/accounts/${accountId}/tunnels`));
+            show("GET  account memberships",
+              await call("GET", `/accounts/${accountId}/members`));
+
+            const made = await call("POST", `/accounts/${accountId}/cfd_tunnel`,
+              { name: "router2-diag", config_src: "cloudflare" });
+            show("POST cfd_tunnel (create)", made);
+            if (made.json?.success) {
+              const id = made.json.result.id;
+              show("GET  cfd_tunnel token", await call("GET", `/accounts/${accountId}/cfd_tunnel/${id}/token`));
+              show("PUT  cfd_tunnel configurations",
+                await call("PUT", `/accounts/${accountId}/cfd_tunnel/${id}/configurations`,
+                  { config: { ingress: [{ service: "http_status:404" }] } }));
+              show("DELETE cfd_tunnel (cleanup)",
+                await call("DELETE", `/accounts/${accountId}/cfd_tunnel/${id}`));
+            }
+          }
+
+          if (zone) {
+            show("GET  dns_records?name=router2.codol.ir",
+              await call("GET", `/zones/${zone}/dns_records?name=router2.codol.ir`));
+          }
+          '
