@@ -377,11 +377,43 @@ async function installRouter() {
   log("• 9router: running the existing bootstrap (install + systemd unit)…");
   const script = join(repoRoot, "scripts", "freestyle-router", "bootstrap.sh");
   await readFile(script, "utf8"); // fail early with a clear error if it is missing
-  const out = await must(`sudo bash ${script}`, {
-    env: { ROUTER_PORT: String(PORT), NINE_ROUTER_PASSWORD: process.env.NINE_ROUTER_PASSWORD },
-    timeout: 900_000,
-  });
-  for (const line of out.split("\n").slice(-12).filter(Boolean)) log(`    ${line}`);
+
+  // Two things the previous VM did not have to care about:
+  //   * sudo resets the environment, so NINE_ROUTER_PASSWORD never reached
+  //     bootstrap.sh. Handing it over through a root-only file keeps it out of
+  //     the command text, which would otherwise land in the public log.
+  //   * node/npm live in /opt/hostedtoolcache, which is not on root's
+  //     secure_path — bootstrap.sh calls npm, so PATH has to be passed in.
+  const dir = await mkdtemp(join(tmpdir(), "9rboot-"));
+  const pw = join(dir, "pw");
+  await writeFile(pw, process.env.NINE_ROUTER_PASSWORD || "", { mode: 0o600 });
+  const path = `${process.env.PATH || ""}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+
+  // bootstrap.sh runs `sudo bash -c "... npm install ..."` internally, and that
+  // nested sudo resets PATH to root's secure_path, where /opt/hostedtoolcache is
+  // missing. Linking node/npm into /usr/local/bin fixes those calls and also
+  // lets systemd start the 9router shim, which is `#!/usr/bin/env node`.
+  const links = await must(`
+    set -e
+    for b in node npm npx; do
+      src=$(command -v $b 2>/dev/null || true)
+      if [ -n "$src" ]; then sudo ln -sf "$src" "/usr/local/bin/$b"; fi
+    done
+    echo "node -> $(readlink -f /usr/local/bin/node)"
+    echo "npm  -> $(readlink -f /usr/local/bin/npm)"
+  `);
+  for (const line of links.split("\n").filter(Boolean)) log(`    ${line}`);
+
+  try {
+    const out = await must(
+      `sudo bash -c 'export PATH=${path}; export NINE_ROUTER_PASSWORD="$(cat ${pw})"; ` +
+        `export ROUTER_PORT=${PORT}; exec bash ${script}'`,
+      { timeout: 900_000 },
+    );
+    for (const line of out.split("\n").slice(-12).filter(Boolean)) log(`    ${line}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 async function restoreState() {
