@@ -1,0 +1,37 @@
+name: Zen egress probe (temporary)
+
+# Throwaway: asks OpenCode's free model from a GitHub runner IP, so the 429 can
+# be told apart from "this particular IP is out of free quota". No credential is
+# used, so nothing secret can leak into the public log.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Where are we and what does Zen answer
+        run: |
+          set -uo pipefail
+          echo "egress=$(curl -s --max-time 15 https://api.ipify.org)"
+          BODY='{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+          for label in no-auth garbage; do
+            if [ "$label" = "garbage" ]; then
+              HDR=(-H "Authorization: Bearer sk-0000000000000000-000000-00000000")
+            else
+              HDR=()
+            fi
+            CODE=$(curl -s -o /tmp/out -w '%{http_code}' --max-time 30 \
+              -X POST "https://opencode.ai/zen/v1/chat/completions" \
+              -H 'Content-Type: application/json' "${HDR[@]}" -d "$BODY")
+            echo "== $label -> HTTP $CODE"
+            head -c 300 /tmp/out; echo
+          done
+
+          echo "== models"
+          curl -s -o /tmp/m -w 'HTTP %{http_code}\n' --max-time 20 \
+            "https://opencode.ai/zen/v1/models"
+          head -c 200 /tmp/m; echo
