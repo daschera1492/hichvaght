@@ -5,19 +5,18 @@
 //   cloudflared  ──► 127.0.0.1:20128   the public entry for router2.codol.ir
 //   9router      ──► systemd service (root), same data dir as before
 //   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
-//   iptables     ──► the whole machine egresses through that SOCKS5
+//   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118, forwarding into that SOCKS5
 //
-// Scope of the redirect: everything, minus the three processes that would kill
-// the setup if they were sent through the tunnel:
+// 9router's provider traffic is routed through the VPN by its own outbound-proxy
+// setting, not by iptables: the runner kernel has no xt_owner, so a transparent
+// redirect could not exempt the VPN from itself and had to be dropped. The app
+// reads HTTPS_PROXY and passes it to undici's ProxyAgent, which speaks HTTP
+// only — hence the small bridge in socks-bridge.mjs.
 //
-//   awmvpn     its own upstream dial would loop back into redsocks
-//   redsocks   same reason, one hop earlier
-//   cloudflared  the public entry point: tunnelling the tunnel doubles every
-//                request and turns any VPN blip into a dead domain
-//
-// The Actions agent (user "runner") is excluded by default too — see
-// VPN_EXCLUDE_RUNNER — because it carries the job's control channel and its
-// log upload. Everything else, including 9router, leaves through Mozilla.
+// What leaves through the VPN is therefore exactly 9router's upstream calls.
+// The tunnel, the Actions agent and every other process keep the runner's own
+// route; none of them needs to be, and tunnelling the tunnel would turn any VPN
+// blip into a dead domain.
 //
 // Usage: node router.mjs start | stop
 //
@@ -39,9 +38,11 @@ const DATA_DIR = "/root/.9router";
 const VPN_DIR = "/opt/awmvpn";
 const VPN_DATA = `${VPN_DIR}/user-data`;
 const VPN_PORT = Number(process.env.FXA_PROXY_PORT || 10810);
+const BRIDGE_PORT = Number(process.env.FXA_BRIDGE_PORT || 8118);
 const VPN_USER = "awmvpn";
 const TUNNEL_USER = "cfd";
-const REDSOCKS_PORT = 12345;
+const BRIDGE_DIR = "/opt/9router-bridge";
+const BRIDGE_LOG = "/var/log/9router-bridge.log";
 const FXA_REPO = process.env.FXA_REPO || "AiWithMase/awmvpn";
 const FXA_RELEASE = process.env.FXA_RELEASE || "latest";
 const TRANSPORT = (process.env.FXA_TRANSPORT || "h2").toLowerCase() === "h3" ? "h3" : "h2";
@@ -52,11 +53,6 @@ const FREE_COUNTRIES = ["ar", "au", "de", "jp", "us", "za"];
 // being passed through the step environment — GitHub echoes every env entry
 // into the (public) log.
 const PROXY_PASS = process.env.FXA_PROXY_PASS || randomBytes(12).toString("hex");
-
-// "Whole machine" still has to leave the job's own control channel alone: if the
-// agent cannot reach github.com the run is declared lost and everything above is
-// thrown away. Set VPN_EXCLUDE_RUNNER=false to send it through the tunnel too.
-const EXCLUDE_RUNNER = (process.env.VPN_EXCLUDE_RUNNER ?? "true").toLowerCase() !== "false";
 
 const CF = {
   token: (process.env.CF_API_TOKEN || "").trim(),
@@ -645,163 +641,266 @@ async function bringUpVpn() {
   throw new Error("AWMVPN never produced a working tunnel (account needs a sign-in, or Guardian refuses the region)");
 }
 
-// ------------------------------------------------- redirect: whole machine
-async function redirectEverything(expectedIp, runnerIp) {
-  log("• Redirect: whole machine through the VPN (except the tunnel and the VPN itself)…");
-  const out = await must(`
-    set -e
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redsocks iptables >/dev/null
-    sudo tee /etc/redsocks.conf >/dev/null <<CONF
-base {
-  log_debug = off;
-  log_info = on;
-  daemon = on;
-  redirector = iptables;
-}
-redsocks {
-  local_ip = 127.0.0.1;
-  local_port = ${REDSOCKS_PORT};
-  ip = 127.0.0.1;
-  port = ${VPN_PORT};
-  type = socks5;
-  login = "router";
-  password = "\${FXA_PASS}";
-}
-CONF
-    sudo systemctl enable redsocks >/dev/null 2>&1 || true
-    sudo systemctl restart redsocks
-    sleep 1
-    systemctl is-active redsocks
-  `, { env: { FXA_PASS: PROXY_PASS }, timeout: 420_000 });
-  for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+// --------------------------------------------------- egress: 9router only
+// 9router's provider layer (proxyAwareFetch) reads HTTPS_PROXY and hands the URL
+// to undici's ProxyAgent, which speaks HTTP only. AWMVPN speaks SOCKS5, so a
+// small bridge does the translation. It runs as its own unit: it survives a
+// 9router restart and keeps its access log separate from the app's.
+const ROUTER_PROXY = `http://127.0.0.1:${BRIDGE_PORT}`;
+const ROUTER_NO_PROXY = "localhost,127.0.0.1,::1";
 
-  const r = await sh(`
-    set -e
-    VPN_UID=$(id -u ${VPN_USER})
-    RS_UID=$(id -u redsocks)
-    CFD_UID=$(id -u ${TUNNEL_USER})
-    RUNNER_UID=$(id -u runner 2>/dev/null || echo "")
+async function installBridge() {
+  log(`• Egress: installing the HTTP→SOCKS5 bridge on 127.0.0.1:${BRIDGE_PORT}…`);
+  const script = join(here, "socks-bridge.mjs");
+  await readFile(script, "utf8"); // fail early with a clear error if it is missing
 
-    # -m owner is the only way to exempt a process from the redirect, and
-    # iptables-nft does not autoload xt_owner on every kernel. Probe it and use
-    # whichever backend actually accepts the match; a chain with the owner rules
-    # silently missing looks fine now and turns the tunnel into a loop on the
-    # first reconnect.
-    modprobe xt_owner 2>/dev/null || true
-    probe_owner() {
-      $1 -t nat -N AWMVPNT 2>/dev/null || $1 -t nat -F AWMVPNT 2>/dev/null
-      $1 -t nat -A AWMVPNT -m owner --uid-owner 0 -j RETURN 2>/dev/null
-      rc=$?
-      $1 -t nat -F AWMVPNT 2>/dev/null
-      $1 -t nat -X AWMVPNT 2>/dev/null
-      return $rc
-    }
-    IPT=""
-    for c in iptables iptables-legacy; do
-      command -v $c >/dev/null 2>&1 || continue
-      if probe_owner $c; then IPT=$c; echo "owner matching: $c"; break; fi
-      echo "owner matching: $c unavailable"
-    done
-    if [ -z "$IPT" ]; then
-      echo "RESULT=unsupported"
-      exit 0
-    fi
+  const dir = await mkdtemp(join(tmpdir(), "bridge-"));
+  const env = join(dir, "bridge.env");
+  await writeFile(
+    env,
+    [
+      `BRIDGE_LISTEN=127.0.0.1:${BRIDGE_PORT}`,
+      "SOCKS_HOST=127.0.0.1",
+      `SOCKS_PORT=${VPN_PORT}`,
+      "SOCKS_USER=router",
+      `SOCKS_PASS=${PROXY_PASS}`,
+    ].join("\n") + "\n",
+    { mode: 0o600 },
+  );
 
-    revert() {
-      for c in "$IPT" iptables iptables-legacy; do
-        command -v $c >/dev/null 2>&1 || continue
-        $c -t nat -D OUTPUT -j AWMVPN 2>/dev/null || true
-        $c -t nat -F AWMVPN 2>/dev/null || true
-        $c -t nat -X AWMVPN 2>/dev/null || true
-      done
-    }
+  // ExecStart uses the real node binary, not /usr/local/bin/node: this unit may
+  // start before anything re-created that symlink.
+  const unit = `[Unit]
+Description=HTTP CONNECT to SOCKS5 bridge for 9router
+After=network-online.target awmvpn.service
+Wants=network-online.target
 
-    revert
-    $IPT -t nat -N AWMVPN
-    for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
-      $IPT -t nat -A AWMVPN -d $net -j RETURN
-    done
-    $IPT -t nat -A AWMVPN -m owner --uid-owner $VPN_UID -j RETURN
-    $IPT -t nat -A AWMVPN -m owner --uid-owner $RS_UID -j RETURN
-    $IPT -t nat -A AWMVPN -m owner --uid-owner $CFD_UID -j RETURN
-    if [ "${EXCLUDE_RUNNER}" = "true" ] && [ -n "$RUNNER_UID" ]; then
-      $IPT -t nat -A AWMVPN -m owner --uid-owner $RUNNER_UID -j RETURN
-    fi
-    $IPT -t nat -A AWMVPN -p tcp -j REDIRECT --to-ports ${REDSOCKS_PORT}
-    $IPT -t nat -I OUTPUT 1 -j AWMVPN
-    echo "rules: $($IPT -t nat -S AWMVPN | wc -l) lines, owner: $($IPT -t nat -S AWMVPN | grep -c owner)"
+[Service]
+Type=simple
+ExecStart=${process.execPath} ${BRIDGE_DIR}/socks-bridge.mjs
+EnvironmentFile=${BRIDGE_DIR}/bridge.env
+Restart=always
+RestartSec=3
+StandardOutput=append:${BRIDGE_LOG}
+StandardError=append:${BRIDGE_LOG}
 
-    # root is the redirected case (9router runs as root); the runner user is the
-    # exempt case. Both must be checked, because "everything works" only means
-    # something if the two paths actually differ.
-    probe() { sudo curl -s --max-time 20 https://api.ipify.org || true; }
-    probe_as_runner() { sudo -u runner curl -s --max-time 20 https://api.ipify.org 2>/dev/null || true; }
+[Install]
+WantedBy=multi-user.target
+`;
+  const unitPath = join(dir, "socks-bridge.service");
+  await writeFile(unitPath, unit);
 
-    ROOT_IP=""
-    for i in $(seq 1 8); do
-      ROOT_IP=$(probe)
-      echo "root probe $i egress=\${ROOT_IP:-none}"
-      [ -n "$ROOT_IP" ] && break
-      sleep 3
-    done
-    RUN_IP=$(probe_as_runner)
-    echo "runner probe egress=\${RUN_IP:-none}"
-
-    EXPECTED="${expectedIp}"
-    RUNNER="${runnerIp}"
-
-    if [ -z "$ROOT_IP" ]; then
-      echo "the redirected machine has no egress — reverting"
-      revert
-      echo "RESULT=failed no_egress"
-      exit 0
-    fi
-    if [ -n "$RUNNER" ] && [ "$ROOT_IP" = "$RUNNER" ]; then
-      echo "egress is still the runner IP ($ROOT_IP) — the redirect is not in effect, reverting"
-      revert
-      echo "RESULT=failed still_runner_ip=$ROOT_IP"
-      exit 0
-    fi
-    if [ "${EXCLUDE_RUNNER}" = "true" ] && [ -n "$RUNNER" ] && [ "$RUN_IP" = "$ROOT_IP" ]; then
-      echo "warning: the exempt user is also on the VPN IP ($RUN_IP) — the owner rules are not matching"
-    fi
-
-    # A first probe proves nothing on its own: the tunnel was opened before these
-    # rules existed, so its upstream connection is already established and never
-    # passes nat/OUTPUT again. Restart it so it dials out through the new chain —
-    # that is the real test that the owner exclusions hold.
-    echo "restarting the VPN to force a reconnect through the redirect"
-    sudo systemctl restart awmvpn
-    ROOT_IP2=""
-    for i in $(seq 1 8); do
-      sleep 5
-      ROOT_IP2=$(probe)
-      echo "post-restart probe $i egress=\${ROOT_IP2:-none}"
-      [ -n "$ROOT_IP2" ] && break
-    done
-    if [ -z "$ROOT_IP2" ] || { [ -n "$RUNNER" ] && [ "$ROOT_IP2" = "$RUNNER" ]; }; then
-      echo "the tunnel does not survive a reconnect through the redirect — reverting"
-      revert
-      sudo systemctl restart awmvpn
-      echo "RESULT=failed reconnect=\${ROOT_IP2:-none}"
-      exit 0
-    fi
-    if [ -n "$EXPECTED" ] && [ "$ROOT_IP2" != "$EXPECTED" ]; then
-      echo "note: egress $ROOT_IP2 differs from the VPN exit IP $EXPECTED"
-    fi
-    echo "RESULT=ok egress=$ROOT_IP2 exempt=\${RUN_IP:-none}"
-  `, { check: false, timeout: 420_000 });
-
-  for (const line of r.out.split("\n").filter(Boolean)) log(`    ${line}`);
-  const m = r.out.match(/RESULT=(\w+)/);
-  if (!m) return false;
-  if (m[1] === "unsupported") {
-    log("    this kernel cannot match a process owner in iptables (no xt_owner), so the VPN");
-    log("    cannot be exempted from its own redirect — refusing to apply it.");
-    return false;
+  try {
+    const out = await must(`
+      set -e
+      sudo mkdir -p ${BRIDGE_DIR}
+      sudo install -m 0644 ${script} ${BRIDGE_DIR}/socks-bridge.mjs
+      sudo install -m 0600 ${env} ${BRIDGE_DIR}/bridge.env
+      sudo install -m 0644 ${unitPath} /etc/systemd/system/socks-bridge.service
+      sudo touch ${BRIDGE_LOG}
+      sudo chmod 0644 ${BRIDGE_LOG}
+      sudo systemctl daemon-reload
+      sudo systemctl enable socks-bridge >/dev/null 2>&1 || true
+      sudo systemctl restart socks-bridge
+      sleep 2
+      systemctl is-active socks-bridge
+    `);
+    for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
-  return m[1] === "ok";
+}
+
+// Proves the bridge really reaches the internet through the tunnel: the answer
+// must be the VPN's exit IP, not the runner's.
+async function bridgeEgress(expectedIp) {
+  log("• Egress: asking for the exit IP through the bridge…");
+  for (let i = 1; i <= 10; i++) {
+    const r = await sh(
+      `curl -s --max-time 20 -x ${ROUTER_PROXY} https://api.ipify.org`,
+      { check: false, timeout: 40_000 },
+    );
+    const ip = r.out.trim();
+    if (/^[0-9a-fA-F:.]{3,45}$/.test(ip)) {
+      log(`    bridge egress ${ip}${expectedIp ? ` (VPN exit ${expectedIp})` : ""}`);
+      return { ok: true, ip };
+    }
+    if (i === 1 || i % 3 === 0) log(`    probe ${i}/10: ${(ip || "no answer").slice(0, 100)}`);
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return { ok: false, ip: "" };
+}
+
+// Login with the password bootstrap.sh installed, then flip the app's own
+// outbound-proxy setting. The credential and the settings body travel in
+// root-only files so neither ends up in the public step log.
+async function enableOutboundProxy() {
+  log(`• Egress: setting 9router's outbound proxy to ${ROUTER_PROXY}…`);
+  const dir = await mkdtemp(join(tmpdir(), "9rproxy-"));
+  const jar = join(dir, "cookies");
+  const pwFile = join(dir, "login.json");
+  const settingsFile = join(dir, "settings.json");
+  await writeFile(pwFile, JSON.stringify({ password: process.env.NINE_ROUTER_PASSWORD || "" }), {
+    mode: 0o600,
+  });
+  await writeFile(
+    settingsFile,
+    JSON.stringify({
+      outboundProxyEnabled: true,
+      outboundProxyUrl: ROUTER_PROXY,
+      outboundNoProxy: ROUTER_NO_PROXY,
+    }),
+    { mode: 0o600 },
+  );
+
+  try {
+    const login = await sh(
+      `curl -s -o /dev/null -w '%{http_code}' --max-time 20 -c ${jar} ` +
+        `-H 'content-type: application/json' --data-binary @${pwFile} ` +
+        `http://127.0.0.1:${PORT}/api/auth/login`,
+      { check: false, timeout: 60_000 },
+    );
+    const code = login.out.trim();
+    if (code !== "200") {
+      throw new Error(`login to the local 9router answered ${code || "nothing"} — cannot set the outbound proxy`);
+    }
+
+    const patch = await sh(
+      `curl -s --max-time 30 -b ${jar} -X PATCH ` +
+        `-H 'content-type: application/json' --data-binary @${settingsFile} ` +
+        `http://127.0.0.1:${PORT}/api/settings`,
+      { check: false, timeout: 60_000 },
+    );
+    let saved;
+    try {
+      saved = JSON.parse(patch.out);
+    } catch {
+      throw new Error(`the settings endpoint returned no JSON: ${patch.out.slice(0, 200)}`);
+    }
+    if (saved?.outboundProxyEnabled !== true || saved?.outboundProxyUrl !== ROUTER_PROXY) {
+      throw new Error(`the app did not keep the proxy settings: ${JSON.stringify(saved).slice(0, 240)}`);
+    }
+    log(`    saved: outboundProxyEnabled=true outboundProxyUrl=${ROUTER_PROXY}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// The setting only rewrites process.env inside the running server. The unit has
+// Restart=always, so a crash would silently drop it; the same values go into a
+// drop-in so a restarted 9router comes back with the proxy still applied.
+async function persistProxyEnv() {
+  const dir = await mkdtemp(join(tmpdir(), "9rdrop-"));
+  const file = join(dir, "proxy.conf");
+  const lines = [
+    ["HTTP_PROXY", ROUTER_PROXY],
+    ["HTTPS_PROXY", ROUTER_PROXY],
+    ["ALL_PROXY", ROUTER_PROXY],
+    ["NO_PROXY", ROUTER_NO_PROXY],
+    ["NINE_ROUTER_PROXY_MANAGED", "1"],
+    ["NINE_ROUTER_PROXY_URL", ROUTER_PROXY],
+    ["NINE_ROUTER_NO_PROXY", ROUTER_NO_PROXY],
+  ].map(([k, v]) => `Environment=${k}=${v}`);
+  await writeFile(file, `[Service]\n${lines.join("\n")}\n`);
+
+  try {
+    const out = await must(`
+      set -e
+      sudo mkdir -p /etc/systemd/system/9router.service.d
+      sudo install -m 0644 ${file} /etc/systemd/system/9router.service.d/10-proxy.conf
+      sudo systemctl daemon-reload
+      sudo systemctl restart 9router
+      for i in $(seq 1 90); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${PORT}/api/health || true)
+        case "$code" in 2*) echo "9router answers again after \${i}s"; exit 0;; esac
+        sleep 1
+      done
+      echo "9router did not come back after the restart"
+      sudo tail -20 /var/log/9router.log || true
+      exit 1
+    `);
+    for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  const check = await sh(
+    `
+    pid=$(systemctl show 9router -p MainPID --value)
+    if [ -z "$pid" ] || [ "$pid" = "0" ]; then echo 0; exit 0; fi
+    sudo bash -c "tr '\\\\0' '\\\\n' < /proc/$pid/environ" | grep -c '^HTTPS_PROXY=' || true
+    `,
+    { check: false },
+  );
+  log(`    process env: HTTPS_PROXY entries = ${check.out.trim()}`);
+}
+
+async function bridgeLogLines() {
+  const r = await sh(`sudo wc -l < ${BRIDGE_LOG} 2>/dev/null || echo 0`, { check: false });
+  return Number(r.out.trim()) || 0;
+}
+
+// The decisive check: one real provider call through the app, then look for a
+// new tunnel in the bridge log. A configured proxy that nothing uses would leave
+// the log untouched.
+async function probeThroughRouter() {
+  log("• Egress: one provider call through 9router, then the bridge log…");
+  const dir = await mkdtemp(join(tmpdir(), "9rprobe-"));
+  const jar = join(dir, "cookies");
+  const pwFile = join(dir, "login.json");
+  const testFile = join(dir, "test.json");
+  await writeFile(pwFile, JSON.stringify({ password: process.env.NINE_ROUTER_PASSWORD || "" }), {
+    mode: 0o600,
+  });
+
+  try {
+    await sh(
+      `curl -s -o /dev/null -c ${jar} -H 'content-type: application/json' --data-binary @${pwFile} ` +
+        `http://127.0.0.1:${PORT}/api/auth/login`,
+      { check: false, timeout: 60_000 },
+    );
+
+    const raw = await must(`curl -s -b ${jar} --max-time 20 http://127.0.0.1:${PORT}/api/models`);
+    let models = [];
+    try {
+      const parsed = JSON.parse(raw);
+      models = Array.isArray(parsed) ? parsed : parsed.models || [];
+    } catch {
+      /* reported below */
+    }
+    const pick = models.find((m) => m?.routedModel) || models[0];
+    if (!pick) {
+      log("    no model in the restored state — skipping the end-to-end probe");
+      return false;
+    }
+    const model = pick.routedModel || pick.fullModel;
+    await writeFile(testFile, JSON.stringify({ model, kind: "llm" }));
+
+    const before = await bridgeLogLines();
+    const res = await sh(
+      `curl -s --max-time 90 -b ${jar} -H 'content-type: application/json' ` +
+        `--data-binary @${testFile} http://127.0.0.1:${PORT}/api/models/test`,
+      { check: false, timeout: 120_000 },
+    );
+    let result = {};
+    try {
+      result = JSON.parse(res.out);
+    } catch {
+      /* keep {} */
+    }
+    const verdict = result.ok ? "ok" : `failed${result.error ? `: ${String(result.error).slice(0, 140)}` : ""}`;
+    log(`    ${model} → ${verdict}${result.status ? ` (HTTP ${result.status})` : ""}`);
+
+    await new Promise((r) => setTimeout(r, 1000));
+    const added = (await bridgeLogLines()) - before;
+    log(
+      `    bridge log: ${added} new tunnel(s) — ` +
+        (added > 0 ? "9router egresses through the VPN" : "no tunnel seen, the proxy setting is not in the request path"),
+    );
+    return added > 0;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 // ------------------------------------------------------------------ start
@@ -819,21 +918,29 @@ async function start() {
   await verifyPublic();
 
   const vpn = await bringUpVpn();
-  const redirected = await redirectEverything(vpn.ip, process.env.RUNNER_PUBLIC_IP || "");
+  await installBridge();
+  const egress = await bridgeEgress(vpn.ip);
+  await enableOutboundProxy();
+  await persistProxyEnv();
+  const routed = await probeThroughRouter();
+  const throughVpn = egress.ok && routed;
 
   const socks = `socks5h://router:${PROXY_PASS}@127.0.0.1:${VPN_PORT}`;
   await exportEnv({
     FXA_SOCKS5: socks,
+    FXA_HTTP_PROXY: ROUTER_PROXY,
     FXA_COUNTRY: vpn.country || "auto",
     FXA_EXIT_IP: vpn.ip,
     FXA_VPN_ACTIVE: "1",
-    FXA_VPN_SCOPE: redirected ? "whole-machine" : "vpn-only",
+    FXA_VPN_SCOPE: "9router",
+    FXA_VPN_VERIFIED: throughVpn ? "1" : "0",
   });
 
   header("READY");
   log(`  URL      : https://${DOMAIN}/dashboard`);
-  log(`  runner   : ${process.env.RUNNER_PUBLIC_IP || "?"} (exempt: tunnel + agent)`);
-  log(`  egress   : ${redirected ? `whole machine → VPN exit ${vpn.ip} (${vpn.country || "auto"})` : `VPN only — 9router keeps the runner IP`}`);
+  log(`  runner   : ${process.env.RUNNER_PUBLIC_IP || "?"} (unchanged: tunnel and agent stay direct)`);
+  log(`  egress   : 9router → ${ROUTER_PROXY} → SOCKS5 ${VPN_PORT} → VPN exit ${vpn.ip} (${vpn.country || "auto"})`);
+  log(`  verified : ${egress.ok ? `bridge reaches ${egress.ip}` : "bridge probe failed"} / ${routed ? "provider call seen in the bridge log" : "provider call not confirmed"}`);
   log(`  SOCKS5   : 127.0.0.1:${VPN_PORT} (user router, password is per-run and not printed)`);
   log(`  data     : ${DATA_DIR}`);
 }
