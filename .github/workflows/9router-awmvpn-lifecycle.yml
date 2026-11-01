@@ -1,0 +1,232 @@
+name: 9Router + Firefox VPN Lifecycle
+
+# Same session as 9router-lifecycle.yml, with one addition: after 9router is up,
+# a Firefox-VPN client (AWMVPN core) is started INSIDE the same VM and the WHOLE
+# VM is routed through it — redsocks + iptables send every locally generated TCP
+# connection into the VPN's SOCKS5 on 127.0.0.1:10810, so nothing inside the VM
+# needs a proxy setting.
+#
+# Order matters and is deliberate:
+#
+#   1. This runner becomes a Tailscale EXIT NODE and stays up all session.
+#   2. start.mjs creates the Freestyle VM, installs 9router, and routes ALL of
+#      the VM's traffic through that exit node.
+#   3. awmvpn.mjs installs the Firefox-VPN core in that same VM, restores the
+#      Firefox Account(s) from a secret, tries a random free location until one
+#      really tunnels, and then redirects ALL of the VM's TCP traffic into it
+#      (redsocks + an iptables chain, with loopback and private ranges kept off
+#      the tunnel so Freestyle's control channel and the exit node still work).
+#   4. From that point the VM behaves like a device connected to the VPN.
+#
+# Step 2 must come before step 3: Mozilla's Guardian answers 451
+# (RegionUnavailable) and FxA flags sign-ins from datacenter addresses, so the
+# VPN has to be installed while the VM already egresses from the runner's IP.
+#
+# Nothing from 9router-lifecycle.yml is modified by this file — it is a separate
+# workflow. It shares the same concurrency group on purpose, so the two can never
+# fight over the same VM.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "حالت شروع: با بکاپ (کانفیگ قبلی) یا خام (هیچ بکاپی لود نمی‌شه)"
+        type: choice
+        default: with-backup
+        options:
+          - with-backup
+          - fresh
+      fxa_country:
+        description: "لوکیشن VPN: خالی = رندوم از کشورهای آزاد، auto = بهترین لوکیشن Mozilla، یا کد کشور (ar au de jp us za)"
+        required: false
+        default: ""
+      fxa_transport:
+        description: "ترنسپورت VPN"
+        type: choice
+        default: h2
+        options:
+          - h2
+          - h3
+      idle_timeout:
+        description: "Seconds of inactivity before the VM auto-pauses"
+        required: false
+        default: "1200"
+      session_seconds:
+        description: "Session length in seconds (GitHub free tier caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+# Never let two lifecycle runs fight over the same VM — including the original
+# 9router-lifecycle.yml, which uses this same group.
+concurrency:
+  group: 9router-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      contents: write
+
+    env:
+      # Tailscale — one shared key for the runner (exit node) and the VM.
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # Set to tag:exit-node if your auth key is tag-restricted; leave empty for an
+      # unrestricted reusable key.
+      TAILSCALE_EXIT_TAG: tag:exit-node
+      # Freestyle + router
+      FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      ROUTER_DOMAIN: router.codol.ir
+      ROUTER_SLUG: nine-router
+      ROUTER_PORT: "20128"
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+      IDLE_TIMEOUT_SECONDS: ${{ inputs.idle_timeout }}
+      FREESTYLE_SNAPSHOT: freestyle/ubuntu-sm
+      RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
+      GITHUB_TOKEN: ${{ github.token }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+      # Firefox VPN (AWMVPN core). The accounts archive is the tar.gz of a
+      # user-data/accounts folder (credentials.json + secret.key), base64'd.
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+      FXA_COUNTRY: ${{ inputs.fxa_country }}
+      FXA_TRANSPORT: ${{ inputs.fxa_transport }}
+      FXA_PROXY_PORT: "10810"
+      FXA_DASHBOARD_PORT: "10820"
+      FXA_TRIES: "3"
+      # "1" = route the whole VM through the VPN; "0" = leave the routing alone
+      # and only expose the SOCKS5 address.
+      FXA_TRANSPARENT: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        working-directory: scripts/freestyle-router
+        run: npm install --no-audit --no-fund
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------------- exit node
+      # Bring this runner up as a Tailscale exit node (mirrors the byCountry
+      # runners). Everything after this depends on it being online.
+      - name: Bring up exit node (this runner)
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -y
+          sudo apt-get install -y curl lsb-release iptables
+
+          # Tailscale repo + key
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" \
+            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y tailscale
+
+          # An exit node needs forwarding + NAT on the default interface.
+          printf 'net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n' \
+            | sudo tee /etc/sysctl.d/99-tailscale.conf >/dev/null
+          sudo sysctl --system >/dev/null
+          sudo systemctl enable --now tailscaled
+
+          DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+          sudo iptables -A FORWARD -i tailscale0 -o "$DEFAULT_IF" -j ACCEPT
+          sudo iptables -A FORWARD -i "$DEFAULT_IF" -o tailscale0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          sudo iptables -t nat -A POSTROUTING -o "$DEFAULT_IF" -j MASQUERADE
+
+          # Unique hostname per session, like the byCountry runners.
+          CITY=$(curl -s --max-time 10 https://ipinfo.io/city | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+          CITY="${CITY:-runner}"
+          HOSTNAME="${CITY}--$(TZ=Asia/Tehran date +'%H-%M')"
+
+          TAG_ARGS=()
+          if [ -n "${TAILSCALE_EXIT_TAG:-}" ]; then
+            TAG_ARGS+=(--advertise-tags="$TAILSCALE_EXIT_TAG")
+          fi
+
+          # Use --authkey (the exact flag the working byCountry runners use).
+          # `sudo TS_AUTHKEY=... tailscale up` did NOT apply the key here — tailscale
+          # fell back to the interactive login URL. GitHub masks the secret value
+          # in logs, so the flag form is safe. `timeout 120` guarantees a bad key
+          # fails fast instead of hanging on the interactive prompt for hours.
+          sudo timeout 120 tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --advertise-exit-node \
+            --accept-dns=false \
+            --hostname="$HOSTNAME" \
+            "${TAG_ARGS[@]}" \
+            || { echo "FATAL: tailscale up failed or timed out (bad/expired TAILSCALE_AUTH_KEY?)"; tailscale status || true; exit 1; }
+
+          # Give the control plane a moment to publish the exit node.
+          sleep 5
+          tailscale status
+
+          # Export what the VM needs to select and verify this exit node.
+          echo "EXIT_NODE=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
+          echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 10 https://api.ipify.org)" >> "$GITHUB_ENV"
+          echo "Exit node ready."
+
+      # ------------------------------------------------------------ start VM
+      # Creates the VM, routes ALL of its traffic through the exit node above,
+      # installs 9router + wreq-js, and points the domain at it.
+      - name: Start 9Router (VM routed through the exit node)
+        timeout-minutes: 30
+        working-directory: scripts/freestyle-router
+        run: node start.mjs
+
+      # ------------------------------------------------------- firefox vpn
+      # Installs the Firefox-VPN core inside the same VM, restores the account(s)
+      # from FXA_ACCOUNTS_TGZ_B64, and tries random free locations until one
+      # really answers through the tunnel. Leaves SOCKS5 on 127.0.0.1:10810 and
+      # exports FXA_SOCKS5 / FXA_EXIT_IP / FXA_COUNTRY for later steps.
+      #
+      # Deliberately after start.mjs: the VM must already egress from the
+      # runner's IP, otherwise Guardian answers 451 and FxA flags the sign-in.
+      - name: Start Firefox VPN (AWMVPN) inside the VM
+        timeout-minutes: 25
+        working-directory: scripts/freestyle-router
+        run: node awmvpn.mjs
+
+      - name: Report egress
+        run: |
+          echo "9router  : https://${ROUTER_DOMAIN}/dashboard"
+          echo "runner IP: ${RUNNER_PUBLIC_IP}"
+          echo "VPN      : ${FXA_SOCKS5:-not started} (${FXA_COUNTRY:-?})"
+          echo "VPN exit : ${FXA_EXIT_IP:-?}"
+          echo "whole VM : ${FXA_TRANSPARENT:-0} (1 = every TCP connection in the VM goes through the VPN)"
+
+      # ----------------------------------------------------------- keep alive
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300   # reserve the last 5 minutes for a clean teardown
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          NOW=$(date +%s)
+          SLEEP=$(( DEADLINE - NOW ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      # ------------------------------------------------------------ teardown
+      # Runs even if a middle step failed, so a broken start never leaks a VM.
+      # The VPN lives inside the VM, so deleting the VM removes it too.
+      - name: Archive state and delete VM
+        if: always()
+        working-directory: scripts/freestyle-router
+        run: node stop.mjs
+
+      - name: Log out of Tailscale
+        if: always()
+        run: sudo tailscale logout || true
