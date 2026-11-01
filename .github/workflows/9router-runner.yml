@@ -35,16 +35,43 @@ on:
           - with-backup
           - fresh
       fxa_country:
-        description: "لوکیشن VPN — فقط ۶ کشور رایگان Mozilla: ar au de jp us za (random = یکی از همین‌ها، auto = بهترین لوکیشن). MX/BR/CA/FR و… فقط با اشتراک پولی Mozilla VPN."
+        description: "لوکیشن VPN — هر کد کشوری که اکانتت باز دارد. mx/br/ca/fr/gb و… در لیست Mozilla قفل‌اند و فقط با اکانت دارای اشتراک وصل می‌شوند؛ اگر نشد خودکار به یکی از ۶ کشور رایگان می‌افتد."
         type: choice
         default: random
         options:
           - random
           - auto
           - ar
+          - at
           - au
+          - be
+          - bg
+          - br
+          - ca
+          - cl
+          - co
           - de
+          - dk
+          - es
+          - fi
+          - fr
+          - gb
+          - gh
+          - ie
+          - it
           - jp
+          - kr
+          - mx
+          - my
+          - nl
+          - "no"
+          - nz
+          - pe
+          - ph
+          - pt
+          - se
+          - sg
+          - th
           - us
           - za
       fxa_transport:
