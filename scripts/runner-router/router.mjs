@@ -909,8 +909,13 @@ redsocks {
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redsocks nftables
       fi
       id -u redsocks >/dev/null 2>&1 || sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin redsocks
-      sudo install -m 600 -o root -g root ${confPath} ${REDSOCKS_CONF}
-      sudo tee /etc/systemd/system/redsocks.service >/dev/null <<'UNIT'
+      REDSOCKS_BIN=$(command -v redsocks)
+      REDSOCKS_GROUP=$(id -gn redsocks)
+      # The service runs unprivileged, so it must be able to READ this file: the
+      # SOCKS5 login lives in it. 0600 root made redsocks exit on startup and
+      # systemd kept it in an "activating" restart loop.
+      sudo install -m 0640 -o root -g "$REDSOCKS_GROUP" ${confPath} ${REDSOCKS_CONF}
+      sudo tee /etc/systemd/system/redsocks.service >/dev/null <<UNIT
 [Unit]
 Description=redsocks (uid-scoped TCP -> SOCKS5 for 9router)
 After=network-online.target awmvpn.service
@@ -919,19 +924,31 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=redsocks
-Group=redsocks
-ExecStart=/usr/sbin/redsocks -c /etc/redsocks.conf
+Group=$REDSOCKS_GROUP
+ExecStart=$REDSOCKS_BIN -c ${REDSOCKS_CONF}
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+      echo "    binary: $REDSOCKS_BIN (group $REDSOCKS_GROUP)"
       sudo systemctl daemon-reload
       sudo systemctl enable redsocks >/dev/null 2>&1 || true
       sudo systemctl restart redsocks
-      sleep 1
-      systemctl is-active redsocks
+      state=""
+      for i in $(seq 1 15); do
+        state=$(systemctl is-active redsocks || true)
+        if [ "$state" = "active" ]; then
+          echo "    redsocks active after \${i}s"
+          exit 0
+        fi
+        sleep 1
+      done
+      echo "    redsocks did not become active (state: \${state:-unknown})"
+      sudo systemctl status redsocks --no-pager -l 2>&1 | tail -20 || true
+      sudo journalctl -u redsocks -n 30 --no-pager 2>&1 || true
+      exit 1
     `, { timeout: 420_000 });
     for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
   } finally {
