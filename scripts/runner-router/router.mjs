@@ -610,13 +610,22 @@ async function vpnProbe() {
 
 function pickLocations() {
   const want = (process.env.FXA_COUNTRY || "").trim().toLowerCase();
-  if (want && want !== "random") return [want === "auto" ? "" : want];
   const pool = [...FREE_COUNTRIES];
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
-  return pool.slice(0, Number(process.env.FXA_TRIES || 3));
+  const tries = Number(process.env.FXA_TRIES || 3);
+  if (want && want !== "random") {
+    // The requested location goes first, exactly as asked. Mozilla marks some
+    // countries "locked" in its public server list; an account entitled to them
+    // connects anyway, an account that is not gets "no CONNECT proxy found for
+    // country …". Rather than losing the whole session over that, the free pool
+    // follows as a fallback and the log says which one was actually used.
+    const first = want === "auto" ? "" : want;
+    return [first, ...pool.filter((c) => c !== first).slice(0, Math.max(0, tries - 1))];
+  }
+  return pool.slice(0, tries);
 }
 
 async function bringUpVpn() {
