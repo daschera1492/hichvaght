@@ -1,0 +1,139 @@
+name: 9Router (runner only)
+
+# Same job as 9router-lifecycle.yml, with no Freestyle VM and no Tailscale:
+#
+#   cloudflared ──► 127.0.0.1:20128   the public entry for router2.codol.ir
+#   9router     ──► systemd (root), same /root/.9router as before
+#   awmvpn-core ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
+#   iptables    ──► whole machine egresses through it, except the tunnel, the
+#                   VPN itself and the job's control channel
+#
+# A GitHub runner has no public inbound port, so the domain reaches it through a
+# Cloudflare Tunnel. Nothing has to be created by hand: if CF_TUNNEL_TOKEN is
+# absent, CF_API_TOKEN is used to create the tunnel, its ingress rule and the
+# DNS record for router2.codol.ir.
+#
+# Nothing from the previous workflows or scripts is modified. This workflow only
+# reads scripts/freestyle-router/bootstrap.sh (the 9router installer) and uses
+# the new scripts/runner-router/router.mjs.
+#
+# Do not run this and 9router-lifecycle.yml at the same time: both archive state
+# to the same release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "حالت شروع: با بکاپ (کانفیگ قبلی) یا خام"
+        type: choice
+        default: with-backup
+        options:
+          - with-backup
+          - fresh
+      fxa_country:
+        description: "لوکیشن VPN: خالی = رندوم، auto = بهترین لوکیشن Mozilla، یا کد کشور (ar au de jp us za)"
+        required: false
+        default: ""
+      fxa_transport:
+        description: "ترنسپورت VPN"
+        type: choice
+        default: h2
+        options:
+          - h2
+          - h3
+      session_seconds:
+        description: "Session length in seconds (GitHub caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+concurrency:
+  group: 9router-runner
+  cancel-in-progress: false
+
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      ROUTER_PORT: "20128"
+      ROUTER_DOMAIN: router2.codol.ir
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+
+      # Tunnel: either a ready token, or the API token that can create one.
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+
+      # Firefox VPN (AWMVPN core): the accounts archive is the base64 of a
+      # tar.gz of a user-data/accounts folder (credentials.json + secret.key).
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+      FXA_COUNTRY: ${{ inputs.fxa_country }}
+      FXA_TRANSPORT: ${{ inputs.fxa_transport }}
+      FXA_PROXY_PORT: "10810"
+      FXA_TRIES: "3"
+      FXA_UPSTREAM_CONNECTIONS: "4"
+
+      # Whole machine, minus the pieces that must stay direct to survive:
+      # cloudflared (the entry point), the VPN itself, and the Actions agent.
+      VPN_EXCLUDE_RUNNER: "true"
+
+      # State travels through the same encrypted release asset the VM sessions
+      # write, so the existing database is picked up unchanged.
+      RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Record the runner's public IP
+        run: echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 15 https://api.ipify.org)" >> "$GITHUB_ENV"
+
+      # Per-run only: the SOCKS5 login never leaves the machine, so a fresh
+      # value each session is enough and nothing has to be stored.
+      - name: Generate the proxy password
+        run: echo "FXA_PROXY_PASS=$(openssl rand -hex 12)" >> "$GITHUB_ENV"
+
+      # Tunnel, 9router, state restore, VPN, and the whole-machine redirect.
+      - name: Start 9Router and the VPN
+        timeout-minutes: 50
+        run: node scripts/runner-router/router.mjs start
+
+      - name: Report
+        run: |
+          echo "URL      : https://${ROUTER_DOMAIN}/dashboard"
+          echo "runner   : ${RUNNER_PUBLIC_IP}"
+          echo "scope    : ${FXA_VPN_SCOPE:-none} country=${FXA_COUNTRY:-?} exit=${FXA_EXIT_IP:-?}"
+          echo "SOCKS5   : 127.0.0.1:10810 (per-run password, not printed)"
+
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          SLEEP=$(( DEADLINE - $(date +%s) ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      # Always runs: a failed start must not lose the database, and a runner is
+      # gone the moment the job ends.
+      - name: Archive state
+        if: always()
+        run: node scripts/runner-router/router.mjs stop
+
+      - name: Stop the tunnel
+        if: always()
+        run: sudo systemctl stop cloudflared 2>/dev/null || true
