@@ -35,9 +35,18 @@ on:
           - with-backup
           - fresh
       fxa_country:
-        description: "لوکیشن VPN: خالی = رندوم، auto = بهترین لوکیشن Mozilla، یا کد کشور (ar au de jp us za)"
-        required: false
-        default: ""
+        description: "لوکیشن VPN — از قبل تعریف‌شده انتخاب کن (random = هر بار یک کشور آزاد، auto = بهترین لوکیشن Mozilla)"
+        type: choice
+        default: random
+        options:
+          - random
+          - auto
+          - ar
+          - au
+          - de
+          - jp
+          - us
+          - za
       fxa_transport:
         description: "ترنسپورت VPN"
         type: choice
