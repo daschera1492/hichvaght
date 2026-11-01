@@ -7,6 +7,7 @@ name: 9Router (runner only)
 #   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
 #   redsocks     ──► HTTP-free kernel redirect target on 127.0.0.1:12345
 #   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118 → that SOCKS5
+#   zen-proxy    ──► 127.0.0.1:8787 on Bun: OpenCode free-tier gateway shim
 #
 # Order is enforced by router.mjs:
 #   1. VPN up + exit IP proven
@@ -166,6 +167,7 @@ jobs:
           echo "runner   : ${RUNNER_PUBLIC_IP}"
           echo "scope    : ${FXA_VPN_SCOPE:-none} country=${FXA_COUNTRY:-?} exit=${FXA_EXIT_IP:-?}"
           echo "proxy    : ${FXA_HTTP_PROXY:-none} verified=${FXA_VPN_VERIFIED:-0}"
+          echo "free tier: ${FXA_FREE_TIER:-none} model=${FXA_FREE_TIER_MODEL:-?}"
           echo "SOCKS5   : 127.0.0.1:10810 (per-run password, not printed)"
 
       - name: Keep session alive until the deadline

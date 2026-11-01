@@ -1,0 +1,11 @@
+{
+  "name": "wreq-js",
+  "version": "3.2.0",
+  "description": "Local shim: forwards 9router's OpenCode free-tier traffic to the zen-proxy gateway on loopback",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "private": true
+}

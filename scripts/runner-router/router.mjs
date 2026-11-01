@@ -58,6 +58,16 @@ const BRIDGE_LOG = "/var/log/9router-bridge.log";
 const REDSOCKS_PORT = Number(process.env.FXA_REDSOCKS_PORT || 12345);
 const REDSOCKS_CONF = "/etc/redsocks.conf";
 const NINE_LOCK_TABLE = "inet nine_lock";
+// OpenCode free-tier shim: 9router's `oc` transport is redirected (through a
+// local wreq-js stand-in) to this loopback proxy, which speaks the wire shape
+// the free-tier gateway accepts. It runs as the same unprivileged user, so the
+// kernel egress lock covers its upstream calls too.
+const FREE_DIR = `${DATA_DIR}/zen`;
+const FREE_LOG = "/var/log/9router-zen.log";
+const FREE_PORT = Number(process.env.ZEN_PORT || 8787);
+const FREE_UPSTREAM = "https://opencode.ai/inference/openai/v1";
+const FREE_MODEL = process.env.ZEN_PROBE_MODEL || "deepseek-v4.1-flash-free";
+const BUN_VERSION = process.env.BUN_VERSION || "1.4.4";
 const FXA_REPO = process.env.FXA_REPO || "AiWithMase/awmvpn";
 const FXA_RELEASE = process.env.FXA_RELEASE || "latest";
 const TRANSPORT = (process.env.FXA_TRANSPORT || "h2").toLowerCase() === "h3" ? "h3" : "h2";
@@ -1084,6 +1094,221 @@ async function clearEgressLock() {
   await sh(`sudo nft delete table ${NINE_LOCK_TABLE} 2>/dev/null || true`, { check: false });
 }
 
+// ------------------------------------------------- OpenCode free-tier shim
+// 9router's built-in `oc` transport cannot reach OpenCode's free models from
+// Node: the gateway refuses the legacy /inference/v1 base, Node's TLS stack and
+// any request without the harness preamble with 429 FreeUsageLimitError —
+// independent of the egress IP (a fresh session is refused over the VPN exit and
+// over a home connection alike, while the real CLI streams 200 in the same
+// second). zen-proxy speaks the accepted wire shape from Bun. It runs as the
+// same unprivileged user as 9router, so its upstream calls sit inside the
+// kernel lock, and the wreq-js stand-in below points 9router's free-tier
+// transport at it over loopback.
+async function installBun() {
+  log(`• Free tier: making sure Bun ${BUN_VERSION} is installed (Node's TLS stack is refused)…`);
+  const have = await sh(`command -v bun >/dev/null 2>&1 && bun --version || true`, { check: false });
+  if (have.out.trim() === BUN_VERSION) {
+    log(`    bun ${BUN_VERSION} is already in place`);
+    return;
+  }
+  const arch = process.arch === "arm64" ? "aarch64" : "x64";
+  const url = `https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${arch}.zip`;
+  const res = await fetch(url, { redirect: "follow", headers: { "user-agent": "runner-router" } });
+  if (!res.ok) throw new Error(`cannot download ${url}: HTTP ${res.status}`);
+  const dir = await mkdtemp(join(tmpdir(), "bun-"));
+  const zip = join(dir, "bun.zip");
+  await writeFile(zip, Buffer.from(await res.arrayBuffer()));
+  try {
+    const out = await must(`
+      set -e
+      command -v unzip >/dev/null 2>&1 || sudo apt-get install -y unzip >/dev/null 2>&1
+      command -v unzip >/dev/null 2>&1 || { echo "unzip is missing"; exit 1; }
+      rm -rf ${dir}/x && mkdir -p ${dir}/x
+      unzip -qo ${zip} -d ${dir}/x
+      bin=$(find ${dir}/x -type f -name bun | head -n1)
+      [ -n "$bin" ] || { echo "the bun archive has no bun binary"; exit 1; }
+      sudo install -m 0755 "$bin" /usr/local/bin/bun
+      /usr/local/bin/bun --version
+    `);
+    for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// Installs three things and starts the proxy:
+//   * the vendored zen-proxy assets (see scripts/runner-router/zen/NOTICE.md),
+//   * a systemd unit that runs it as ${NINE_USER} on loopback only,
+//   * a wreq-js stand-in in ${DATA_DIR}/runtime, which 9router loads for its
+//     free-tier transport and which forwards those calls to the proxy.
+async function installFreeTier() {
+  log(`• Free tier: installing the OpenCode gateway shim on 127.0.0.1:${FREE_PORT}…`);
+  await installBun();
+
+  const src = join(here, "zen");
+  const assets = ["zen-proxy.mjs", "agent-preamble.txt", "agent-tools.json", "models.json", "LICENSE"];
+  for (const f of assets) await readFile(join(src, f)); // fail early, clear error
+  const shim = ["package.json", "index.mjs"];
+  for (const f of shim) await readFile(join(src, "wreq-shim", f));
+
+  const dir = await mkdtemp(join(tmpdir(), "zen-"));
+  const conf = join(dir, "zen-proxy.json");
+  await writeFile(
+    conf,
+    JSON.stringify(
+      {
+        host: "127.0.0.1",
+        port: FREE_PORT,
+        upstream: FREE_UPSTREAM,
+        ua: "opencode/latest/2.1.4/cli",
+        clientName: "cli",
+        projectHash: "",
+        tracing: true,
+        autoUA: true,
+        uaRefreshMs: 21600000,
+        injectSession: true,
+        probeAuth: "auto",
+        defaultModel: "",
+        modelAliases: {},
+        // "" means the shipped harness preamble: the gateway fingerprints it.
+        agentPreamble: "",
+        agentTools: true,
+        responsesModels: ["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"],
+        maxBodyBytes: 33554432,
+        retriesPerModel: 2,
+        retryBackoffMs: 500,
+        rateLimitMax: 0,
+        rateLimitWindowMs: 60000,
+        proxyKey: "",
+        defaultZenKey: "",
+        trustForwarded: false,
+        timeoutMs: 120000,
+        cacheMs: 30000,
+        // No boot-time probes: the first real caller is the probe below.
+        autoSync: false,
+        autoSyncIntervalMs: 3600000,
+      },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o644 },
+  );
+
+  const unit = `[Unit]
+Description=OpenCode free-tier gateway shim for 9router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${NINE_USER}
+Group=${NINE_USER}
+WorkingDirectory=${FREE_DIR}
+Environment=HOME=${DATA_DIR}
+Environment=ZEN_PROXY_CONFIG=${FREE_DIR}/zen-proxy.json
+ExecStart=/usr/local/bin/bun ${FREE_DIR}/zen-proxy.mjs
+Restart=always
+RestartSec=3
+StandardOutput=append:${FREE_LOG}
+StandardError=append:${FREE_LOG}
+
+[Install]
+WantedBy=multi-user.target
+`;
+  const unitPath = join(dir, "9router-free-tier.service");
+  await writeFile(unitPath, unit);
+
+  try {
+    const out = await must(`
+      set -e
+      sudo mkdir -p ${FREE_DIR} ${DATA_DIR}/runtime/node_modules/wreq-js
+      ${assets.map((f) => `sudo install -m 0644 ${join(src, f)} ${FREE_DIR}/${f}`).join("\n      ")}
+      sudo install -m 0644 ${conf} ${FREE_DIR}/zen-proxy.json
+      sudo install -m 0644 ${join(src, "wreq-shim", "package.json")} ${DATA_DIR}/runtime/node_modules/wreq-js/package.json
+      sudo install -m 0644 ${join(src, "wreq-shim", "index.mjs")} ${DATA_DIR}/runtime/node_modules/wreq-js/index.mjs
+      if [ ! -f ${DATA_DIR}/runtime/package.json ]; then
+        printf '%s\\n' '{"name":"9router-runtime","private":true}' | sudo tee ${DATA_DIR}/runtime/package.json >/dev/null
+      fi
+      sudo chown -R ${NINE_USER}:${NINE_USER} ${FREE_DIR} ${DATA_DIR}/runtime
+      sudo touch ${FREE_LOG}
+      sudo chown ${NINE_USER}:${NINE_USER} ${FREE_LOG}
+      sudo install -m 0644 ${unitPath} /etc/systemd/system/9router-free-tier.service
+      sudo systemctl daemon-reload
+      sudo systemctl enable 9router-free-tier >/dev/null 2>&1 || true
+      sudo systemctl restart 9router-free-tier
+      for i in $(seq 1 45); do
+        body=$(curl -s --max-time 5 http://127.0.0.1:${FREE_PORT}/health || true)
+        case "$body" in
+          *'"upstream"'*) echo "free tier answers after \${i}s: $body"; exit 0;;
+        esac
+        sleep 1
+      done
+      echo "the free-tier shim did not come up"
+      sudo systemctl status 9router-free-tier --no-pager || true
+      sudo tail -40 ${FREE_LOG} || true
+      exit 1
+    `, { timeout: 900_000 });
+    for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// The decisive check for the 429: one real free-model completion, sent as
+// ${NINE_USER} so it also proves the shim's upstream call leaves through the
+// lock. Runs before 9router starts — a broken free tier must stop the run here,
+// with the gateway's own words in the log, instead of surfacing hours later as a
+// user-visible 429 through the public domain.
+async function probeFreeTier() {
+  log(`• Free tier: one real "${FREE_MODEL}" completion through the shim…`);
+  const dir = await mkdtemp(join(tmpdir(), "zenprobe-"));
+  const req = join(dir, "req.json");
+  await writeFile(
+    req,
+    JSON.stringify({
+      model: FREE_MODEL,
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: "Reply with the single word: ok" },
+      ],
+      stream: false,
+    }),
+    { mode: 0o644 },
+  );
+
+  try {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const out = await must(`
+        set -e
+        code=$(sudo -u ${NINE_USER} -- curl -s -o ${dir}/res.json -w '%{http_code}' --max-time 180 \
+          -H 'content-type: application/json' --data-binary @${req} \
+          http://127.0.0.1:${FREE_PORT}/v1/chat/completions || true)
+        echo "HTTP \${code:-none}"
+        head -c 600 ${dir}/res.json 2>/dev/null || true
+        echo
+      `, { timeout: 240_000 });
+      const code = (out.match(/^HTTP (\S+)/m) || [])[1] || "none";
+      const body = out.replace(/^HTTP \S+/m, "").trim();
+      if (code === "200" && /"choices"|"content"/.test(body)) {
+        log(`    ${FREE_MODEL} answered (HTTP 200, attempt ${attempt})`);
+        const g = (out.match(/"(?:content|text)"\s*:\s*"([^"]{0,60})/) || [])[1];
+        if (g) log(`    reply: ${g}`);
+        return;
+      }
+      log(`    attempt ${attempt}/3: HTTP ${code} ${body.slice(0, 220).replace(/\s+/g, " ")}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 8000));
+    }
+    const logTail = await sh(`sudo tail -25 ${FREE_LOG} 2>/dev/null || true`, { check: false });
+    for (const line of logTail.out.split("\n").filter(Boolean)) log(`    zen: ${line.slice(0, 200)}`);
+    throw new Error(
+      `the free tier still refuses "${FREE_MODEL}" — 9router's oc provider would answer 429; ` +
+        "see the gateway reply above and the shim log below",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function startRouter() {
   log("• 9router: starting under the egress lock…");
   const out = await must(`
@@ -1198,6 +1423,8 @@ async function start() {
   await installRedsocks();
   const uid = await routerUid();
   await applyEgressLock(uid, vpn.ip);
+  await installFreeTier();
+  await probeFreeTier();
   await applyProxyDropIn();
   await startRouter();
   await verifyPublic();
@@ -1228,6 +1455,8 @@ async function start() {
     FXA_VPN_ACTIVE: "1",
     FXA_VPN_SCOPE: `uid:${uid}`,
     FXA_VPN_VERIFIED: "1", // applyEgressLock threw otherwise
+    FXA_FREE_TIER: `zen-proxy :${FREE_PORT} (uid ${uid}, Bun ${BUN_VERSION})`,
+    FXA_FREE_TIER_MODEL: FREE_MODEL,
   });
 
   header("READY");
@@ -1238,6 +1467,9 @@ async function start() {
   );
   log(
     `  lock     : uid ${uid} TCP forced through the VPN; IPv6 + non-DNS UDP dropped; loopback/private exempt`,
+  );
+  log(
+    `  free tier: oc/* → wreq-js stand-in → zen-proxy :${FREE_PORT} → ${FREE_UPSTREAM} (proved with ${FREE_MODEL})`,
   );
   log(
     `  verified : uid probe answered from the VPN exit / app proxy ${egress.ok ? `reaches ${egress.ip}` : "unverified"}${routed ? " / provider call seen in the bridge log" : ""}`,
@@ -1252,6 +1484,9 @@ async function stop() {
   // Order matters: stop the app BEFORE the lock is dropped, so no request can
   // slip out on the runner's direct route in between.
   await sh(`sudo systemctl stop 9router || true`, { check: false });
+  // The free-tier shim makes upstream calls as the same uid; stop it before the
+  // lock goes away, for the same reason.
+  await sh(`sudo systemctl stop 9router-free-tier || true`, { check: false });
   // Then drop the kernel lock: the archive upload must not depend on the VPN,
   // and a half-dead tunnel must never turn into a lost backup.
   await clearEgressLock();
