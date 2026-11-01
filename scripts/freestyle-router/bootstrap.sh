@@ -62,6 +62,9 @@ APP_DIR="$PKG_DIR/app"
 [ -d "$APP_DIR" ] || { echo "FATAL: app directory not found under $PKG_DIR"; exit 1; }
 echo "    package -> $PKG_DIR"
 echo "    app dir -> $APP_DIR"
+# runner-router/router.mjs needs the same path to put the zen-proxy wreq-js
+# stand-in where the app's ESM import() looks for it.
+printf '%s\n' "$APP_DIR" | sudo tee /etc/9router-app-dir >/dev/null
 
 # The dedicated account. `--system` keeps it out of the login users; the home is
 # the data dir itself, which the app writes to anyway. Idempotent: re-running a

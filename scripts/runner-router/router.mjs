@@ -1229,6 +1229,22 @@ WantedBy=multi-user.target
       if [ ! -f ${DATA_DIR}/runtime/package.json ]; then
         printf '%s\\n' '{"name":"9router-runtime","private":true}' | sudo tee ${DATA_DIR}/runtime/package.json >/dev/null
       fi
+      # The app's own ESM import("wreq-js") resolves from its install tree, not
+      # from DATA_DIR/runtime (bootstrap.sh copies the real package there). The
+      # stand-in has to win that resolution or 9router keeps posting to the
+      # legacy /inference/v1 base from Node — which is the 429 this shim exists
+      # to prevent. The real package is kept next to it.
+      APP_DIR=$(sudo cat /etc/9router-app-dir 2>/dev/null || true)
+      if [ -n "$APP_DIR" ] && [ -d "$APP_DIR/node_modules" ]; then
+        if [ -d "$APP_DIR/node_modules/wreq-js" ] && [ ! -e "$APP_DIR/node_modules/wreq-js.9router-orig" ]; then
+          sudo mv "$APP_DIR/node_modules/wreq-js" "$APP_DIR/node_modules/wreq-js.9router-orig"
+        fi
+        sudo rm -rf "$APP_DIR/node_modules/wreq-js"
+        sudo cp -a ${DATA_DIR}/runtime/node_modules/wreq-js "$APP_DIR/node_modules/wreq-js"
+        echo "wreq-js: $APP_DIR/node_modules/wreq-js is the shim (real package kept as wreq-js.9router-orig)"
+      else
+        echo "wreq-js: app dir unknown (/etc/9router-app-dir) - the app may still import the real package"
+      fi
       sudo chown -R ${NINE_USER}:${NINE_USER} ${FREE_DIR} ${DATA_DIR}/runtime
       sudo touch ${FREE_LOG}
       sudo chown ${NINE_USER}:${NINE_USER} ${FREE_LOG}
@@ -1310,6 +1326,117 @@ async function probeFreeTier() {
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// Same call the user makes through https://router2.codol.ir/v1/chat/completions,
+// but straight at the local listener: it proves the app itself reaches the shim
+// (and not the legacy OpenCode path). A temporary API key is minted through the
+// dashboard session and deleted again; it never appears on a command line.
+async function probeRouterModel() {
+  log(`• Free tier: the same request through 9router's own /v1 API…`);
+  const dir = await mkdtemp(join(tmpdir(), "9rdiag-"));
+  const jar = join(dir, "cookies");
+  const pwFile = join(dir, "login.json");
+  const keyFile = join(dir, "key.json");
+  const reqFile = join(dir, "chat.json");
+  const keyName = `zen-diag-${Date.now()}`;
+  const base = `http://127.0.0.1:${PORT}`;
+  await writeFile(pwFile, JSON.stringify({ password: process.env.NINE_ROUTER_PASSWORD || "" }), { mode: 0o600 });
+  await writeFile(keyFile, JSON.stringify({ name: keyName }), { mode: 0o600 });
+  await writeFile(
+    reqFile,
+    JSON.stringify({
+      model: `oc/${FREE_MODEL}`,
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: "Reply with the single word: ok" },
+      ],
+      stream: false,
+    }),
+    { mode: 0o600 },
+  );
+
+  let apiKey = "";
+  try {
+    await sh(
+      `curl -s -o /dev/null -c ${jar} -H 'content-type: application/json' --data-binary @${pwFile} ${base}/api/auth/login`,
+      { check: false, timeout: 60_000 },
+    );
+    const created = await sh(
+      `curl -s --max-time 30 -b ${jar} -H 'content-type: application/json' --data-binary @${keyFile} ${base}/api/keys`,
+      { check: false, timeout: 60_000 },
+    );
+    try {
+      const j = JSON.parse(created.out);
+      apiKey = typeof j.key === "string" ? j.key : typeof j.key?.key === "string" ? j.key.key : "";
+    } catch {
+      /* reported below */
+    }
+    if (!apiKey) throw new Error(`could not mint a temporary API key: ${created.out.slice(0, 200)}`);
+
+    const cfg = join(dir, "curl.cfg");
+    await writeFile(cfg, `header = "authorization: Bearer ${apiKey}"\n`, { mode: 0o600 });
+
+    const res = await sh(
+      `curl -s -K ${cfg} -o ${dir}/body.json -w '%{http_code}' --max-time 180 ` +
+        `-H 'content-type: application/json' --data-binary @${reqFile} ${base}/v1/chat/completions`,
+      { check: false, timeout: 240_000 },
+    );
+    const code = res.out.trim();
+    const body = (await readFile(join(dir, "body.json")).catch(() => Buffer.from(""))).toString("utf8");
+    log(`    oc/${FREE_MODEL} → HTTP ${code} ${body.replace(/\s+/g, " ").slice(0, 280)}`);
+    if (code !== "200") {
+      await dumpFreeTierEvidence();
+      throw new Error(
+        `9router answered HTTP ${code} for oc/${FREE_MODEL} — the app is not reaching the shim`,
+      );
+    }
+    return true;
+  } finally {
+    if (apiKey) {
+      const list = await sh(`curl -s --max-time 20 -b ${jar} ${base}/api/keys`, {
+        check: false,
+        timeout: 40_000,
+      });
+      let id = "";
+      try {
+        const keys = JSON.parse(list.out).keys || [];
+        id = keys.find((k) => k.name === keyName)?.id || keys.find((k) => k.key === apiKey)?.id || "";
+      } catch {
+        /* fall through */
+      }
+      if (id) {
+        await sh(`curl -s -o /dev/null -X DELETE -b ${jar} ${base}/api/keys/${id}`, {
+          check: false,
+          timeout: 40_000,
+        });
+      } else {
+        log("    (the temporary key could not be removed — delete zen-diag-* in the dashboard)");
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// What the shim really is (real package vs stand-in), plus the two logs that
+// carry the request: printed only when the end-to-end probe fails.
+async function dumpFreeTierEvidence() {
+  const appDir = (await sh(`sudo cat /etc/9router-app-dir 2>/dev/null || true`, { check: false })).out.trim();
+  if (appDir) {
+    const r = await sh(
+      `sudo head -c 130 ${appDir}/node_modules/wreq-js/index.mjs 2>/dev/null; echo; ` +
+        `sudo ls -ld ${appDir}/node_modules/wreq-js ${appDir}/node_modules/wreq-js.9router-orig 2>/dev/null || true`,
+      { check: false },
+    );
+    for (const line of r.out.split("\n").filter(Boolean)) log(`    wreq: ${line.slice(0, 170)}`);
+  }
+  for (const [label, cmd] of [
+    ["9router", `sudo tail -40 /var/log/9router.log 2>/dev/null || true`],
+    ["zen", `sudo tail -30 ${FREE_LOG} 2>/dev/null || true`],
+  ]) {
+    const r = await sh(cmd, { check: false });
+    for (const line of r.out.split("\n").filter(Boolean).slice(-14)) log(`    ${label}: ${line.slice(0, 200)}`);
   }
 }
 
@@ -1432,6 +1559,9 @@ async function start() {
   await applyProxyDropIn();
   await startRouter();
   await verifyPublic();
+  // The decisive end-to-end check: the app's own /v1 API, the same model the
+  // user calls. Threshold: it must answer 200 before the session is called ready.
+  await probeRouterModel();
 
   // ---- 4. end-to-end ----------------------------------------------------
   try {
