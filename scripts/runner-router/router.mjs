@@ -315,8 +315,47 @@ async function ensureTunnelToken() {
   return await cf(`/accounts/${accountId}/cfd_tunnel/${tunnel.id}/token`);
 }
 
+// The dashboard's "Public Hostname" step also creates the CNAME that makes the
+// name resolve. Doing it here means a session heals itself even if nobody
+// touched the dashboard — the tunnel id is already inside the token.
+async function ensureDns(tunnelToken) {
+  if (!CF.token || !CF.zone) {
+    log("• Tunnel: no CF_API_TOKEN/CF_ZONE_ID — skipping the DNS check");
+    return;
+  }
+  let tunnelId;
+  try {
+    tunnelId = JSON.parse(Buffer.from(tunnelToken, "base64").toString()).t;
+  } catch {
+    log("• Tunnel: cannot read the tunnel id from the token — skipping the DNS check");
+    return;
+  }
+  const target = `${tunnelId}.cfargotunnel.com`;
+  try {
+    const existing = await cf(`/zones/${CF.zone}/dns_records?name=${encodeURIComponent(DOMAIN)}`);
+    const current = existing?.[0];
+    if (current?.type === "CNAME" && current?.content === target) {
+      log(`• Tunnel: DNS ${DOMAIN} → ${target} already correct`);
+      return;
+    }
+    const record = { type: "CNAME", name: DOMAIN, content: target, proxied: true, ttl: 1 };
+    if (current) {
+      await cf(`/zones/${CF.zone}/dns_records/${current.id}`, { method: "PUT", body: JSON.stringify(record) });
+      log(`• Tunnel: DNS ${DOMAIN} → ${target} updated`);
+    } else {
+      await cf(`/zones/${CF.zone}/dns_records`, { method: "POST", body: JSON.stringify(record) });
+      log(`• Tunnel: DNS ${DOMAIN} → ${target} created`);
+    }
+  } catch (err) {
+    // Not fatal: the record may already be right, and the public probe below
+    // reports the real state.
+    log(`• Tunnel: DNS check skipped (${err.message})`);
+  }
+}
+
 async function startTunnel() {
   const token = await ensureTunnelToken();
+  await ensureDns(token);
 
   log("• Tunnel: installing cloudflared…");
   await must(
