@@ -340,25 +340,70 @@ rm -f "$RES"
 exec >>"$LOG" 2>&1
 echo "redirect start $(date -u +%H:%M:%S)"
 
+# The VPN's own upstream connections must not be caught by the redirect, or
+# they are fed straight back into redsocks and the tunnel recurses into
+# itself. The only reliable way to exclude them is -m owner --uid-owner, which
+# needs the xt_owner module. iptables-nft does NOT autoload it (measured:
+# "Extension owner revision 0 not supported, missing kernel module?" and two
+# silently dropped rules); the legacy backend does. Pick whichever works and
+# refuse the redirect if neither does — a half-applied chain looks fine for
+# the current session and then kills the tunnel on the first reconnect.
+modprobe xt_owner 2>/dev/null || true
+probe_owner() {
+  $1 -t nat -N AWMVPNT 2>/dev/null || $1 -t nat -F AWMVPNT 2>/dev/null
+  $1 -t nat -A AWMVPNT -m owner --uid-owner 0 -j RETURN 2>/dev/null
+  rc=$?
+  $1 -t nat -F AWMVPNT 2>/dev/null
+  $1 -t nat -X AWMVPNT 2>/dev/null
+  return $rc
+}
+IPT=""
+for c in iptables iptables-legacy; do
+  command -v $c >/dev/null 2>&1 || continue
+  if probe_owner $c; then IPT=$c; echo "owner matching: $c"; break; fi
+  echo "owner matching: $c unavailable"
+done
+if [ -z "$IPT" ]; then
+  echo "RESULT=unsupported owner=no" > "$RES"
+  chmod 644 "$RES" "$LOG" 2>/dev/null
+  exit 0
+fi
+
 revert() {
-  iptables -t nat -D OUTPUT -j AWMVPN 2>/dev/null
-  iptables -t nat -F AWMVPN 2>/dev/null
-  iptables -t nat -X AWMVPN 2>/dev/null
+  for c in "$IPT" iptables iptables-legacy; do
+    command -v $c >/dev/null 2>&1 || continue
+    $c -t nat -D OUTPUT -j AWMVPN 2>/dev/null
+    $c -t nat -F AWMVPN 2>/dev/null
+    $c -t nat -X AWMVPN 2>/dev/null
+  done
 }
 
 revert
-iptables -t nat -N AWMVPN
-iptables -t nat -A AWMVPN -d 127.0.0.0/8 -j RETURN
-iptables -t nat -A AWMVPN -d 10.0.0.0/8 -j RETURN
-iptables -t nat -A AWMVPN -d 172.16.0.0/12 -j RETURN
-iptables -t nat -A AWMVPN -d 192.168.0.0/16 -j RETURN
-iptables -t nat -A AWMVPN -d 169.254.0.0/16 -j RETURN
-iptables -t nat -A AWMVPN -d 100.64.0.0/10 -j RETURN
-iptables -t nat -A AWMVPN -m owner --uid-owner ${vpnUid} -j RETURN
-iptables -t nat -A AWMVPN -m owner --uid-owner ${redsocksUid} -j RETURN
-iptables -t nat -A AWMVPN -p tcp -j REDIRECT --to-ports ${REDSOCKS_PORT}
-iptables -t nat -I OUTPUT 1 -j AWMVPN
-echo "rules installed: $(iptables -t nat -S AWMVPN | wc -l) lines"
+$IPT -t nat -N AWMVPN
+$IPT -t nat -A AWMVPN -d 127.0.0.0/8 -j RETURN
+$IPT -t nat -A AWMVPN -d 10.0.0.0/8 -j RETURN
+$IPT -t nat -A AWMVPN -d 172.16.0.0/12 -j RETURN
+$IPT -t nat -A AWMVPN -d 192.168.0.0/16 -j RETURN
+$IPT -t nat -A AWMVPN -d 169.254.0.0/16 -j RETURN
+$IPT -t nat -A AWMVPN -d 100.64.0.0/10 -j RETURN
+$IPT -t nat -A AWMVPN -m owner --uid-owner ${vpnUid} -j RETURN
+$IPT -t nat -A AWMVPN -m owner --uid-owner ${redsocksUid} -j RETURN
+$IPT -t nat -A AWMVPN -p tcp -j REDIRECT --to-ports ${REDSOCKS_PORT}
+$IPT -t nat -I OUTPUT 1 -j AWMVPN
+echo "rules installed: $($IPT -t nat -S AWMVPN | wc -l) lines"
+echo "owner rules: $($IPT -t nat -S AWMVPN | grep -c 'owner')"
+
+EXPECTED="${expectedIp}"
+RUNNER="${runnerIp}"
+verdict() {
+  if [ -z "$1" ]; then
+    echo "no egress"
+  elif [ -n "$RUNNER" ] && [ "$1" = "$RUNNER" ]; then
+    echo "still_runner_ip=$1"
+  else
+    echo "ok egress=$1"
+  fi
+}
 
 OK=""
 for i in $(seq 1 6); do
@@ -368,25 +413,45 @@ for i in $(seq 1 6); do
   if [ -n "$IP" ]; then OK="$IP"; break; fi
 done
 
-EXPECTED="${expectedIp}"
-RUNNER="${runnerIp}"
-if [ -z "$OK" ]; then
-  echo "no egress after the redirect — reverting"
+if [ -z "$OK" ] || { [ -n "$RUNNER" ] && [ "$OK" = "$RUNNER" ]; }; then
+  echo "the redirect does not carry traffic ($(verdict "$OK")) — reverting"
   revert
   sleep 3
   BACK=$(curl -s --max-time 15 https://api.ipify.org || true)
   echo "RESULT=failed reverted_egress=\${BACK:-none}" > "$RES"
-elif [ -n "$RUNNER" ] && [ "$OK" = "$RUNNER" ]; then
-  echo "egress is still the runner IP ($OK) — the redirect is not in effect"
-  revert
-  sleep 3
-  echo "RESULT=failed still_runner_ip=\${OK}" > "$RES"
-elif [ -n "$EXPECTED" ] && [ "$OK" != "$EXPECTED" ]; then
-  echo "egress $OK differs from the VPN exit IP $EXPECTED — keeping the redirect"
-  echo "RESULT=ok egress=$OK expected=$EXPECTED" > "$RES"
-else
-  echo "RESULT=ok egress=$OK" > "$RES"
+  chmod 644 "$RES" "$LOG" 2>/dev/null
+  exit 0
 fi
+
+# A working first probe proves nothing on its own: the tunnel was opened BEFORE
+# these rules existed, so its upstream connection is already established and
+# never passes through nat/OUTPUT again. Restart the VPN so it dials out through
+# the new chain — that is the real test that the owner exclusion is in place.
+echo "restarting the VPN to force a reconnect through the redirect"
+systemctl restart awmvpn
+OK2=""
+for i in $(seq 1 6); do
+  sleep 5
+  IP=$(curl -s --max-time 20 https://api.ipify.org || true)
+  echo "post-restart probe $i egress=\${IP:-none}"
+  if [ -n "$IP" ]; then OK2="$IP"; break; fi
+done
+
+if [ -z "$OK2" ] || { [ -n "$RUNNER" ] && [ "$OK2" = "$RUNNER" ]; }; then
+  echo "the tunnel does not survive a reconnect through the redirect ($(verdict "$OK2")) — reverting"
+  revert
+  systemctl restart awmvpn
+  sleep 3
+  echo "RESULT=failed reconnect=\${OK2:-none}" > "$RES"
+  chmod 644 "$RES" "$LOG" 2>/dev/null
+  exit 0
+fi
+
+if [ -n "$EXPECTED" ] && [ "$OK2" != "$EXPECTED" ]; then
+  echo "note: egress $OK2 differs from the VPN exit IP $EXPECTED"
+fi
+echo "RESULT=ok egress=$OK2"
+echo "RESULT=ok egress=$OK2" > "$RES"
 chmod 644 "$RES" "$LOG" 2>/dev/null
 echo "redirect done"
 `;
@@ -410,9 +475,14 @@ tail -n 6 /tmp/awmvpn-redirect.log 2>/dev/null || true`,
       180_000,
     );
     for (const line of poll.split("\n").filter(Boolean)) log(`    ${line}`);
-    const m = poll.match(/RESULT=(ok|failed)\b[^\n]*/);
+    const m = poll.match(/RESULT=(ok|failed|unsupported)\b[^\n]*/);
     if (!m) continue;
     if (m[1] === "ok") return true;
+    if (m[1] === "unsupported") {
+      log("    this kernel cannot match a process owner in iptables (no xt_owner),");
+      log("    so the VPN's own traffic cannot be excluded — refusing the redirect.");
+      return false;
+    }
     return false;
   }
   log("    redirect verdict still pending — leaving the direct route in place");
@@ -422,9 +492,10 @@ tail -n 6 /tmp/awmvpn-redirect.log 2>/dev/null || true`,
 async function clearTransparent(vm) {
   await tryRun(
     vm,
-    `sudo iptables -t nat -D OUTPUT -j AWMVPN 2>/dev/null; \
-     sudo iptables -t nat -F AWMVPN 2>/dev/null; \
-     sudo iptables -t nat -X AWMVPN 2>/dev/null; echo cleared`,
+    `for c in iptables iptables-legacy; do command -v $c >/dev/null 2>&1 || continue; \
+       sudo $c -t nat -D OUTPUT -j AWMVPN 2>/dev/null; \
+       sudo $c -t nat -F AWMVPN 2>/dev/null; \
+       sudo $c -t nat -X AWMVPN 2>/dev/null; done; echo cleared`,
     60_000,
   );
 }
