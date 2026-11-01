@@ -48,6 +48,11 @@ const TRANSPORT = (process.env.FXA_TRANSPORT || "h2").toLowerCase() === "h3" ? "
 const UPSTREAM = Math.max(1, Math.min(16, Number(process.env.FXA_UPSTREAM_CONNECTIONS || 4)));
 const FREE_COUNTRIES = ["ar", "au", "de", "jp", "us", "za"];
 
+// The SOCKS5 login never leaves loopback, so it is generated here instead of
+// being passed through the step environment — GitHub echoes every env entry
+// into the (public) log.
+const PROXY_PASS = process.env.FXA_PROXY_PASS || randomBytes(12).toString("hex");
+
 // "Whole machine" still has to leave the job's own control channel alone: if the
 // agent cannot reach github.com the run is declared lost and everything above is
 // thrown away. Set VPN_EXCLUDE_RUNNER=false to send it through the tunnel too.
@@ -252,15 +257,28 @@ async function ensureTunnelToken() {
   }
   if (!accountId) throw new Error("CF_API_TOKEN has no account to create the tunnel in");
 
-  let tunnel = (await cf(`/accounts/${accountId}/cfd_tunnel?name=${encodeURIComponent(CF.tunnelName)}&is_deleted=false`))?.[0];
-  if (tunnel) {
-    log(`• Tunnel: reusing "${CF.tunnelName}" (${tunnel.id})`);
-  } else {
-    tunnel = await cf(`/accounts/${accountId}/cfd_tunnel`, {
-      method: "POST",
-      body: JSON.stringify({ name: CF.tunnelName, config_src: "cloudflare" }),
-    });
-    log(`• Tunnel: created "${CF.tunnelName}" (${tunnel.id})`);
+  let tunnel;
+  try {
+    tunnel = (await cf(`/accounts/${accountId}/cfd_tunnel?name=${encodeURIComponent(CF.tunnelName)}&is_deleted=false`))?.[0];
+    if (tunnel) {
+      log(`• Tunnel: reusing "${CF.tunnelName}" (${tunnel.id})`);
+    } else {
+      tunnel = await cf(`/accounts/${accountId}/cfd_tunnel`, {
+        method: "POST",
+        body: JSON.stringify({ name: CF.tunnelName, config_src: "cloudflare" }),
+      });
+      log(`• Tunnel: created "${CF.tunnelName}" (${tunnel.id})`);
+    }
+  } catch (err) {
+    throw new Error(
+      `CF_API_TOKEN cannot manage Cloudflare Tunnels (${err.message}).\n` +
+        `    Fix either one:\n` +
+        `      1. Cloudflare dashboard → My Profile → API Tokens → edit the token and add\n` +
+        `         "Account → Cloudflare Tunnel → Edit", or\n` +
+        `      2. Zero Trust → Networks → Tunnels → Create a tunnel (Cloudflared),\n` +
+        `         public hostname ${DOMAIN} → http://localhost:${PORT},\n` +
+        `         then store its token as the CF_TUNNEL_TOKEN secret.`,
+    );
   }
 
   await cf(`/accounts/${accountId}/cfd_tunnel/${tunnel.id}/configurations`, {
@@ -458,7 +476,7 @@ function vpnConfig(country) {
       proxy: {
         listen: `127.0.0.1:${VPN_PORT}`,
         username: "router",
-        password: process.env.FXA_PROXY_PASS || "routerpass",
+        password: PROXY_PASS,
         country,
         transport: TRANSPORT,
         // One upstream connection multiplexes every TCP flow through a single
@@ -516,7 +534,7 @@ WantedBy=multi-user.target
 async function vpnProbe() {
   const r = await sh(
     `curl -s --max-time 15 --socks5-hostname 127.0.0.1:${VPN_PORT} ` +
-      `--proxy-user 'router:${process.env.FXA_PROXY_PASS || "routerpass"}' https://api.ipify.org`,
+      `--proxy-user 'router:${PROXY_PASS}' https://api.ipify.org`,
     { check: false, timeout: 60_000 },
   );
   const ip = r.out.trim();
@@ -584,7 +602,7 @@ CONF
     sudo systemctl restart redsocks
     sleep 1
     systemctl is-active redsocks
-  `, { env: { FXA_PASS: process.env.FXA_PROXY_PASS || "routerpass" }, timeout: 420_000 });
+  `, { env: { FXA_PASS: PROXY_PASS }, timeout: 420_000 });
   for (const line of out.split("\n").filter(Boolean)) log(`    ${line}`);
 
   const r = await sh(`
@@ -732,7 +750,7 @@ async function start() {
   const vpn = await bringUpVpn();
   const redirected = await redirectEverything(vpn.ip, process.env.RUNNER_PUBLIC_IP || "");
 
-  const socks = `socks5h://router:${process.env.FXA_PROXY_PASS || "routerpass"}@127.0.0.1:${VPN_PORT}`;
+  const socks = `socks5h://router:${PROXY_PASS}@127.0.0.1:${VPN_PORT}`;
   await exportEnv({
     FXA_SOCKS5: socks,
     FXA_COUNTRY: vpn.country || "auto",
