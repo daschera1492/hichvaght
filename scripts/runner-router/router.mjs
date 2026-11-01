@@ -958,11 +958,14 @@ async function stop() {
     const out = await must(`
       set -e
       sudo systemctl stop 9router || true
-      # A start that failed before the install finished must not turn the
+      # /root is 0700, so an unprivileged test(1) cannot even stat inside it and
+      # would report the data dir as missing — which is exactly what happened:
+      # every session logged NO_DATA_DIR and silently kept the October backup.
+      # A start that failed before the install finished must still not turn the
       # always() archive step into a second, unrelated failure.
-      if [ ! -d ${DATA_DIR} ]; then echo "NO_DATA_DIR"; exit 0; fi
-      cd ${DATA_DIR}
-      sudo tar czf ${file} db 9router-export.json jwt-secret 2>/dev/null || sudo tar czf ${file} db
+      if ! sudo test -d ${DATA_DIR}; then echo "NO_DATA_DIR"; exit 0; fi
+      sudo bash -c "cd ${DATA_DIR} || exit 1
+        tar czf ${file} db 9router-export.json jwt-secret 2>/dev/null || tar czf ${file} db"
       sudo chmod 644 ${file}
       ls -l ${file}
     `, { timeout: 300_000 });
