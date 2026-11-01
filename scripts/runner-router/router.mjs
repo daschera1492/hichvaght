@@ -1280,12 +1280,16 @@ async function probeFreeTier() {
     for (let attempt = 1; attempt <= 3; attempt++) {
       const out = await must(`
         set -e
-        code=$(sudo -u ${NINE_USER} -- curl -s -o ${dir}/res.json -w '%{http_code}' --max-time 180 \
+        # mkdtemp gives 0700/root, and the probe must run as ${NINE_USER}: without
+        # this the body file is unreadable and curl exits before any request.
+        chmod 0755 ${dir}
+        chmod 0644 ${req}
+        got=$(sudo -u ${NINE_USER} -- curl -s -w '\\n%{http_code}' --max-time 180 \
           -H 'content-type: application/json' --data-binary @${req} \
-          http://127.0.0.1:${FREE_PORT}/v1/chat/completions || true)
-        echo "HTTP \${code:-none}"
-        head -c 600 ${dir}/res.json 2>/dev/null || true
-        echo
+          http://127.0.0.1:${FREE_PORT}/v1/chat/completions 2>&1 || true)
+        code=$(printf '%s' "$got" | tail -n1)
+        body=$(printf '%s' "$got" | sed '$d' | head -c 600)
+        printf 'HTTP %s\\n%s\\n' "\${code:-none}" "$body"
       `, { timeout: 240_000 });
       const code = (out.match(/^HTTP (\S+)/m) || [])[1] || "none";
       const body = out.replace(/^HTTP \S+/m, "").trim();
