@@ -35,7 +35,7 @@ on:
           - with-backup
           - fresh
       fxa_country:
-        description: "لوکیشن VPN — از قبل تعریف‌شده انتخاب کن (random = هر بار یک کشور آزاد، auto = بهترین لوکیشن Mozilla)"
+        description: "لوکیشن VPN — فقط ۶ کشور رایگان Mozilla: ar au de jp us za (random = یکی از همین‌ها، auto = بهترین لوکیشن). MX/BR/CA/FR و… فقط با اشتراک پولی Mozilla VPN."
         type: choice
         default: random
         options:
