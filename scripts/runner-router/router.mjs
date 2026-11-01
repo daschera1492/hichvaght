@@ -65,6 +65,7 @@ const NINE_LOCK_TABLE = "inet nine_lock";
 const FREE_DIR = `${DATA_DIR}/zen`;
 const FREE_LOG = "/var/log/9router-zen.log";
 const FREE_PORT = Number(process.env.ZEN_PORT || 8787);
+const FREE_ZEN_PORT = Number(process.env.ZEN_UPSTREAM_PORT || 8788);
 const FREE_UPSTREAM = "https://opencode.ai/inference/openai/v1";
 const FREE_MODEL = process.env.ZEN_PROBE_MODEL || "deepseek-v4.1-flash-free";
 const BUN_VERSION = process.env.BUN_VERSION || "1.4.4";
@@ -1142,7 +1143,7 @@ async function installBun() {
 //   * a wreq-js stand-in in ${DATA_DIR}/runtime, which 9router loads for its
 //     free-tier transport and which forwards those calls to the proxy.
 async function installFreeTier() {
-  log(`• Free tier: installing the OpenCode gateway shim on 127.0.0.1:${FREE_PORT}…`);
+  log(`• Free tier: installing the gateway shim (zen-proxy :${FREE_ZEN_PORT} + compat :${FREE_PORT})…`);
   await installBun();
 
   const src = join(here, "zen");
@@ -1150,6 +1151,8 @@ async function installFreeTier() {
   for (const f of assets) await readFile(join(src, f)); // fail early, clear error
   const shim = ["package.json", "index.mjs"];
   for (const f of shim) await readFile(join(src, "wreq-shim", f));
+  const compat = join(here, "free-tier-compat.mjs");
+  await readFile(compat);
 
   const dir = await mkdtemp(join(tmpdir(), "zen-"));
   const conf = join(dir, "zen-proxy.json");
@@ -1158,7 +1161,7 @@ async function installFreeTier() {
     JSON.stringify(
       {
         host: "127.0.0.1",
-        port: FREE_PORT,
+        port: FREE_ZEN_PORT,
         upstream: FREE_UPSTREAM,
         ua: "opencode/latest/2.1.4/cli",
         clientName: "cli",
@@ -1194,8 +1197,8 @@ async function installFreeTier() {
     { mode: 0o644 },
   );
 
-  const unit = `[Unit]
-Description=OpenCode free-tier gateway shim for 9router
+  const zenUnit = `[Unit]
+Description=OpenCode free-tier gateway (zen-proxy on Bun) for 9router
 After=network-online.target
 Wants=network-online.target
 
@@ -1215,8 +1218,34 @@ StandardError=append:${FREE_LOG}
 [Install]
 WantedBy=multi-user.target
 `;
-  const unitPath = join(dir, "9router-free-tier.service");
-  await writeFile(unitPath, unit);
+  // The front the app actually talks to: it accepts whatever path 9router
+  // builds and forwards to zen-proxy, which is the stack the gateway accepts.
+  const compatUnit = `[Unit]
+Description=9router OpenCode free-tier compatibility front
+After=network-online.target 9router-free-tier.service
+Wants=network-online.target
+Requires=9router-free-tier.service
+
+[Service]
+Type=simple
+User=${NINE_USER}
+Group=${NINE_USER}
+Environment=HOME=${DATA_DIR}
+Environment=FREE_TIER_LISTEN=127.0.0.1:${FREE_PORT}
+Environment=FREE_TIER_UPSTREAM=http://127.0.0.1:${FREE_ZEN_PORT}
+ExecStart=${process.execPath} ${FREE_DIR}/free-tier-compat.mjs
+Restart=always
+RestartSec=3
+StandardOutput=append:${FREE_LOG}
+StandardError=append:${FREE_LOG}
+
+[Install]
+WantedBy=multi-user.target
+`;
+  const zenUnitPath = join(dir, "9router-free-tier.service");
+  const compatUnitPath = join(dir, "9router-free-tier-compat.service");
+  await writeFile(zenUnitPath, zenUnit);
+  await writeFile(compatUnitPath, compatUnit);
 
   try {
     const out = await must(`
@@ -1245,13 +1274,48 @@ WantedBy=multi-user.target
       else
         echo "wreq-js: app dir unknown (/etc/9router-app-dir) - the app may still import the real package"
       fi
+      sudo install -m 0644 ${compat} ${FREE_DIR}/free-tier-compat.mjs
+      # The app's own ESM import("wreq-js") resolves from its install tree, not
+      # from DATA_DIR/runtime (bootstrap.sh copies the real package there). The
+      # stand-in has to win that resolution or 9router keeps posting to the
+      # legacy /inference/v1 base from Node — which is the 429 this shim exists
+      # to prevent. The real package is kept next to it.
+      APP_DIR=$(sudo cat /etc/9router-app-dir 2>/dev/null || true)
+      if [ -n "$APP_DIR" ] && [ -d "$APP_DIR/node_modules" ]; then
+        if [ -d "$APP_DIR/node_modules/wreq-js" ] && [ ! -e "$APP_DIR/node_modules/wreq-js.9router-orig" ]; then
+          sudo mv "$APP_DIR/node_modules/wreq-js" "$APP_DIR/node_modules/wreq-js.9router-orig"
+        fi
+        sudo rm -rf "$APP_DIR/node_modules/wreq-js"
+        sudo cp -a ${DATA_DIR}/runtime/node_modules/wreq-js "$APP_DIR/node_modules/wreq-js"
+        echo "wreq-js: $APP_DIR/node_modules/wreq-js is the shim (real package kept as wreq-js.9router-orig)"
+      else
+        echo "wreq-js: app dir unknown (/etc/9router-app-dir) - the app may still import the real package"
+      fi
+      # The decisive patch: point the built-in "oc" provider at the compat front.
+      # Measured on the runner, 9router did not use its wreq-js transport for this
+      # provider at all — it posted to https://opencode.ai/inference/v1/... from
+      # Node and the shim stayed idle. Rewriting the base URL intercepts the
+      # traffic whatever transport it chooses.
+      if [ -n "$APP_DIR" ]; then
+        files=$(sudo grep -rl 'baseUrl:"https://opencode.ai"' "$APP_DIR" 2>/dev/null || true)
+        if [ -n "$files" ]; then
+          printf '%s\\n' "$files" | while IFS= read -r f; do
+            sudo sed -i 's|baseUrl:"https://opencode.ai"|baseUrl:"http://127.0.0.1:${FREE_PORT}"|g' "$f"
+          done
+          echo "9router: oc base URL -> http://127.0.0.1:${FREE_PORT} in $(printf '%s\\n' "$files" | grep -c . ) file(s)"
+        else
+          echo "9router: no 'baseUrl:\\"https://opencode.ai\\"' found — check whether the app changed shape"
+        fi
+      fi
       sudo chown -R ${NINE_USER}:${NINE_USER} ${FREE_DIR} ${DATA_DIR}/runtime
       sudo touch ${FREE_LOG}
       sudo chown ${NINE_USER}:${NINE_USER} ${FREE_LOG}
-      sudo install -m 0644 ${unitPath} /etc/systemd/system/9router-free-tier.service
+      sudo install -m 0644 ${zenUnitPath} /etc/systemd/system/9router-free-tier.service
+      sudo install -m 0644 ${compatUnitPath} /etc/systemd/system/9router-free-tier-compat.service
       sudo systemctl daemon-reload
-      sudo systemctl enable 9router-free-tier >/dev/null 2>&1 || true
+      sudo systemctl enable 9router-free-tier 9router-free-tier-compat >/dev/null 2>&1 || true
       sudo systemctl restart 9router-free-tier
+      sudo systemctl restart 9router-free-tier-compat
       for i in $(seq 1 45); do
         body=$(curl -s --max-time 5 http://127.0.0.1:${FREE_PORT}/health || true)
         case "$body" in
@@ -1259,8 +1323,8 @@ WantedBy=multi-user.target
         esac
         sleep 1
       done
-      echo "the free-tier shim did not come up"
-      sudo systemctl status 9router-free-tier --no-pager || true
+      echo "the free-tier front did not come up"
+      sudo systemctl status 9router-free-tier 9router-free-tier-compat --no-pager || true
       sudo tail -40 ${FREE_LOG} || true
       exit 1
     `, { timeout: 900_000 });
@@ -1430,6 +1494,12 @@ async function dumpFreeTierEvidence() {
       { check: false },
     );
     for (const line of r.out.split("\n").filter(Boolean)) log(`    wreq: ${line.slice(0, 170)}`);
+    const patched = await sh(
+      `sudo grep -rho 'baseUrl:"http://127.0.0.1:[0-9]*"' ${appDir}/.next-cli-build 2>/dev/null | sort -u | head -3`,
+      { check: false },
+    );
+    for (const line of patched.out.split("\n").filter(Boolean)) log(`    app: ${line}`);
+    if (!patched.out.trim()) log("    app: no patched baseUrl found — the oc provider still points upstream");
   }
   for (const [label, cmd] of [
     ["9router", `sudo tail -40 /var/log/9router.log 2>/dev/null || true`],
@@ -1618,9 +1688,9 @@ async function stop() {
   // Order matters: stop the app BEFORE the lock is dropped, so no request can
   // slip out on the runner's direct route in between.
   await sh(`sudo systemctl stop 9router || true`, { check: false });
-  // The free-tier shim makes upstream calls as the same uid; stop it before the
-  // lock goes away, for the same reason.
-  await sh(`sudo systemctl stop 9router-free-tier || true`, { check: false });
+  // The free-tier front and its upstream call out as the same uid; stop them
+  // before the lock goes away, for the same reason.
+  await sh(`sudo systemctl stop 9router-free-tier-compat 9router-free-tier || true`, { check: false });
   // Then drop the kernel lock: the archive upload must not depend on the VPN,
   // and a half-dead tunnel must never turn into a lost backup.
   await clearEgressLock();
