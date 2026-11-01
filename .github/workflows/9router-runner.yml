@@ -2,11 +2,15 @@ name: 9Router (runner only)
 
 # Same job as 9router-lifecycle.yml, with no Freestyle VM and no Tailscale:
 #
-#   cloudflared ──► 127.0.0.1:20128   the public entry for router2.codol.ir
-#   9router     ──► systemd (root), same /root/.9router as before
-#   awmvpn-core ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
-#   iptables    ──► whole machine egresses through it, except the tunnel, the
-#                   VPN itself and the job's control channel
+#   cloudflared  ──► 127.0.0.1:20128   the public entry for router2.codol.ir
+#   9router      ──► systemd (root), same /root/.9router as before
+#   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
+#   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118 → that SOCKS5
+#
+# 9router's own outbound-proxy setting sends its provider calls through the VPN.
+# iptables is not used: the runner kernel has no xt_owner, so a transparent
+# redirect could not exempt the VPN from itself. Everything else on the machine
+# (the tunnel, the Actions agent) keeps the runner's direct route.
 #
 # A GitHub runner has no public inbound port, so the domain reaches it through a
 # Cloudflare Tunnel. Nothing has to be created by hand: if CF_TUNNEL_TOKEN is
@@ -76,9 +80,9 @@ jobs:
       FXA_TRIES: "3"
       FXA_UPSTREAM_CONNECTIONS: "4"
 
-      # Whole machine, minus the pieces that must stay direct to survive:
-      # cloudflared (the entry point), the VPN itself, and the Actions agent.
-      VPN_EXCLUDE_RUNNER: "true"
+      # Egress scope: 9router's provider calls go through the VPN (its own
+      # outbound-proxy setting, applied by router.mjs). The tunnel and the
+      # Actions agent stay on the runner's direct route on purpose.
 
       # State travels through the same encrypted release asset the VM sessions
       # write, so the existing database is picked up unchanged.
@@ -103,7 +107,8 @@ jobs:
       # Per-run only: the SOCKS5 login is generated inside router.mjs, never in
       # the step environment (which GitHub prints into the public log).
 
-      # Tunnel, 9router, state restore, VPN, and the whole-machine redirect.
+      # Tunnel, 9router, state restore, VPN, then the outbound proxy and the
+      # end-to-end check that provider traffic really leaves through it.
       - name: Start 9Router and the VPN
         timeout-minutes: 50
         run: node scripts/runner-router/router.mjs start
@@ -113,6 +118,7 @@ jobs:
           echo "URL      : https://${ROUTER_DOMAIN}/dashboard"
           echo "runner   : ${RUNNER_PUBLIC_IP}"
           echo "scope    : ${FXA_VPN_SCOPE:-none} country=${FXA_COUNTRY:-?} exit=${FXA_EXIT_IP:-?}"
+          echo "proxy    : ${FXA_HTTP_PROXY:-none} verified=${FXA_VPN_VERIFIED:-0}"
           echo "SOCKS5   : 127.0.0.1:10810 (per-run password, not printed)"
 
       - name: Keep session alive until the deadline
