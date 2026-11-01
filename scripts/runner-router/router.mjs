@@ -58,10 +58,12 @@ const BRIDGE_LOG = "/var/log/9router-bridge.log";
 const REDSOCKS_PORT = Number(process.env.FXA_REDSOCKS_PORT || 12345);
 const REDSOCKS_CONF = "/etc/redsocks.conf";
 const NINE_LOCK_TABLE = "inet nine_lock";
-// OpenCode free-tier shim: 9router's `oc` transport is redirected (through a
-// local wreq-js stand-in) to this loopback proxy, which speaks the wire shape
-// the free-tier gateway accepts. It runs as the same unprivileged user, so the
-// kernel egress lock covers its upstream calls too.
+// OpenCode free tier: the gateway only answers requests that use the
+// /inference/openai/v1 base, a browser-like TLS stack and the harness preamble.
+// 9router's built-in `oc` transport uses the legacy /inference/v1 base from Node,
+// so its calls are routed (by patching that provider's base URL) to a local
+// compat front, which forwards to zen-proxy on Bun. Both run as the same
+// unprivileged user, so the kernel egress lock covers their upstream calls too.
 const FREE_DIR = `${DATA_DIR}/zen`;
 const FREE_LOG = "/var/log/9router-zen.log";
 const FREE_PORT = Number(process.env.ZEN_PORT || 8787);
@@ -1095,7 +1097,7 @@ async function clearEgressLock() {
   await sh(`sudo nft delete table ${NINE_LOCK_TABLE} 2>/dev/null || true`, { check: false });
 }
 
-// ------------------------------------------------- OpenCode free-tier shim
+// ------------------------------------------------- OpenCode free tier
 // 9router's built-in `oc` transport cannot reach OpenCode's free models from
 // Node: the gateway refuses the legacy /inference/v1 base, Node's TLS stack and
 // any request without the harness preamble with 429 FreeUsageLimitError —
@@ -1103,8 +1105,8 @@ async function clearEgressLock() {
 // over a home connection alike, while the real CLI streams 200 in the same
 // second). zen-proxy speaks the accepted wire shape from Bun. It runs as the
 // same unprivileged user as 9router, so its upstream calls sit inside the
-// kernel lock, and the wreq-js stand-in below points 9router's free-tier
-// transport at it over loopback.
+// kernel lock; 9router reaches it through a compat front on loopback, after the
+// `oc` provider's base URL is rewritten below.
 async function installBun() {
   log(`• Free tier: making sure Bun ${BUN_VERSION} is installed (Node's TLS stack is refused)…`);
   const have = await sh(`command -v bun >/dev/null 2>&1 && bun --version || true`, { check: false });
@@ -1137,22 +1139,21 @@ async function installBun() {
   }
 }
 
-// Installs three things and starts the proxy:
+// Installs four things and starts the free-tier stack:
 //   * the vendored zen-proxy assets (see scripts/runner-router/zen/NOTICE.md),
 //   * a systemd unit that runs it as ${NINE_USER} on loopback only,
-//   * a wreq-js stand-in in ${DATA_DIR}/runtime, which 9router loads for its
-//     free-tier transport and which forwards those calls to the proxy.
+//   * a compat front in front of it, which accepts the paths 9router builds,
+//   * a base-URL patch on the app's `oc` provider, so that traffic arrives here.
 async function installFreeTier() {
-  log(`• Free tier: installing the gateway shim (zen-proxy :${FREE_ZEN_PORT} + compat :${FREE_PORT})…`);
+  log(`• Free tier: installing the gateway (zen-proxy :${FREE_ZEN_PORT} + compat :${FREE_PORT})…`);
   await installBun();
 
   const src = join(here, "zen");
   const assets = ["zen-proxy.mjs", "agent-preamble.txt", "agent-tools.json", "models.json", "LICENSE"];
   for (const f of assets) await readFile(join(src, f)); // fail early, clear error
-  const shim = ["package.json", "index.mjs"];
-  for (const f of shim) await readFile(join(src, "wreq-shim", f));
   const compat = join(here, "free-tier-compat.mjs");
   await readFile(compat);
+  await readFile(join(src, "wreq-probe.mjs"));
 
   const dir = await mkdtemp(join(tmpdir(), "zen-"));
   const conf = join(dir, "zen-proxy.json");
@@ -1250,46 +1251,25 @@ WantedBy=multi-user.target
   try {
     const out = await must(`
       set -e
-      sudo mkdir -p ${FREE_DIR} ${DATA_DIR}/runtime/node_modules/wreq-js
+      sudo mkdir -p ${FREE_DIR}
       ${assets.map((f) => `sudo install -m 0644 ${join(src, f)} ${FREE_DIR}/${f}`).join("\n      ")}
       sudo install -m 0644 ${conf} ${FREE_DIR}/zen-proxy.json
-      sudo install -m 0644 ${join(src, "wreq-shim", "package.json")} ${DATA_DIR}/runtime/node_modules/wreq-js/package.json
-      sudo install -m 0644 ${join(src, "wreq-shim", "index.mjs")} ${DATA_DIR}/runtime/node_modules/wreq-js/index.mjs
-      if [ ! -f ${DATA_DIR}/runtime/package.json ]; then
-        printf '%s\\n' '{"name":"9router-runtime","private":true}' | sudo tee ${DATA_DIR}/runtime/package.json >/dev/null
-      fi
-      # The app's own ESM import("wreq-js") resolves from its install tree, not
-      # from DATA_DIR/runtime (bootstrap.sh copies the real package there). The
-      # stand-in has to win that resolution or 9router keeps posting to the
-      # legacy /inference/v1 base from Node — which is the 429 this shim exists
-      # to prevent. The real package is kept next to it.
-      APP_DIR=$(sudo cat /etc/9router-app-dir 2>/dev/null || true)
-      if [ -n "$APP_DIR" ] && [ -d "$APP_DIR/node_modules" ]; then
-        if [ -d "$APP_DIR/node_modules/wreq-js" ] && [ ! -e "$APP_DIR/node_modules/wreq-js.9router-orig" ]; then
-          sudo mv "$APP_DIR/node_modules/wreq-js" "$APP_DIR/node_modules/wreq-js.9router-orig"
-        fi
-        sudo rm -rf "$APP_DIR/node_modules/wreq-js"
-        sudo cp -a ${DATA_DIR}/runtime/node_modules/wreq-js "$APP_DIR/node_modules/wreq-js"
-        echo "wreq-js: $APP_DIR/node_modules/wreq-js is the shim (real package kept as wreq-js.9router-orig)"
-      else
-        echo "wreq-js: app dir unknown (/etc/9router-app-dir) - the app may still import the real package"
-      fi
       sudo install -m 0644 ${compat} ${FREE_DIR}/free-tier-compat.mjs
-      # The app's own ESM import("wreq-js") resolves from its install tree, not
-      # from DATA_DIR/runtime (bootstrap.sh copies the real package there). The
-      # stand-in has to win that resolution or 9router keeps posting to the
-      # legacy /inference/v1 base from Node — which is the 429 this shim exists
-      # to prevent. The real package is kept next to it.
+      sudo install -m 0644 ${join(src, "wreq-probe.mjs")} ${FREE_DIR}/wreq-probe.mjs
       APP_DIR=$(sudo cat /etc/9router-app-dir 2>/dev/null || true)
       if [ -n "$APP_DIR" ] && [ -d "$APP_DIR/node_modules" ]; then
-        if [ -d "$APP_DIR/node_modules/wreq-js" ] && [ ! -e "$APP_DIR/node_modules/wreq-js.9router-orig" ]; then
-          sudo mv "$APP_DIR/node_modules/wreq-js" "$APP_DIR/node_modules/wreq-js.9router-orig"
+        # The interception happens at the provider base URL below, so the app
+        # keeps the wreq-js that bootstrap.sh installed (sqdshguy/wreq-js, Rust +
+        # BoringSSL). Older builds of this script swapped in a loopback shim;
+        # restore the real package if one of those ran.
+        if [ -d "$APP_DIR/node_modules/wreq-js.9router-orig" ]; then
+          sudo rm -rf "$APP_DIR/node_modules/wreq-js"
+          sudo mv "$APP_DIR/node_modules/wreq-js.9router-orig" "$APP_DIR/node_modules/wreq-js"
+          echo "wreq-js: restored the real package over an older shim"
         fi
-        sudo rm -rf "$APP_DIR/node_modules/wreq-js"
-        sudo cp -a ${DATA_DIR}/runtime/node_modules/wreq-js "$APP_DIR/node_modules/wreq-js"
-        echo "wreq-js: $APP_DIR/node_modules/wreq-js is the shim (real package kept as wreq-js.9router-orig)"
+        echo "wreq-js: $(sudo node -e "const p=require('$APP_DIR/node_modules/wreq-js/package.json');console.log(p.name+' '+p.version)" 2>/dev/null || echo unknown) at $APP_DIR/node_modules/wreq-js"
       else
-        echo "wreq-js: app dir unknown (/etc/9router-app-dir) - the app may still import the real package"
+        echo "wreq-js: app dir unknown (/etc/9router-app-dir) - check the bootstrap output"
       fi
       # The decisive patch: point the built-in "oc" provider at the compat front.
       # Measured on the runner, 9router did not use its wreq-js transport for this
@@ -1303,6 +1283,8 @@ WantedBy=multi-user.target
             sudo sed -i 's|baseUrl:"https://opencode.ai"|baseUrl:"http://127.0.0.1:${FREE_PORT}"|g' "$f"
           done
           echo "9router: oc base URL -> http://127.0.0.1:${FREE_PORT} in $(printf '%s\\n' "$files" | grep -c . ) file(s)"
+        elif sudo grep -rq 'baseUrl:"http://127.0.0.1:${FREE_PORT}"' "$APP_DIR" 2>/dev/null; then
+          echo "9router: oc base URL already points at the compat front"
         else
           echo "9router: no 'baseUrl:\\"https://opencode.ai\\"' found — check whether the app changed shape"
         fi
@@ -1335,12 +1317,12 @@ WantedBy=multi-user.target
 }
 
 // The decisive check for the 429: one real free-model completion, sent as
-// ${NINE_USER} so it also proves the shim's upstream call leaves through the
+// ${NINE_USER} so it also proves the front's upstream call leaves through the
 // lock. Runs before 9router starts — a broken free tier must stop the run here,
 // with the gateway's own words in the log, instead of surfacing hours later as a
 // user-visible 429 through the public domain.
 async function probeFreeTier() {
-  log(`• Free tier: one real "${FREE_MODEL}" completion through the shim…`);
+  log(`• Free tier: one real "${FREE_MODEL}" completion through the stack…`);
   const dir = await mkdtemp(join(tmpdir(), "zenprobe-"));
   const req = join(dir, "req.json");
   await writeFile(
@@ -1386,15 +1368,33 @@ async function probeFreeTier() {
     for (const line of logTail.out.split("\n").filter(Boolean)) log(`    zen: ${line.slice(0, 200)}`);
     throw new Error(
       `the free tier still refuses "${FREE_MODEL}" — 9router's oc provider would answer 429; ` +
-        "see the gateway reply above and the shim log below",
+        "see the gateway reply above and the free-tier log below",
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
 
+// Informational only, never fatal: same call with the real wreq-js (the package
+// 9router installs) straight at https://opencode.ai/inference/openai/v1. If this
+// ever answers 200, the Bun/zen-proxy hop can be dropped and the free tier served
+// by one runtime instead of two. Until then zen-proxy stays the proven path.
+async function probeWreqDirect() {
+  const appDir = (await sh(`sudo cat /etc/9router-app-dir 2>/dev/null || true`, { check: false })).out.trim();
+  if (!appDir) return;
+  log(`• Free tier: for reference, the real wreq-js straight at the gateway…`);
+  const out = await sh(
+    `sudo -u ${NINE_USER} -- ${process.execPath} ${FREE_DIR}/wreq-probe.mjs ` +
+      `${appDir} ${FREE_DIR}/agent-preamble.txt ${FREE_MODEL} 2>&1 || true`,
+    { check: false, timeout: 240_000 },
+  );
+  const lines = out.out.split("\n").filter(Boolean);
+  if (!lines.length) log("    wreq-probe: no output");
+  for (const line of lines.slice(-6)) log(`    ${line.slice(0, 220)}`);
+}
+
 // Same call the user makes through https://router2.codol.ir/v1/chat/completions,
-// but straight at the local listener: it proves the app itself reaches the shim
+// but straight at the local listener: it proves the app itself reaches the front
 // (and not the legacy OpenCode path). A temporary API key is minted through the
 // dashboard session and deleted again; it never appears on a command line.
 async function probeRouterModel() {
@@ -1453,7 +1453,7 @@ async function probeRouterModel() {
     if (code !== "200") {
       await dumpFreeTierEvidence();
       throw new Error(
-        `9router answered HTTP ${code} for oc/${FREE_MODEL} — the app is not reaching the shim`,
+        `9router answered HTTP ${code} for oc/${FREE_MODEL} — the app is not reaching the free-tier front`,
       );
     }
     return true;
@@ -1483,14 +1483,15 @@ async function probeRouterModel() {
   }
 }
 
-// What the shim really is (real package vs stand-in), plus the two logs that
-// carry the request: printed only when the end-to-end probe fails.
+// Which wreq-js the app has (the real package, or an old shim left over), which
+// base URL the oc provider points at, plus the two logs that carry the request:
+// printed only when the end-to-end probe fails.
 async function dumpFreeTierEvidence() {
   const appDir = (await sh(`sudo cat /etc/9router-app-dir 2>/dev/null || true`, { check: false })).out.trim();
   if (appDir) {
     const r = await sh(
-      `sudo head -c 130 ${appDir}/node_modules/wreq-js/index.mjs 2>/dev/null; echo; ` +
-        `sudo ls -ld ${appDir}/node_modules/wreq-js ${appDir}/node_modules/wreq-js.9router-orig 2>/dev/null || true`,
+      `sudo node -e "const p=require('${appDir}/node_modules/wreq-js/package.json');console.log(p.name+'@'+p.version+' main='+p.main)" 2>/dev/null || echo "wreq-js: not installed where the app resolves it"; ` +
+        `sudo test -d ${appDir}/node_modules/wreq-js.9router-orig && echo "wreq-js: an old shim backup is still present" || true`,
       { check: false },
     );
     for (const line of r.out.split("\n").filter(Boolean)) log(`    wreq: ${line.slice(0, 170)}`);
@@ -1626,6 +1627,7 @@ async function start() {
   await applyEgressLock(uid, vpn.ip);
   await installFreeTier();
   await probeFreeTier();
+  await probeWreqDirect();
   await applyProxyDropIn();
   await startRouter();
   await verifyPublic();
@@ -1673,7 +1675,7 @@ async function start() {
     `  lock     : uid ${uid} TCP forced through the VPN; IPv6 + non-DNS UDP dropped; loopback/private exempt`,
   );
   log(
-    `  free tier: oc/* → wreq-js stand-in → zen-proxy :${FREE_PORT} → ${FREE_UPSTREAM} (proved with ${FREE_MODEL})`,
+    `  free tier: oc/* → compat :${FREE_PORT} → zen-proxy :${FREE_ZEN_PORT} → ${FREE_UPSTREAM} (proved with ${FREE_MODEL})`,
   );
   log(
     `  verified : uid probe answered from the VPN exit / app proxy ${egress.ok ? `reaches ${egress.ip}` : "unverified"}${routed ? " / provider call seen in the bridge log" : ""}`,
