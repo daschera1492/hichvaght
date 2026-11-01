@@ -100,10 +100,8 @@ jobs:
       - name: Record the runner's public IP
         run: echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 15 https://api.ipify.org)" >> "$GITHUB_ENV"
 
-      # Per-run only: the SOCKS5 login never leaves the machine, so a fresh
-      # value each session is enough and nothing has to be stored.
-      - name: Generate the proxy password
-        run: echo "FXA_PROXY_PASS=$(openssl rand -hex 12)" >> "$GITHUB_ENV"
+      # Per-run only: the SOCKS5 login is generated inside router.mjs, never in
+      # the step environment (which GitHub prints into the public log).
 
       # Tunnel, 9router, state restore, VPN, and the whole-machine redirect.
       - name: Start 9Router and the VPN
