@@ -3,14 +3,21 @@ name: 9Router (runner only)
 # Same job as 9router-lifecycle.yml, with no Freestyle VM and no Tailscale:
 #
 #   cloudflared  ──► 127.0.0.1:20128   the public entry for router2.codol.ir
-#   9router      ──► systemd (root), same /root/.9router as before
+#   9router      ──► systemd as the dedicated user "nine", state in /var/lib/9router
 #   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
+#   redsocks     ──► HTTP-free kernel redirect target on 127.0.0.1:12345
 #   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118 → that SOCKS5
 #
-# 9router's own outbound-proxy setting sends its provider calls through the VPN.
-# iptables is not used: the runner kernel has no xt_owner, so a transparent
-# redirect could not exempt the VPN from itself. Everything else on the machine
-# (the tunnel, the Actions agent) keeps the runner's direct route.
+# Order is enforced by router.mjs:
+#   1. VPN up + exit IP proven
+#   2. 9router installed but NOT started
+#   3. 9router's uid locked at the kernel level: every IPv4 TCP packet it
+#      generates is REDIRECTed into redsocks → the VPN's SOCKS5, IPv6 and
+#      non-DNS UDP are dropped. nftables `meta skuid` is used because it is core
+#      nft and does not need the xt_owner module the runner kernel lacks.
+#   4. only then is 9router started
+# The app's own outbound-proxy setting is kept as a second layer. The tunnel
+# and the Actions agent run under their own uids and keep the direct route.
 #
 # A GitHub runner has no public inbound port, so the domain reaches it through a
 # Cloudflare Tunnel. Nothing has to be created by hand: if CF_TUNNEL_TOKEN is
@@ -116,9 +123,12 @@ jobs:
       FXA_TRIES: "3"
       FXA_UPSTREAM_CONNECTIONS: "4"
 
-      # Egress scope: 9router's provider calls go through the VPN (its own
-      # outbound-proxy setting, applied by router.mjs). The tunnel and the
-      # Actions agent stay on the runner's direct route on purpose.
+      # Egress scope: ALL of 9router's traffic is locked to the VPN at the kernel
+      # level (nftables `meta skuid` for the service user "nine"). Its own
+      # outbound-proxy setting is kept as a second layer. The tunnel and the
+      # Actions agent run under other uids and stay on the runner's direct route.
+      NINE_DATA_DIR: "/var/lib/9router"
+      NINE_RUN_USER: "nine"
 
       # State travels through the same encrypted release asset the VM sessions
       # write, so the existing database is picked up unchanged.
@@ -143,8 +153,9 @@ jobs:
       # Per-run only: the SOCKS5 login is generated inside router.mjs, never in
       # the step environment (which GitHub prints into the public log).
 
-      # Tunnel, 9router, state restore, VPN, then the outbound proxy and the
-      # end-to-end check that provider traffic really leaves through it.
+      # VPN first, then 9router installed-but-stopped, then the kernel egress
+      # lock, then the start — all inside router.mjs. The step comment used to
+      # describe the old tunnel→router→VPN order, which no longer applies.
       - name: Start 9Router and the VPN
         timeout-minutes: 50
         run: node scripts/runner-router/router.mjs start

@@ -8,12 +8,30 @@ PORT="${ROUTER_PORT:-20128}"
 # to everyone. The caller must always provide one.
 : "${NINE_ROUTER_PASSWORD:?NINE_ROUTER_PASSWORD must be set (no default password allowed)}"
 PASSWORD="$NINE_ROUTER_PASSWORD"
-DATA_DIR="/root/.9router"
+# Two layouts, chosen by the caller:
+#
+#   * DEDICATED (runner): 9router runs as its own system user, never root. The
+#     runner locks that uid's egress to the VPN with nftables (`meta skuid`), and
+#     locking uid 0 would also capture systemd, DHCP and every root helper.
+#     DATA_DIR is the override 9router documents (README: `-e DATA_DIR=/app/data`).
+#   * LEGACY (Freestyle VM): unchanged root layout in /root/.9router, because
+#     start.mjs/stop.mjs archive and restore exactly that path.
+#
+# Dedicated mode is opt-in, so the VM workflows keep their existing behaviour.
+if [ -n "${NINE_RUN_USER:-}" ] || [ -n "${NINE_DATA_DIR:-}" ]; then
+  DEDICATED=1
+  NINE_USER="${NINE_RUN_USER:-nine}"
+  DATA_DIR="${NINE_DATA_DIR:-/var/lib/9router}"
+else
+  DEDICATED=0
+  NINE_USER="root"
+  DATA_DIR="/root/.9router"
+fi
 RUNTIME="$DATA_DIR/runtime"
 
 export PATH="$PATH:$(npm prefix -g)/bin"
 
-echo "==> 1/5 installing 9router (if missing)"
+echo "==> 1/6 installing 9router (if missing)"
 if ! command -v 9router >/dev/null 2>&1; then
   # npm >= 11 blocks postinstall scripts unless allow-listed; older npm rejects the
   # flag. Pick the flag by asking npm itself instead of failing a 2-minute install
@@ -45,7 +63,39 @@ APP_DIR="$PKG_DIR/app"
 echo "    package -> $PKG_DIR"
 echo "    app dir -> $APP_DIR"
 
-echo "==> 2/5 installing runtime deps (wreq-js + sqlite + tray)"
+# The dedicated account. `--system` keeps it out of the login users; the home is
+# the data dir itself, which the app writes to anyway. Idempotent: re-running a
+# start must never fail here.
+echo "==> 2/6 preparing the run-as user \"$NINE_USER\" and $DATA_DIR"
+RUN_AS=""
+if [ "$DEDICATED" = "1" ]; then
+  if ! id -u "$NINE_USER" >/dev/null 2>&1; then
+    sudo useradd --system --user-group --create-home --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$NINE_USER"
+  fi
+  sudo mkdir -p "$DATA_DIR" "$RUNTIME"
+  sudo chown -R "$NINE_USER:$NINE_USER" "$DATA_DIR"
+  sudo chmod 0750 "$DATA_DIR"
+  # 9router owns its own package tree too: Next keeps runtime caches under the
+  # build directory, and a read-only install would fail on image/ISR caching.
+  sudo chown -R "$NINE_USER:$NINE_USER" "$PKG_DIR"
+  sudo mkdir -p "$APP_DIR/.next-cli-build/cache/images" "$APP_DIR/.next-cli-build/cache/fetch-cache"
+  sudo chown -R "$NINE_USER:$NINE_USER" "$APP_DIR/.next-cli-build/cache"
+  # systemd appends stdout/stderr to this file, so the service user must own it.
+  sudo touch /var/log/9router.log
+  sudo chown "$NINE_USER:$NINE_USER" /var/log/9router.log
+  sudo chmod 0640 /var/log/9router.log
+  RUN_AS="User=${NINE_USER}
+Group=${NINE_USER}
+WorkingDirectory=${DATA_DIR}
+Environment=DATA_DIR=${DATA_DIR}
+Environment=HOME=${DATA_DIR}
+Environment=NEXT_TELEMETRY_DISABLED=1"
+  echo "    uid $(id -u "$NINE_USER") / gid $(id -g "$NINE_USER"), data dir owned by $NINE_USER"
+else
+  echo "    legacy layout: running as root, data dir $DATA_DIR (Freestyle VM)"
+fi
+
+echo "==> 3/6 installing runtime deps (wreq-js + sqlite + tray)"
 sudo mkdir -p "$RUNTIME"
 if [ ! -f "$RUNTIME/package.json" ]; then
   printf '{"name":"9router-runtime","version":"1.0.0","private":true}\n' | sudo tee "$RUNTIME/package.json" >/dev/null
@@ -69,7 +119,7 @@ echo "    runtime deps OK"
 # path then crashes on `(void 0).resolve(...)`, surfacing as
 # "wreq-js unavailable (Cannot read properties of undefined (reading 'resolve'))".
 # Copying the package (plus its platform binding) next to the app fixes it.
-echo "==> 3/5 placing wreq-js where the app's ESM import() can resolve it"
+echo "==> 4/6 placing wreq-js where the app's ESM import() can resolve it"
 sudo mkdir -p "$APP_DIR/node_modules/@wreq-js"
 sudo rm -rf "$APP_DIR/node_modules/wreq-js"
 sudo cp -a "$RUNTIME/node_modules/wreq-js" "$APP_DIR/node_modules/"
@@ -97,8 +147,10 @@ console.log(`wreq-js ESM import: OK (fetch -> ${res.status || res.err})`);
 EOF
 sudo node "$CHECK" || { sudo rm -f "$CHECK"; echo "FATAL: wreq-js is not importable from the app"; exit 1; }
 sudo rm -f "$CHECK"
+# cp -a above reintroduced root-owned files inside the package tree.
+sudo chown -R "$NINE_USER:$NINE_USER" "$APP_DIR/node_modules" "$RUNTIME"
 
-echo "==> 4/5 writing systemd unit"
+echo "==> 5/6 writing systemd unit"
 sudo tee /etc/systemd/system/9router.service >/dev/null <<EOF
 [Unit]
 Description=9Router AI gateway
@@ -107,6 +159,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Dedicated mode (runner): router.mjs locks exactly this uid to the VPN, so
+# nothing else on the machine (systemd, DHCP, cloudflared) is ever redirected.
+# Legacy mode (Freestyle VM) leaves this block empty, i.e. root as before.
+${RUN_AS}
 # 9router reads INITIAL_PASSWORD (not NINE_ROUTER_PASSWORD) when no password is
 # stored in settings yet; it is also what satisfies the "change the default
 # password before remote access" guard.
@@ -125,9 +181,18 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable 9router >/dev/null 2>&1 || true
+
+# The runner variant starts 9router only after its uid has been locked to the
+# VPN at the kernel level (router.mjs). It must therefore be able to install
+# the unit without ever running the app on the direct route.
+if [ "${NINE_ROUTER_SKIP_START:-0}" = "1" ]; then
+  echo "==> 6/6 start skipped (NINE_ROUTER_SKIP_START=1): the caller starts 9router after the egress lock"
+  exit 0
+fi
+
 sudo systemctl restart 9router
 
-echo "==> 5/5 waiting for the listener on :$PORT"
+echo "==> 6/6 waiting for the listener on :$PORT"
 for i in $(seq 1 90); do
   if curl -sf -o /dev/null "http://127.0.0.1:$PORT/dashboard" 2>/dev/null \
      || curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/dashboard" 2>/dev/null | grep -qE '^[23]'; then
