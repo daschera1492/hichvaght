@@ -1,0 +1,220 @@
+name: 9Router (runner only custom domain)
+
+# Same job as 9router-lifecycle.yml, with no Freestyle VM and no Tailscale:
+#
+#   cloudflared  ──► 127.0.0.1:20128   the public entry for <subdomain>.codol.ir
+#   9router      ──► systemd as the dedicated user "nine", state in /var/lib/9router
+#   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
+#   redsocks     ──► HTTP-free kernel redirect target on 127.0.0.1:12345
+#   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118 → that SOCKS5
+#   zen-proxy    ──► 127.0.0.1:8788 on Bun: OpenCode free-tier gateway
+#   compat front ──► 127.0.0.1:8787 (the oc provider's base URL points here)
+#
+# Order is enforced by router.mjs:
+#   1. VPN up + exit IP proven
+#   2. 9router installed but NOT started
+#   3. 9router's uid locked at the kernel level: every IPv4 TCP packet it
+#      generates is REDIRECTed into redsocks → the VPN's SOCKS5, IPv6 and
+#      non-DNS UDP are dropped. nftables `meta skuid` is used because it is core
+#      nft and does not need the xt_owner module the runner kernel lacks.
+#   4. only then is 9router started
+# The app's own outbound-proxy setting is kept as a second layer. The tunnel
+# and the Actions agent run under their own uids and keep the direct route.
+#
+# A GitHub runner has no public inbound port, so the domain reaches it through a
+# Cloudflare Tunnel. Nothing has to be created by hand: if CF_TUNNEL_TOKEN is
+# absent, CF_API_TOKEN is used to create the tunnel, its ingress rule and the
+# DNS record for <subdomain>.codol.ir.
+#
+# The base domain (codol.ir) is fixed; only the subdomain is asked at dispatch.
+#
+# Nothing from the previous workflows or scripts is modified. This workflow only
+# reads scripts/freestyle-router/bootstrap.sh (the 9router installer) and uses
+# the new scripts/runner-router/router.mjs.
+#
+# Do not run this and 9router-lifecycle.yml at the same time: both archive state
+# to the same release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdomain:
+        description: "ساب‌دامین (فقط بخش اول، مثلاً router5 یا mase یا xyz) — پسوند .codol.ir خودکار اضافه می‌شود"
+        type: string
+        required: true
+        default: router2
+      mode:
+        description: "حالت شروع: با بکاپ (کانفیگ قبلی) یا خام"
+        type: choice
+        default: with-backup
+        options:
+          - with-backup
+          - fresh
+      fxa_country:
+        description: "لوکیشن VPN — هر کد کشوری که اکانتت باز دارد. mx/br/ca/fr/gb و… در لیست Mozilla قفل‌اند و فقط با اکانت دارای اشتراک وصل می‌شوند؛ اگر نشد خودکار به یکی از ۶ کشور رایگان می‌افتد."
+        type: choice
+        default: random
+        options:
+          - random
+          - auto
+          - ar
+          - at
+          - au
+          - be
+          - bg
+          - br
+          - ca
+          - cl
+          - co
+          - de
+          - dk
+          - es
+          - fi
+          - fr
+          - gb
+          - gh
+          - ie
+          - it
+          - jp
+          - kr
+          - mx
+          - my
+          - nl
+          - "no"
+          - nz
+          - pe
+          - ph
+          - pt
+          - se
+          - sg
+          - th
+          - us
+          - za
+      fxa_transport:
+        description: "ترنسپورت VPN"
+        type: choice
+        default: h2
+        options:
+          - h2
+          - h3
+      session_seconds:
+        description: "Session length in seconds (GitHub caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+concurrency:
+  group: 9router-runner
+  cancel-in-progress: false
+
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      ROUTER_PORT: "20128"
+      # Raw subdomain input; the "Resolve domain" step validates it and
+      # exports the final ROUTER_DOMAIN (<subdomain>.codol.ir) for later steps.
+      BASE_DOMAIN: codol.ir
+      SUBDOMAIN_INPUT: ${{ inputs.subdomain }}
+      ROUTER_DOMAIN: ${{ format('{0}.codol.ir', inputs.subdomain) }}
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+
+      # Tunnel: either a ready token, or the API token that can create one.
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+
+      # Firefox VPN (AWMVPN core): the accounts archive is the base64 of a
+      # tar.gz of a user-data/accounts folder (credentials.json + secret.key).
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+      FXA_COUNTRY: ${{ inputs.fxa_country }}
+      FXA_TRANSPORT: ${{ inputs.fxa_transport }}
+      FXA_PROXY_PORT: "10810"
+      FXA_TRIES: "3"
+      FXA_UPSTREAM_CONNECTIONS: "4"
+
+      # Egress scope: ALL of 9router's traffic is locked to the VPN at the kernel
+      # level (nftables `meta skuid` for the service user "nine"). Its own
+      # outbound-proxy setting is kept as a second layer. The tunnel and the
+      # Actions agent run under other uids and stay on the runner's direct route.
+      NINE_DATA_DIR: "/var/lib/9router"
+      NINE_RUN_USER: "nine"
+
+      # State travels through the same encrypted release asset the VM sessions
+      # write, so the existing database is picked up unchanged.
+      RESTORE_BACKUP: ${{ inputs.mode != 'fresh' }}
+      BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Normalise and validate the subdomain, then export the final domain.
+      # The input goes through an env var (never interpolated into the script)
+      # so it cannot inject shell code.
+      - name: Resolve domain
+        run: |
+          set -euo pipefail
+          SUB="$(printf '%s' "${SUBDOMAIN_INPUT}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          # tolerate someone typing the full domain by mistake
+          SUB="${SUB%.${BASE_DOMAIN}}"
+          if ! printf '%s' "$SUB" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
+            echo "::error::ساب‌دامین نامعتبر است: '${SUBDOMAIN_INPUT}' — فقط حروف انگلیسی، عدد و خط تیره (بدون نقطه) مجاز است."
+            exit 1
+          fi
+          echo "ROUTER_DOMAIN=${SUB}.${BASE_DOMAIN}" >> "$GITHUB_ENV"
+          echo "Domain: ${SUB}.${BASE_DOMAIN}"
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Record the runner's public IP
+        run: echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 15 https://api.ipify.org)" >> "$GITHUB_ENV"
+
+      # Per-run only: the SOCKS5 login is generated inside router.mjs, never in
+      # the step environment (which GitHub prints into the public log).
+
+      # VPN first, then 9router installed-but-stopped, then the kernel egress
+      # lock, then the start — all inside router.mjs. The step comment used to
+      # describe the old tunnel→router→VPN order, which no longer applies.
+      - name: Start 9Router and the VPN
+        timeout-minutes: 50
+        run: node scripts/runner-router/router.mjs start
+
+      - name: Report
+        run: |
+          echo "URL      : https://${ROUTER_DOMAIN}/dashboard"
+          echo "runner   : ${RUNNER_PUBLIC_IP}"
+          echo "scope    : ${FXA_VPN_SCOPE:-none} country=${FXA_COUNTRY:-?} exit=${FXA_EXIT_IP:-?}"
+          echo "proxy    : ${FXA_HTTP_PROXY:-none} verified=${FXA_VPN_VERIFIED:-0}"
+          echo "free tier: ${FXA_FREE_TIER:-none} model=${FXA_FREE_TIER_MODEL:-?}"
+          echo "SOCKS5   : 127.0.0.1:10810 (per-run password, not printed)"
+
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          SLEEP=$(( DEADLINE - $(date +%s) ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      # Always runs: a failed start must not lose the database, and a runner is
+      # gone the moment the job ends.
+      - name: Archive state
+        if: always()
+        run: node scripts/runner-router/router.mjs stop
+
+      - name: Stop the tunnel
+        if: always()
+        run: sudo systemctl stop cloudflared 2>/dev/null || true
