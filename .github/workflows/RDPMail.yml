@@ -185,37 +185,24 @@ jobs:
               Write-Warning "RDP test failed, but continuing"
           }
 
-      - name: Install OpenCode
+      - name: Download OpenCode Installer
         shell: pwsh
         timeout-minutes: 10
         run: |
-          Write-Host "Installing OpenCode via npm..."
-          npm install -g opencode-ai
-          if ($LASTEXITCODE -ne 0) { throw "npm install -g opencode-ai failed" }
+          # فقط دانلود می‌کنه، نصب رو خودت دستی انجام می‌دی
+          $projectDir = "C:\Users\Public\Desktop\project"
+          New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
 
-          # مطمئن شو پوشه‌ی global npm توی PATH سیستم هست (برای یوزر RDP)
-          $npmPrefix = (npm prefix -g).Trim()
-          Write-Host "npm global prefix: $npmPrefix"
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($machinePath -notlike "*$npmPrefix*") {
-              [Environment]::SetEnvironmentVariable("Path", "$machinePath;$npmPrefix", "Machine")
-              Write-Host "Added $npmPrefix to machine PATH"
-          }
-          $env:Path = "$env:Path;$npmPrefix"
+          $url = "https://opencode.ai/download/latest/windows-x64-nsis"
+          $out = "$projectDir\OpenCode-Setup.exe"
 
-          # تست نصب
-          & "$npmPrefix\opencode.cmd" --version
+          Write-Host "Downloading OpenCode installer..."
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -MaximumRedirection 10
+          if (-not (Test-Path $out)) { throw "OpenCode download failed" }
 
-          # شورتکات روی دسکتاپ همه‌ی یوزرها: ترمینال با opencode داخل پوشه‌ی project
-          New-Item -ItemType Directory -Path "C:\Users\Public\Desktop\project" -Force | Out-Null
-          $shell = New-Object -ComObject WScript.Shell
-          $lnk = $shell.CreateShortcut("C:\Users\Public\Desktop\OpenCode.lnk")
-          $lnk.TargetPath = "powershell.exe"
-          $lnk.Arguments = "-NoExit -Command opencode"
-          $lnk.WorkingDirectory = "C:\Users\Public\Desktop\project"
-          $lnk.Save()
-
-          Write-Host "OpenCode installed"
+          $sizeMB = [math]::Round((Get-Item $out).Length / 1MB, 1)
+          Write-Host "OpenCode installer saved to $out ($sizeMB MB)"
 
       - name: Add Persian (Farsi) Keyboard
         shell: pwsh
@@ -299,7 +286,7 @@ jobs:
           Write-Host ""
           Write-Host "Project folder: Desktop\project (GmailDuck, duckmail-hub)"
           Write-Host "GmailDuck log:  C:\Users\Public\Desktop\project\GmailDuck\start.log"
-          Write-Host "OpenCode: shortcut on Desktop (or run 'opencode' in terminal)"
+          Write-Host "OpenCode installer: Desktop\project\OpenCode-Setup.exe (install manually)"
           Write-Host ""
           Write-Host "After reboot, wait 1-2 minutes for reconnection"
           Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
