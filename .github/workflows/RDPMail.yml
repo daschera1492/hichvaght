@@ -195,14 +195,42 @@ jobs:
 
           $url = "https://opencode.ai/download/latest/windows-x64-nsis"
           $out = "$projectDir\OpenCode-Setup.exe"
-
-          Write-Host "Downloading OpenCode installer..."
+          $ua  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -MaximumRedirection 10
-          if (-not (Test-Path $out)) { throw "OpenCode download failed" }
 
-          $sizeMB = [math]::Round((Get-Item $out).Length / 1MB, 1)
-          Write-Host "OpenCode installer saved to $out ($sizeMB MB)"
+          $ok = $false
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+              Write-Host "Download attempt $i/3 (Invoke-WebRequest) ..."
+              try {
+                  if (Test-Path $out) { Remove-Item $out -Force }
+                  Invoke-WebRequest -Uri $url -OutFile $out -UserAgent $ua -MaximumRedirection 10
+                  if ((Test-Path $out) -and (Get-Item $out).Length -gt 1MB) { $ok = $true }
+              } catch {
+                  Write-Warning "Invoke-WebRequest failed: $_"
+              }
+
+              if (-not $ok) {
+                  Write-Host "Download attempt $i/3 (curl.exe) ..."
+                  try {
+                      if (Test-Path $out) { Remove-Item $out -Force }
+                      curl.exe -L --fail --retry 3 --retry-delay 3 -A $ua -o $out $url
+                      if ($LASTEXITCODE -eq 0 -and (Test-Path $out) -and (Get-Item $out).Length -gt 1MB) { $ok = $true }
+                  } catch {
+                      Write-Warning "curl.exe failed: $_"
+                  }
+              }
+
+              if (-not $ok) { Start-Sleep -Seconds 5 }
+          }
+
+          if ($ok) {
+              $sizeMB = [math]::Round((Get-Item $out).Length / 1MB, 1)
+              Write-Host "OpenCode installer saved to $out ($sizeMB MB)"
+          } else {
+              Write-Warning "OpenCode download failed after 3 attempts. Continuing without it."
+              if (Test-Path $out) { Remove-Item $out -Force }
+              exit 0
+          }
 
       - name: Add Persian (Farsi) Keyboard
         shell: pwsh
@@ -286,7 +314,7 @@ jobs:
           Write-Host ""
           Write-Host "Project folder: Desktop\project (GmailDuck, duckmail-hub)"
           Write-Host "GmailDuck log:  C:\Users\Public\Desktop\project\GmailDuck\start.log"
-          Write-Host "OpenCode installer: Desktop\project\OpenCode-Setup.exe (install manually)"
+          Write-Host "OpenCode installer: Desktop\project\OpenCode-Setup.exe (install manually, if download succeeded)"
           Write-Host ""
           Write-Host "After reboot, wait 1-2 minutes for reconnection"
           Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
