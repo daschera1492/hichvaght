@@ -1,0 +1,207 @@
+name: 9Router (runner only, FoxyVPN login)
+
+# Runner-only 9Router with the Firefox VPN login taken from FoxyVPN.
+#
+# The previous runner let awmvpn-core log in to Firefox Accounts by itself.
+# Mozilla changed that control plane, so the stored login could no longer be
+# refreshed and every session died at "Start 9Router and the VPN". This workflow
+# keeps the old workflow and router.mjs untouched: a new step refreshes the FxA
+# credentials with the exact flow FoxyVPN v2.0.2 uses, proves the Guardian pass,
+# and only then hands the refreshed archive to the existing router.mjs.
+#
+#   cloudflared  ──► 127.0.0.1:20128   the public entry for <subdomain>.codol.ir
+#   9router      ──► systemd as the dedicated user "nine", state in /var/lib/9router
+#   awmvpn-core  ──► SOCKS5 127.0.0.1:10810 (Mozilla free VPN)
+#   redsocks     ──► kernel redirect target on 127.0.0.1:12345
+#   socks-bridge ──► HTTP CONNECT 127.0.0.1:8118 → that SOCKS5
+#   zen-proxy    ──► 127.0.0.1:8788 on Bun: OpenCode free-tier gateway
+#   compat front ──► 127.0.0.1:8787 (the oc provider's base URL points here)
+#
+# Login credentials: the step reads FXA_ACCOUNTS_TGZ_B64 (the archive the old
+# runner already uses) or FOXY_REFRESH_TOKEN (a fresh token from FoxyVPN) and
+# writes the refreshed archive back to GITHUB_ENV. No secret is printed.
+#
+# Independence: separate concurrency group and tunnel per subdomain, no backup,
+# and a tunnel created per run through CF_API_TOKEN. The base domain is fixed;
+# every simultaneous run needs a different subdomain.
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdomain:
+        description: "ساب‌دامین (فقط بخش اول، مثلاً router3 یا foxy) — پسوند .codol.ir خودکار اضافه می‌شود."
+        type: string
+        required: true
+        default: router3
+      fxa_country:
+        description: "لوکیشن VPN — هر کد کشوری که اکانتت باز دارد. random یک کشور رایگان انتخاب می‌کند."
+        type: choice
+        default: random
+        options:
+          - random
+          - auto
+          - ar
+          - at
+          - au
+          - be
+          - bg
+          - br
+          - ca
+          - cl
+          - co
+          - de
+          - dk
+          - es
+          - fi
+          - fr
+          - gb
+          - gh
+          - ie
+          - it
+          - jp
+          - kr
+          - mx
+          - my
+          - nl
+          - "no"
+          - nz
+          - pe
+          - ph
+          - pt
+          - se
+          - sg
+          - th
+          - us
+          - za
+      fxa_transport:
+        description: "ترنسپورت VPN"
+        type: choice
+        default: h2
+        options:
+          - h2
+          - h3
+      session_seconds:
+        description: "Session length in seconds (GitHub caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+concurrency:
+  group: 9router-runner-foxy-${{ inputs.subdomain }}
+  cancel-in-progress: false
+
+jobs:
+  router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    env:
+      ROUTER_PORT: "20128"
+      BASE_DOMAIN: codol.ir
+      SUBDOMAIN_INPUT: ${{ inputs.subdomain }}
+      ROUTER_DOMAIN: ${{ format('{0}.codol.ir', inputs.subdomain) }}
+      NINE_ROUTER_PASSWORD: ${{ secrets.NINE_ROUTER_PASSWORD }}
+
+      # Tunnel: created per run through the API. CF_TUNNEL_TOKEN is left out on
+      # purpose (a token is one fixed tunnel and would couple the runs).
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+
+      # Firefox VPN credentials. The login step prefers the archive, so the
+      # existing secret keeps working; FOXY_REFRESH_TOKEN is the fallback when
+      # the archived refresh tokens were revoked.
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+      FOXY_REFRESH_TOKEN: ${{ secrets.FOXY_REFRESH_TOKEN }}
+      FXA_COUNTRY: ${{ inputs.fxa_country }}
+      FXA_TRANSPORT: ${{ inputs.fxa_transport }}
+      FXA_PROXY_PORT: "10810"
+      FXA_TRIES: "3"
+      FXA_UPSTREAM_CONNECTIONS: "4"
+
+      NINE_DATA_DIR: "/var/lib/9router"
+      NINE_RUN_USER: "nine"
+
+      # No backup: empty values make router.mjs skip both restore and archive.
+      GITHUB_TOKEN: ""
+      BACKUP_ENCRYPTION_KEY: ""
+      RESTORE_BACKUP: "false"
+
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Normalise and validate the subdomain, then export everything that
+      # depends on it. The input goes through an env var (never interpolated
+      # into the script) so it cannot inject shell code.
+      - name: Resolve domain
+        run: |
+          set -euo pipefail
+          SUB="$(printf '%s' "${SUBDOMAIN_INPUT}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          SUB="${SUB%.${BASE_DOMAIN}}"
+          if ! printf '%s' "$SUB" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
+            echo "::error::ساب‌دامین نامعتبر است: '${SUBDOMAIN_INPUT}' — فقط حروف انگلیسی، عدد و خط تیره (بدون نقطه) مجاز است."
+            exit 1
+          fi
+          {
+            echo "ROUTER_DOMAIN=${SUB}.${BASE_DOMAIN}"
+            echo "CF_TUNNEL_NAME=router-${SUB}"
+          } >> "$GITHUB_ENV"
+          echo "Domain : ${SUB}.${BASE_DOMAIN}"
+          echo "Tunnel : router-${SUB}"
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Record the runner's public IP
+        run: echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 15 https://api.ipify.org)" >> "$GITHUB_ENV"
+
+      # FoxyVPN's login flow, run before anything VPN-related exists:
+      #   refresh token → oauth.accounts.firefox.com/v1/token
+      #                 → api.accounts.firefox.com/v1/oauth/token on 406/5xx
+      #   Guardian /api/v1/fpn/token proves the account and the proxy pass.
+      # The refreshed archive is appended to GITHUB_ENV for router.mjs.
+      - name: Refresh the Firefox VPN login (FoxyVPN flow)
+        run: node scripts/runner-router-foxy/login.mjs
+
+      # Unchanged from the previous runner: VPN first, 9router installed but
+      # stopped, kernel egress lock, then 9router starts.
+      - name: Start 9Router and the VPN
+        timeout-minutes: 50
+        run: node scripts/runner-router/router.mjs start
+
+      - name: Report
+        run: |
+          echo "URL      : https://${ROUTER_DOMAIN}/dashboard"
+          echo "runner   : ${RUNNER_PUBLIC_IP}"
+          echo "login    : FoxyVPN flow verified=${FOXY_LOGIN_VERIFIED:-0}"
+          echo "scope    : ${FXA_VPN_SCOPE:-none} country=${FXA_COUNTRY:-?} exit=${FXA_EXIT_IP:-?}"
+          echo "proxy    : ${FXA_HTTP_PROXY:-none} verified=${FXA_VPN_VERIFIED:-0}"
+          echo "free tier: ${FXA_FREE_TIER:-none} model=${FXA_FREE_TIER_MODEL:-?}"
+          echo "SOCKS5   : 127.0.0.1:10810 (per-run password, not printed)"
+
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          SLEEP=$(( DEADLINE - $(date +%s) ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      # Always runs: stops 9router and drops the kernel lock cleanly. With
+      # backup off it archives nothing.
+      - name: Stop 9router
+        if: always()
+        run: node scripts/runner-router/router.mjs stop
+
+      - name: Stop the tunnel
+        if: always()
+        run: sudo systemctl stop cloudflared 2>/dev/null || true
