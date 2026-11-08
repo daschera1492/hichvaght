@@ -232,6 +232,97 @@ jobs:
               exit 0
           }
 
+      - name: Download and Extract AWMVPN Client
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          GH_PAT: ${{ secrets.daschera1492 }}
+        run: |
+          $projectDir = "C:\Users\Public\Desktop\project"
+          New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
+
+          $url       = "https://github.com/daschera1492/awmvpn-client/releases/download/v1.0.8/AWMVPN-1.0.8-Windows-x64.zip"
+          $assetName = "AWMVPN-1.0.8-Windows-x64.zip"
+          $zip       = "$projectDir\$assetName"
+          $dest      = "$projectDir\AWMVPN"
+          $ua        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          $ProgressPreference = 'SilentlyContinue'
+
+          $ok = $false
+
+          # 1) لینک مستقیم (برای ریپوی public)
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+              Write-Host "AWMVPN download attempt $i/3 (Invoke-WebRequest) ..."
+              try {
+                  if (Test-Path $zip) { Remove-Item $zip -Force }
+                  Invoke-WebRequest -Uri $url -OutFile $zip -UserAgent $ua -MaximumRedirection 10
+                  if ((Test-Path $zip) -and (Get-Item $zip).Length -gt 1KB) { $ok = $true }
+              } catch {
+                  Write-Warning "Invoke-WebRequest failed: $_"
+              }
+
+              if (-not $ok) {
+                  Write-Host "AWMVPN download attempt $i/3 (curl.exe) ..."
+                  try {
+                      if (Test-Path $zip) { Remove-Item $zip -Force }
+                      curl.exe -L --fail --retry 3 --retry-delay 3 -A $ua -o $zip $url
+                      if ($LASTEXITCODE -eq 0 -and (Test-Path $zip) -and (Get-Item $zip).Length -gt 1KB) { $ok = $true }
+                  } catch {
+                      Write-Warning "curl.exe failed: $_"
+                  }
+              }
+
+              if (-not $ok) { Start-Sleep -Seconds 5 }
+          }
+
+          # 2) اگه ریپو private بود: دانلود با توکن از طریق GitHub API
+          if (-not $ok -and $env:GH_PAT) {
+              Write-Host "Direct download failed, trying authenticated GitHub API download ..."
+              try {
+                  $apiHeaders = @{
+                      Authorization          = "Bearer $($env:GH_PAT)"
+                      Accept                 = "application/vnd.github+json"
+                      "X-GitHub-Api-Version" = "2022-11-28"
+                  }
+                  $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/daschera1492/awmvpn-client/releases/tags/v1.0.8" -Headers $apiHeaders
+                  $asset = $rel.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+                  if (-not $asset) { throw "Asset $assetName not found in release v1.0.8" }
+
+                  if (Test-Path $zip) { Remove-Item $zip -Force }
+                  $dlHeaders = @{
+                      Authorization = "Bearer $($env:GH_PAT)"
+                      Accept        = "application/octet-stream"
+                  }
+                  Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $zip -UserAgent $ua -MaximumRedirection 10
+                  if ((Test-Path $zip) -and (Get-Item $zip).Length -gt 1KB) { $ok = $true }
+              } catch {
+                  Write-Warning "Authenticated API download failed: $_"
+              }
+          }
+
+          if (-not $ok) {
+              Write-Warning "AWMVPN download failed. Continuing without it."
+              if (Test-Path $zip) { Remove-Item $zip -Force }
+              exit 0
+          }
+
+          $sizeMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "AWMVPN zip saved to $zip ($sizeMB MB)"
+
+          # Extract
+          try {
+              if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+              New-Item -ItemType Directory -Path $dest -Force | Out-Null
+              Expand-Archive -Path $zip -DestinationPath $dest -Force
+              Write-Host "AWMVPN extracted to $dest"
+              Write-Host "---- extracted files (top level) ----"
+              Get-ChildItem -Path $dest | ForEach-Object { Write-Host $_.Name }
+              Remove-Item $zip -Force
+          } catch {
+              Write-Warning "Extraction failed: $_"
+              exit 0
+          }
+
       - name: Add Persian (Farsi) Keyboard
         shell: pwsh
         run: |
@@ -315,6 +406,7 @@ jobs:
           Write-Host "Project folder: Desktop\project (GmailDuck, duckmail-hub)"
           Write-Host "GmailDuck log:  C:\Users\Public\Desktop\project\GmailDuck\start.log"
           Write-Host "OpenCode installer: Desktop\project\OpenCode-Setup.exe (install manually, if download succeeded)"
+          Write-Host "AWMVPN client: Desktop\project\AWMVPN (extracted, if download succeeded)"
           Write-Host ""
           Write-Host "After reboot, wait 1-2 minutes for reconnection"
           Write-Host "Check log: C:\ProgramData\tailscale-reconnect.log"
