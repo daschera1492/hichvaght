@@ -1,0 +1,137 @@
+name: Polygate (runner only)
+
+# Runner-only Polygate, the same structure as 9Router (runner only, FoxyVPN login):
+# the gateway and the Cloudflare Tunnel both live on the GitHub runner, and the
+# dashboard is published as <subdomain>.codol.ir.
+#
+#   cloudflared  -> 127.0.0.1:4317   the public entry for <subdomain>.codol.ir
+#   polygate     -> systemd (user "polygate"), state in /var/lib/polygate
+#
+# What changed compared with the 9Router runner:
+#   * 9Router is replaced by Polygate (https://github.com/B3hnamR/Polygate).
+#   * The FoxyVPN login, awmvpn-core, redsocks and the kernel egress lock are
+#     gone. Polygate chooses its own exit per provider on the Routing page:
+#     Direct, Cloudflare WARP, a proxy pool or a relay.
+#   * The dashboard is served at the root of the domain instead of /dashboard.
+#
+# Login credentials: POLYGATE_ADMIN_PASSWORD (12+ characters). When that secret
+# is empty, the runner reuses NINE_ROUTER_PASSWORD. The password is handed to
+# the installer through the environment and is never printed.
+#
+# Independence: separate concurrency group and tunnel per subdomain, no backup,
+# and a tunnel created per run through CF_API_TOKEN. The base domain is fixed;
+# every simultaneous run needs a different subdomain. Use a subdomain that is
+# not in use by a running 9Router session, because the DNS record is repointed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdomain:
+        description: "ساب‌دامین پنل (فقط بخش اول، مثلاً polygate یا pg2) — پسوند .codol.ir خودکار اضافه می‌شود."
+        type: string
+        required: true
+        default: polygate
+      session_seconds:
+        description: "Session length in seconds (GitHub caps a job at 21600 = 6h)"
+        required: false
+        default: "21000"
+
+concurrency:
+  group: polygate-runner-${{ inputs.subdomain }}
+  cancel-in-progress: false
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    env:
+      # Polygate listens on loopback; cloudflared is the only public entrance.
+      ROUTER_PORT: "4317"
+      BASE_DOMAIN: codol.ir
+      SUBDOMAIN_INPUT: ${{ inputs.subdomain }}
+      ROUTER_DOMAIN: ${{ format('{0}.codol.ir', inputs.subdomain) }}
+
+      # 12+ characters. The old 9Router secret is the fallback so an existing
+      # session keeps the same password.
+      POLYGATE_ADMIN_PASSWORD: ${{ secrets.POLYGATE_ADMIN_PASSWORD || secrets.NINE_ROUTER_PASSWORD }}
+
+      # Tunnel: created per run through the API. CF_TUNNEL_TOKEN is left out on
+      # purpose (a token is one fixed tunnel and would couple the runs).
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+
+      POLYGATE_STATE_DIR: "/var/lib/polygate"
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Normalise and validate the subdomain, then export everything that
+      # depends on it. The input goes through an env var (never interpolated
+      # into the script) so it cannot inject shell code.
+      - name: Resolve domain
+        run: |
+          set -euo pipefail
+          SUB="$(printf '%s' "${SUBDOMAIN_INPUT}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          SUB="${SUB%.${BASE_DOMAIN}}"
+          if ! printf '%s' "$SUB" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
+            echo "::error::ساب‌دامین نامعتبر است: '${SUBDOMAIN_INPUT}' — فقط حروف انگلیسی، عدد و خط تیره (بدون نقطه) مجاز است."
+            exit 1
+          fi
+          {
+            echo "ROUTER_DOMAIN=${SUB}.${BASE_DOMAIN}"
+            echo "CF_TUNNEL_NAME=polygate-${SUB}"
+          } >> "$GITHUB_ENV"
+          echo "Domain : ${SUB}.${BASE_DOMAIN}"
+          echo "Tunnel : polygate-${SUB}"
+
+      - name: Record session start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Record the runner's public IP
+        run: echo "RUNNER_PUBLIC_IP=$(curl -s --max-time 15 https://api.ipify.org)" >> "$GITHUB_ENV"
+
+      - name: Start Polygate and the tunnel
+        timeout-minutes: 50
+        run: node scripts/runner-polygate/polygate.mjs start
+
+      - name: Report
+        run: |
+          echo "URL      : ${POLYGATE_URL:-unavailable}"
+          echo "API base : ${POLYGATE_API_BASE:-unavailable}"
+          echo "runner   : ${RUNNER_PUBLIC_IP}"
+          echo "password : from the POLYGATE_ADMIN_PASSWORD / NINE_ROUTER_PASSWORD secret (not printed)"
+          echo "probe    : ${POLYGATE_PUBLIC_OK:-0}"
+          echo "tunnel   : ${CF_TUNNEL_NAME:-?} -> 127.0.0.1:${ROUTER_PORT}"
+          echo "data     : ${POLYGATE_STATE_DIR}"
+
+      - name: Keep session alive until the deadline
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION_SECONDS:-21000}"
+          TEARDOWN_BUFFER=300
+          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          SLEEP=$(( DEADLINE - $(date +%s) ))
+          if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
+          echo "Teardown at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s…"
+          sleep "$SLEEP"
+
+      - name: Service log (only when something failed)
+        if: failure()
+        run: sudo journalctl -u polygate -n 80 --no-pager || true
+
+      # Always runs: stops the gateway and the tunnel cleanly.
+      - name: Stop Polygate
+        if: always()
+        run: node scripts/runner-polygate/polygate.mjs stop
+
+      - name: Stop the tunnel
+        if: always()
+        run: sudo systemctl stop cloudflared 2>/dev/null || true
