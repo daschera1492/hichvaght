@@ -64,6 +64,15 @@ jobs:
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
 
       POLYGATE_STATE_DIR: "/var/lib/polygate"
+
+      # A fixed client API key (and the rest of the pinned settings) travels in
+      # an encrypted Polygate backup. It is restored on every start, so the same
+      # pg_... key works in every session; POLYGATE_CLIENT_KEY is that exact key
+      # and is only used to prove the gateway accepts it.
+      POLYGATE_BACKUP_B64: ${{ secrets.POLYGATE_BACKUP_B64 }}
+      POLYGATE_BACKUP_PASSPHRASE: ${{ secrets.POLYGATE_BACKUP_PASSPHRASE }}
+      POLYGATE_CLIENT_KEY: ${{ secrets.POLYGATE_CLIENT_KEY }}
+
       SESSION_SECONDS: ${{ inputs.session_seconds }}
 
     steps:
@@ -108,6 +117,7 @@ jobs:
           echo "API base : ${POLYGATE_API_BASE:-unavailable}"
           echo "runner   : ${RUNNER_PUBLIC_IP}"
           echo "password : from the POLYGATE_ADMIN_PASSWORD / NINE_ROUTER_PASSWORD secret (not printed)"
+          echo "api key  : fixed from POLYGATE_CLIENT_KEY (accepted=${POLYGATE_CLIENT_KEY_OK:-0})"
           echo "probe    : ${POLYGATE_PUBLIC_OK:-0}"
           echo "tunnel   : ${CF_TUNNEL_NAME:-?} -> 127.0.0.1:${ROUTER_PORT}"
           echo "data     : ${POLYGATE_STATE_DIR}"
