@@ -24,6 +24,13 @@ const PORT = Number(process.env.ROUTER_PORT || 4317);
 const DOMAIN = process.env.ROUTER_DOMAIN || "polygate.codol.ir";
 const DATA_DIR = process.env.POLYGATE_STATE_DIR || "/var/lib/polygate";
 const TUNNEL_USER = "cfd";
+// A fixed client key is carried by an encrypted Polygate backup stored in the
+// repository secrets. Polygate generates key values itself, so the supported
+// way to pin one is to restore a backup that already holds it. The backup also
+// brings providers, routes and chains, so a session starts the same each time.
+const BACKUP_B64 = (process.env.POLYGATE_BACKUP_B64 || "").replace(/\s+/g, "");
+const BACKUP_PASSPHRASE = (process.env.POLYGATE_BACKUP_PASSPHRASE || "").trim();
+const CLIENT_KEY = (process.env.POLYGATE_CLIENT_KEY || "").trim();
 // A dashboard password is mandatory and Polygate refuses anything shorter
 // than 12 characters. It comes from the POLYGATE_ADMIN_PASSWORD secret (the
 // workflow also accepts the old NINE_ROUTER_PASSWORD as a fallback), so it is
@@ -362,6 +369,78 @@ async function waitHealthy() {
   );
 }
 
+// ------------------------------------------------------------------ fixed settings
+async function loginCookie() {
+  const res = await fetch(`http://127.0.0.1:${PORT}/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  if (!res.ok) {
+    throw new Error(`Local dashboard login failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+  }
+  const list =
+    typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : [res.headers.get("set-cookie") || ""];
+  const cookie = String(list[0] || "").split(";")[0];
+  if (!cookie) throw new Error("Local dashboard login returned no session cookie");
+  return cookie;
+}
+
+// Restores the pinned settings from POLYGATE_BACKUP_B64. The backup keeps the
+// live dashboard password, so a restore cannot lock the runner out.
+async function restoreFixedState() {
+  if (!BACKUP_B64 || !BACKUP_PASSPHRASE) {
+    log("State: no fixed backup configured - using Polygate's defaults and a newly generated key");
+    return;
+  }
+  const content = Buffer.from(BACKUP_B64, "base64").toString("utf8");
+  const cookie = await loginCookie();
+  const res = await fetch(`http://127.0.0.1:${PORT}/admin/backup/restore`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      password: PASSWORD,
+      passphrase: BACKUP_PASSPHRASE,
+      content,
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Restoring the fixed settings failed: HTTP ${res.status} ${text.slice(0, 400)}\n` +
+        `    Check POLYGATE_BACKUP_B64 / POLYGATE_BACKUP_PASSPHRASE, or clear both to start fresh.`,
+    );
+  }
+  const out = JSON.parse(text);
+  log(
+    `State: restored ${out.providers} provider(s), ${out.routes} route(s), ${out.keys} key(s) ` +
+      `from the fixed backup (previous settings: ${out.kept})`,
+  );
+}
+
+// Proves the pinned client key is the one the gateway accepts.
+async function verifyClientKey() {
+  if (!CLIENT_KEY) {
+    log("Client key: POLYGATE_CLIENT_KEY is not set - skipping the check");
+    return false;
+  }
+  const res = await fetch(`http://127.0.0.1:${PORT}/v1/models`, {
+    headers: { Authorization: `Bearer ${CLIENT_KEY}` },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `The fixed client key was refused: HTTP ${res.status} ${text.slice(0, 300)}\n` +
+        `    The backup must contain a key with exactly this value.`,
+    );
+  }
+  const count = JSON.parse(text).data?.length ?? 0;
+  log(`Client key: the fixed key is accepted, ${count} model(s) listed.`);
+  return true;
+}
+
 async function verifyPublic() {
   log(` Tunnel: waiting for https://${DOMAIN}/ to answer.`);
   for (let i = 1; i <= 40; i++) {
@@ -407,6 +486,8 @@ async function start() {
     await installPolygate();
     await configureTunnelHost(workDir);
     await waitHealthy();
+    await restoreFixedState();
+    const key_ok = await verifyClientKey();
     const public_ok = await verifyPublic();
 
     const url = `https://${DOMAIN}/`;
@@ -416,6 +497,7 @@ async function start() {
       POLYGATE_API_BASE: api,
       POLYGATE_DOMAIN: DOMAIN,
       POLYGATE_PASSWORD_SOURCE: "secret",
+      POLYGATE_CLIENT_KEY_OK: key_ok ? "1" : "0",
       POLYGATE_PUBLIC_OK: public_ok ? "1" : "0",
     });
 
@@ -425,6 +507,7 @@ async function start() {
     log(`  runner   : ${process.env.RUNNER_PUBLIC_IP || "?"}  (the tunnel + gateway stay direct)`);
     log(`  egress   : chosen per provider on the Routing page (Direct / WARP / proxy pool / relay)`);
     log(`  password : from the POLYGATE_ADMIN_PASSWORD (or NINE_ROUTER_PASSWORD) secret - not printed`);
+    log(`  client key: the fixed key from POLYGATE_CLIENT_KEY - not printed${key_ok ? " (accepted by /v1/models)" : ""}`);
     log(`  data     : ${DATA_DIR} (fresh on every run; a runner is discarded at the end)`);
 
     await summary([
@@ -436,9 +519,10 @@ async function start() {
       `| API base | ${api} |`,
       `| Runner IP | ${process.env.RUNNER_PUBLIC_IP || "?"} |`,
       `| Password | the \`POLYGATE_ADMIN_PASSWORD\` / \`NINE_ROUTER_PASSWORD\` secret |`,
+      `| Client API key | fixed: \`POLYGATE_CLIENT_KEY\` (also listed on Overview as "fixed-runner") |`,
       `| Public probe | ${public_ok ? "answered" : "not answered yet"} |`,
       ``,
-      `Open the dashboard, then **Overview -> Connect your client** to create a \`pg_...\` API key.`,
+      `Open the dashboard and copy the API key from **Overview -> Connect your client**; it is the same on every run.`,
       `On **Routing**, pick Direct, Cloudflare WARP, the proxy pool or a relay if a provider limits the runner's address.`,
       ``,
     ]);
