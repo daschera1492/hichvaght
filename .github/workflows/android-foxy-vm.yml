@@ -170,6 +170,12 @@ jobs:
         if: env.VPN_ENABLED == 'true'
         run: node scripts/runner-router-foxy/login.mjs
 
+      # login.mjs writes the archive at runtime, so GitHub does not know it is a
+      # secret and would print it in the next step's env block. Mask it first.
+      - name: Mask the runtime archive
+        if: env.VPN_ENABLED == 'true'
+        run: echo "::add-mask::${FXA_ACCOUNTS_TGZ_B64}"
+
       # -------------------------------------------------------------- foxyvpn
       - name: Install FoxyVPN core
         if: env.VPN_ENABLED == 'true'
@@ -489,7 +495,7 @@ jobs:
             ACCEL="-accel tcg,thread=multi -smp 2"
           fi
 
-          cat > "$VM_DIR/boot.sh" <<EOF
+          cat > /tmp/boot.sh <<EOF
           #!/bin/bash
           exec qemu-system-x86_64 \\
             -name android-x86 \\
@@ -502,8 +508,8 @@ jobs:
             -display vnc=127.0.0.1:1 \\
             -netdev user,id=n0${QEMU_DNS:-} -device virtio-net-pci,netdev=n0
           EOF
-          sudo chown "$QEMU_USER":"$QEMU_USER" "$VM_DIR/boot.sh"
-          sudo chmod 0755 "$VM_DIR/boot.sh"
+          sudo install -m 0755 -o "$QEMU_USER" -g "$QEMU_USER" /tmp/boot.sh "$VM_DIR/boot.sh"
+          rm -f /tmp/boot.sh
 
           sudo -u "$QEMU_USER" -H bash -c \
             "setsid nohup '$VM_DIR/boot.sh' > '$VM_DIR/qemu.log' 2>&1 &"
@@ -525,6 +531,28 @@ jobs:
             || echo "::warning::tailscale serve failed; VNC is still on 127.0.0.1:5901"
           sudo tailscale serve status || true
 
+      # A browser entry point, so the VM can be driven from any tailnet device
+      # (no VNC client needed). websockify is bound to the tailscale address
+      # only, never to 0.0.0.0.
+      - name: Serve noVNC on the tailnet
+        run: |
+          set -uo pipefail
+          if [ -z "${TS_IP:-}" ]; then
+            echo "no tailnet on this run -> no browser entry point"
+            exit 0
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y novnc websockify
+          sudo pkill -f 'websockify.*6080' 2>/dev/null || true
+          sudo setsid nohup websockify --web=/usr/share/novnc "${TS_IP}:6080" 127.0.0.1:5901 \
+            > /tmp/novnc.log 2>&1 &
+          sleep 3
+          if sudo ss -tlnp | grep -q ':6080'; then
+            echo "NOVNC_URL=http://${TS_IP}:6080/vnc.html?autoconnect=1&resize=scale&path=websockify" >> "$GITHUB_ENV"
+            echo "noVNC: http://${TS_IP}:6080/vnc.html"
+          else
+            echo "::warning::websockify did not start"; sudo tail -20 /tmp/novnc.log || true
+          fi
+
       # ------------------------------------------------------------ keep alive
       - name: Keep alive + egress watchdog
         run: |
@@ -535,6 +563,7 @@ jobs:
           echo "  ANDROID VM READY"
           echo "  Tailscale IP : ${TS_IP:-none}"
           echo "  VNC          : ${TS_IP:-127.0.0.1}:5901"
+          echo "  Browser VNC  : ${NOVNC_URL:-none}"
           echo "  VPN          : country=${FXA_ACTIVE_COUNTRY:-off} exit=${FXA_EXIT_IP:-direct}"
           echo "  QEMU egress  : ${QEMU_EGRESS_IP:-direct}"
           echo "  boot mode    : KVM=${KVM:-NO}"
@@ -559,6 +588,7 @@ jobs:
         run: |
           set +e
           sudo pkill -f qemu-system-x86_64
+          sudo pkill -f 'websockify.*6080'
           sudo nft delete table inet android_lock 2>/dev/null
           sudo systemctl stop awmvpn redsocks 2>/dev/null
           sudo tailscale logout 2>/dev/null
