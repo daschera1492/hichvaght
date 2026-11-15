@@ -218,7 +218,9 @@ jobs:
         run: |
           set -euo pipefail
           PASS="$(openssl rand -hex 16)"
-          printf '%s' "$PASS" | sudo install -m 600 -o root -g root /dev/stdin "$FXA_INSTALL_DIR/proxy.pass"
+          printf '%s' "$PASS" > /tmp/proxy.pass
+          sudo install -m 600 -o root -g root /tmp/proxy.pass "$FXA_INSTALL_DIR/proxy.pass"
+          rm -f /tmp/proxy.pass
 
           write_config() {
             sudo tee "$FXA_INSTALL_DIR/user-data/config.json" >/dev/null <<EOF
@@ -414,9 +416,9 @@ jobs:
           # Port 53 needs a capability; the process must be qemuuser so its
           # TCP/443 is caught by the redirect above.
           sudo setcap cap_net_bind_service=+ep /usr/local/bin/cloudflared
-          sudo -u "$QEMU_USER" -H setsid nohup /usr/local/bin/cloudflared proxy-dns \
-            --address 127.0.0.1 --port 53 --upstream https://1.1.1.1/dns-query \
-            > "$VM_DIR/cloudflared.log" 2>&1 &
+          sudo -u "$QEMU_USER" -H bash -c \
+            "setsid nohup /usr/local/bin/cloudflared proxy-dns --address 127.0.0.1 --port 53 \
+             --upstream https://1.1.1.1/dns-query > '$VM_DIR/cloudflared.log' 2>&1 &"
           sleep 5
           if sudo ss -lunp | grep -q '127.0.0.1:53'; then
             echo "DoH resolver is listening"
@@ -503,8 +505,8 @@ jobs:
           sudo chown "$QEMU_USER":"$QEMU_USER" "$VM_DIR/boot.sh"
           sudo chmod 0755 "$VM_DIR/boot.sh"
 
-          sudo -u "$QEMU_USER" -H setsid nohup "$VM_DIR/boot.sh" \
-            > "$VM_DIR/qemu.log" 2>&1 &
+          sudo -u "$QEMU_USER" -H bash -c \
+            "setsid nohup '$VM_DIR/boot.sh' > '$VM_DIR/qemu.log' 2>&1 &"
           sleep 25
           echo "--- qemu.log ---"
           sudo tail -30 "$VM_DIR/qemu.log" || true
