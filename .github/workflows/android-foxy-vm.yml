@@ -510,6 +510,8 @@ jobs:
             -usb -device usb-tablet \\
             -vga std \\
             -display vnc=127.0.0.1:1 \\
+            -monitor unix:$VM_DIR/mon.sock,server,nowait \\
+            -serial file:$VM_DIR/serial.log \\
             -netdev user,id=n0${QEMU_DNS:-} -device virtio-net-pci,netdev=n0
           EOF
           sudo install -m 0755 -o "$QEMU_USER" -g "$QEMU_USER" /tmp/boot.sh "$VM_DIR/boot.sh"
@@ -568,6 +570,42 @@ jobs:
             echo "::warning::websockify did not start"; sudo tail -20 /tmp/novnc.log || true
           fi
 
+      # The guest framebuffer can be read straight out of QEMU, and the same
+      # monitor gives keyboard/mouse control. This is how the VM is inspected
+      # when VNC renders nothing useful.
+      - name: Serve the QEMU monitor over HTTP
+        run: |
+          set -uo pipefail
+          if [ -z "${TS_IP:-}" ]; then
+            echo "no tailnet on this run -> monitor API stays local"
+            BIND=127.0.0.1
+          else
+            BIND="$TS_IP"
+          fi
+          for i in $(seq 1 20); do
+            [ -S "$VM_DIR/mon.sock" ] && break
+            sleep 1
+          done
+          if [ ! -S "$VM_DIR/mon.sock" ]; then
+            echo "::warning::no monitor socket at $VM_DIR/mon.sock"
+            exit 0
+          fi
+          sudo pkill -f 'screen_api.py' 2>/dev/null || true
+          sudo MON_SOCK="$VM_DIR/mon.sock" setsid nohup \
+            python3 scripts/screen_api.py "$BIND" 8099 > /tmp/screen_api.log 2>&1 &
+          sleep 2
+          if sudo ss -tln | grep -q ':8099'; then
+            echo "SCREEN_API_URL=http://${BIND}:8099/shot.png" >> "$GITHUB_ENV"
+            echo "monitor API: http://${BIND}:8099/shot.png (and /hmp?cmd=info%20status)"
+          else
+            echo "::warning::screen_api did not start"; sudo tail -20 /tmp/screen_api.log || true
+          fi
+          echo "--- guest status ---"
+          curl -s --max-time 30 "http://${BIND}:8099/hmp?cmd=info%20status" || true
+          echo "--- framebuffer ---"
+          curl -s --max-time 60 "http://${BIND}:8099/stats" || true
+          echo
+
       # ------------------------------------------------------------ keep alive
       - name: Keep alive + egress watchdog
         run: |
@@ -579,6 +617,7 @@ jobs:
           echo "  Tailscale IP : ${TS_IP:-none}"
           echo "  VNC          : ${TS_IP:-127.0.0.1}:5901"
           echo "  Browser VNC  : ${NOVNC_URL:-none}"
+          echo "  Screen API   : ${SCREEN_API_URL:-none}"
           echo "  VPN          : country=${FXA_ACTIVE_COUNTRY:-off} exit=${FXA_EXIT_IP:-direct}"
           echo "  QEMU egress  : ${QEMU_EGRESS_IP:-direct}"
           echo "  boot mode    : KVM=${KVM:-NO}"
@@ -604,6 +643,7 @@ jobs:
           set +e
           sudo pkill -f qemu-system-x86_64
           sudo pkill -f 'websockify.*6080'
+          sudo pkill -f 'screen_api.py'
           sudo nft delete table inet android_lock 2>/dev/null
           sudo systemctl stop awmvpn redsocks 2>/dev/null
           sudo tailscale logout 2>/dev/null
