@@ -489,6 +489,10 @@ jobs:
           sudo install -d -m 0755 -o "$QEMU_USER" -g "$QEMU_USER" "$VM_DIR"
           sudo -u "$QEMU_USER" -H qemu-img create -f qcow2 "$VM_DIR/android-disk.qcow2" 16G
 
+          # The runner's workspace is not traversable by qemuuser, so the ISO is
+          # copied into the VM's own directory.
+          sudo install -m 0644 -o "$QEMU_USER" -g "$QEMU_USER" android.iso "$VM_DIR/android.iso"
+
           if [ "${KVM:-NO}" = "YES" ]; then
             ACCEL="-enable-kvm -cpu host -smp 4"
           else
@@ -500,7 +504,7 @@ jobs:
           exec qemu-system-x86_64 \\
             -name android-x86 \\
             -m 4096 $ACCEL \\
-            -cdrom "$PWD/android.iso" \\
+            -cdrom $VM_DIR/android.iso \\
             -drive file=$VM_DIR/android-disk.qcow2,format=qcow2,if=ide \\
             -boot d -no-reboot \\
             -usb -device usb-tablet \\
@@ -513,12 +517,23 @@ jobs:
 
           sudo -u "$QEMU_USER" -H bash -c \
             "setsid nohup '$VM_DIR/boot.sh' > '$VM_DIR/qemu.log' 2>&1 &"
-          sleep 25
-          echo "--- qemu.log ---"
-          sudo tail -30 "$VM_DIR/qemu.log" || true
-          sudo ss -tlnp 2>/dev/null | grep -q ':5901' \
-            && echo "VNC listening on 127.0.0.1:5901" \
-            || echo "VNC not listening yet (still booting)"
+
+          for i in $(seq 1 30); do
+            sleep 3
+            if sudo ss -tln 2>/dev/null | grep -q ':5901'; then
+              echo "VNC is listening on 127.0.0.1:5901 after $((i*3))s"
+              sudo pgrep -a qemu-system | head -2
+              exit 0
+            fi
+            if ! sudo pgrep -f qemu-system >/dev/null; then
+              echo "::error::QEMU exited before VNC came up"
+              sudo tail -40 "$VM_DIR/qemu.log" || true
+              exit 1
+            fi
+          done
+          echo "::error::VNC did not listen within 90s"
+          sudo tail -40 "$VM_DIR/qemu.log" || true
+          exit 1
 
       - name: Expose VNC over Tailscale
         run: |
