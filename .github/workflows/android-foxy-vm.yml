@@ -1,0 +1,563 @@
+name: Android VM (FoxyVPN)
+
+# A SEPARATE workflow: android-v2.yml is left exactly as it is.
+#
+# Android-x86 in QEMU where every packet the VM sends leaves through FoxyVPN
+# (the awmvpn-core client that scripts/runner-router/router.mjs also uses).
+#
+# Order is the whole point — nothing below can start the VM before the tunnel
+# is proven:
+#
+#   1. scripts/runner-router-foxy/login.mjs refreshes the Firefox login with the
+#      exact flow FoxyVPN v2.0.2 uses and exports a ready accounts archive.
+#   2. awmvpn-core is installed on the runner as the unprivileged user "awmvpn"
+#      and listens as an authenticated SOCKS5 on 127.0.0.1:10810.
+#   3. redsocks on 127.0.0.1:12345 forwards into that SOCKS5.
+#   4. An nftables table (inet android_lock) redirects every TCP connection of
+#      ONE uid — the dedicated "qemuuser" — into redsocks, and drops the rest of
+#      its UDP and IPv6 so nothing can slip out sideways. Every rule is scoped
+#      with `meta skuid`, so root, the GitHub agent, tailscaled, the VPN and
+#      redsocks are untouched: the tunnel cannot recurse into itself and the
+#      runner's own network never depends on the VPN being healthy.
+#   5. Only when a socket owned by qemuuser answers with the VPN's exit IP does
+#      QEMU start, unprivileged, so slirp's outbound sockets carry that uid.
+#
+# DNS: slirp resolves names on the host over UDP, which redsocks (TCP-only)
+# cannot carry. Lookups therefore leave directly unless strict_dns=true, which
+# runs a DoH resolver as qemuuser so its TCP/443 is redirected as well.
+#
+# Secrets:
+#   FOXY_REFRESH_TOKEN     refresh token behind the FoxyVPN subscription
+#   FXA_ACCOUNTS_TGZ_B64   optional, pre-built archive; the token wins a refresh
+#   TAILSCALE_AUTH_KEY     optional, to reach the VNC port over the tailnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      vpn_enabled:
+        description: "ترافیک اندروید از FoxyVPN برود؟ (خاموش = مثل android-v2، مستقیم)"
+        type: boolean
+        default: true
+      fxa_country:
+        description: "لوکیشن FoxyVPN — random یعنی کشورهای رایگان را یکی‌یکی امتحان کن"
+        type: choice
+        default: random
+        options:
+          - random
+          - auto
+          - ar
+          - au
+          - de
+          - jp
+          - us
+          - za
+      fxa_transport:
+        description: "ترنسپورت تونل"
+        type: choice
+        default: h2
+        options:
+          - h2
+          - h3
+      strict_dns:
+        description: "DNS هم از تونل برود (DoH) — بستن DNS leak"
+        type: boolean
+        default: false
+      session_seconds:
+        description: "مدت زنده ماندن VM (ثانیه) — سقف این job ۱۷۸۸۰ است"
+        required: false
+        default: "17000"
+
+concurrency:
+  group: android-foxy-vm
+  cancel-in-progress: false
+
+jobs:
+  android-foxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 298
+    permissions:
+      contents: read
+
+    env:
+      VPN_ENABLED: ${{ inputs.vpn_enabled }}
+      STRICT_DNS: ${{ inputs.strict_dns }}
+      FXA_COUNTRY: ${{ inputs.fxa_country }}
+      FXA_TRANSPORT: ${{ inputs.fxa_transport }}
+      FXA_REPO: AiWithMase/awmvpn
+      FXA_RELEASE: latest
+      FXA_INSTALL_DIR: /opt/awmvpn
+      FXA_PROXY_PORT: "10810"
+      FXA_PROXY_USER: "router"
+      FXA_FREE_COUNTRIES: "ar au de jp us za"
+      REDSOCKS_PORT: "12345"
+      NFT_TABLE: "inet android_lock"
+      QEMU_USER: qemuuser
+      VM_DIR: /var/lib/androidvm
+      SESSION_SECONDS: ${{ inputs.session_seconds }}
+      FOXY_REFRESH_TOKEN: ${{ secrets.FOXY_REFRESH_TOKEN }}
+      FXA_ACCOUNTS_TGZ_B64: ${{ secrets.FXA_ACCOUNTS_TGZ_B64 }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/runner-router-foxy
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ---------------------------------------------------------------- host
+      - name: Show hardware
+        run: |
+          nproc
+          free -h
+          df -h /
+          lscpu | grep -iE "model name|vmx|svm" || echo "(no virt flags)"
+          echo "runner uid: $(id -u) ($(id -un))"
+
+      - name: Check /dev/kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "KVM=YES" >> "$GITHUB_ENV"
+            ls -l /dev/kvm
+          else
+            echo "KVM=NO" >> "$GITHUB_ENV"
+            echo "KVM not available -> software mode (TCG), the VM will be slow"
+          fi
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            curl jq lsb-release ca-certificates iptables nftables \
+            qemu-system-x86 qemu-utils redsocks
+
+      # ------------------------------------------------------------ tailscale
+      - name: Install and start Tailscale
+        run: |
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" \
+            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y tailscale
+          sudo systemctl enable --now tailscaled
+
+      - name: Connect to Tailscale
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
+            echo "no TAILSCALE_AUTH_KEY -> VNC stays on 127.0.0.1 only"
+            echo "TS_IP=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          sudo timeout 120 tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="gh-android-foxy-${{ github.run_id }}" \
+            --accept-routes --ephemeral \
+            || { echo "::error::tailscale up failed (bad or expired key?)"; tailscale status || true; exit 1; }
+          echo "TS_IP=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
+          tailscale status
+
+      # ---------------------------------------------------------------- login
+      # Same step 9router-runner-foxy.yml runs. It proves the account through
+      # Guardian and exports FXA_ACCOUNTS_TGZ_B64 for the steps below. Nothing
+      # secret is printed.
+      - name: Refresh the Firefox VPN login (FoxyVPN flow)
+        if: env.VPN_ENABLED == 'true'
+        run: node scripts/runner-router-foxy/login.mjs
+
+      # -------------------------------------------------------------- foxyvpn
+      - name: Install FoxyVPN core
+        if: env.VPN_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 "$FXA_INSTALL_DIR" "$FXA_INSTALL_DIR/user-data"
+          sudo useradd --system --no-create-home \
+            --home-dir "$FXA_INSTALL_DIR" --shell /usr/sbin/nologin awmvpn 2>/dev/null || true
+
+          ASSET="awmvpn-core-linux-amd64.tar.gz"
+          if [ "$FXA_RELEASE" = latest ]; then
+            URL="https://github.com/$FXA_REPO/releases/latest/download/$ASSET"
+          else
+            URL="https://github.com/$FXA_REPO/releases/download/$FXA_RELEASE/$ASSET"
+          fi
+          echo "core: $URL"
+          curl -fL --retry 4 --retry-delay 3 --max-time 300 -o /tmp/awmvpn-core.tar.gz "$URL"
+          sudo tar xzf /tmp/awmvpn-core.tar.gz -C "$FXA_INSTALL_DIR" --strip-components=1
+          sudo chmod 0755 "$FXA_INSTALL_DIR/awmvpn-core"
+          rm -f /tmp/awmvpn-core.tar.gz
+          sudo "$FXA_INSTALL_DIR/awmvpn-core" -version || true
+          echo "vpn uid: $(id -u awmvpn)"
+
+      - name: Restore the FoxyVPN account
+        if: env.VPN_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          B64="$(printf '%s' "${FXA_ACCOUNTS_TGZ_B64:-}" | tr -d '[:space:]')"
+          if [ -z "$B64" ]; then
+            echo "::error::no accounts archive: set FOXY_REFRESH_TOKEN (or FXA_ACCOUNTS_TGZ_B64)"
+            exit 1
+          fi
+          printf '%s' "$B64" | base64 -d > /tmp/fxa-accounts.tar.gz
+          test "$(stat -c%s /tmp/fxa-accounts.tar.gz)" -gt 100 \
+            || { echo "::error::the archive does not decode to a tar.gz"; exit 1; }
+          sudo tar xzf /tmp/fxa-accounts.tar.gz -C "$FXA_INSTALL_DIR/user-data"
+          rm -f /tmp/fxa-accounts.tar.gz
+          sudo test -f "$FXA_INSTALL_DIR/user-data/accounts/secret.key" \
+            || { echo "::error::the archive has no accounts/secret.key"; exit 1; }
+          sudo chown -R awmvpn:awmvpn "$FXA_INSTALL_DIR/user-data"
+          sudo chmod 600 "$FXA_INSTALL_DIR/user-data/accounts/secret.key"
+          echo "accounts restored"
+
+      - name: Start FoxyVPN and prove the tunnel
+        if: env.VPN_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          PASS="$(openssl rand -hex 16)"
+          printf '%s' "$PASS" | sudo install -m 600 -o root -g root /dev/stdin "$FXA_INSTALL_DIR/proxy.pass"
+
+          write_config() {
+            sudo tee "$FXA_INSTALL_DIR/user-data/config.json" >/dev/null <<EOF
+          {
+            "version": 2,
+            "proxy": {
+              "listen": "127.0.0.1:${FXA_PROXY_PORT}",
+              "username": "${FXA_PROXY_USER}",
+              "password": "${PASS}",
+              "country": "$1",
+              "transport": "${FXA_TRANSPORT}",
+              "upstream_connections": 4,
+              "max_connections": 256,
+              "idle_sleep": "0s"
+            },
+            "dashboard": { "enabled": false },
+            "routing": { "enabled": false, "region": "" }
+          }
+          EOF
+            sudo chown awmvpn:awmvpn "$FXA_INSTALL_DIR/user-data/config.json"
+            sudo chmod 600 "$FXA_INSTALL_DIR/user-data/config.json"
+          }
+
+          sudo tee /etc/systemd/system/awmvpn.service >/dev/null <<'EOF'
+          [Unit]
+          Description=AWMVPN core (FoxyVPN client)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=awmvpn
+          Group=awmvpn
+          ExecStart=/opt/awmvpn/awmvpn-core -data-dir /opt/awmvpn/user-data -plain
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable awmvpn >/dev/null 2>&1 || true
+
+          probe() {
+            curl -s --max-time 20 --socks5-hostname "127.0.0.1:${FXA_PROXY_PORT}" \
+              --proxy-user "${FXA_PROXY_USER}:${PASS}" https://api.ipify.org || true
+          }
+
+          case "${FXA_COUNTRY:-random}" in
+            ""|random) CANDIDATES="$FXA_FREE_COUNTRIES" ;;
+            *)         CANDIDATES="$FXA_COUNTRY" ;;
+          esac
+
+          echo "runner egress: $(curl -s --max-time 15 https://api.ipify.org || echo -)"
+          for C in $CANDIDATES; do
+            echo "--- trying country: $C"
+            write_config "$C"
+            sudo systemctl restart awmvpn
+            sleep 4
+            for i in $(seq 1 10); do
+              IP="$(probe)"
+              if [[ "$IP" =~ ^[0-9a-fA-F:.]{3,45}$ ]]; then
+                echo "tunnel up: country=$C exit=$IP (probe $i)"
+                {
+                  echo "FXA_EXIT_IP=$IP"
+                  echo "FXA_ACTIVE_COUNTRY=$C"
+                } >> "$GITHUB_ENV"
+                exit 0
+              fi
+              sleep 6
+            done
+            echo "country $C failed"
+            sudo journalctl -u awmvpn -n 15 --no-pager || true
+          done
+
+          echo "::error::FoxyVPN never answered through its SOCKS5 — refusing to boot a direct-egress VM"
+          exit 1
+
+      # ------------------------------------------------------ kernel egress lock
+      # Every rule carries `meta skuid "$UID_TARGET"`, so only the VM's uid is
+      # affected. The VPN's uid and redsocks' uid are exempt, otherwise the
+      # tunnel would be fed into itself.
+      - name: Lock the VM's uid to the tunnel (redsocks + nftables)
+        if: env.VPN_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home --home-dir "$VM_DIR" --shell /bin/bash "$QEMU_USER" 2>/dev/null || true
+          UID_TARGET="$(id -u "$QEMU_USER")"
+          RUNNER_IP="$(curl -s --max-time 15 https://api.ipify.org || echo -)"
+          echo "qemu uid: $UID_TARGET"
+          if [ "${KVM:-NO}" = "YES" ]; then
+            sudo usermod -aG kvm "$QEMU_USER"
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+          fi
+
+          PASS="$(sudo cat "$FXA_INSTALL_DIR/proxy.pass")"
+          sudo tee /etc/redsocks.conf >/dev/null <<EOF
+          base {
+            log_debug = off;
+            log_info = on;
+            daemon = on;
+            redirector = iptables;
+          }
+          redsocks {
+            local_ip = 127.0.0.1;
+            local_port = ${REDSOCKS_PORT};
+            ip = 127.0.0.1;
+            port = ${FXA_PROXY_PORT};
+            type = socks5;
+            login = "${FXA_PROXY_USER}";
+            password = "${PASS}";
+          }
+          EOF
+          sudo chown root:redsocks /etc/redsocks.conf
+          sudo chmod 0640 /etc/redsocks.conf
+          sudo systemctl unmask redsocks >/dev/null 2>&1 || true
+          sudo systemctl restart redsocks
+          sleep 2
+          sudo systemctl is-active redsocks
+
+          cat > /tmp/egress-lock.sh <<LOCK
+          set -e
+          UID_TARGET=$UID_TARGET
+          RUNNER_IP="$RUNNER_IP"
+          VPN_IP="${FXA_EXIT_IP:-}"
+          REDSOCKS_PORT=${REDSOCKS_PORT}
+          TABLE="${NFT_TABLE}"
+          fail() { echo "FAILED at \$1"; nft delete table \$TABLE 2>/dev/null || true; exit 1; }
+
+          nft delete table \$TABLE 2>/dev/null || true
+          nft add table \$TABLE || fail table
+          nft add chain \$TABLE nat_out '{ type nat hook output priority -100; policy accept; }' || fail nat-chain
+          nft add chain \$TABLE guard '{ type filter hook output priority 0; policy accept; }' || fail filter-chain
+
+          for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+            nft add rule \$TABLE nat_out meta skuid "\$UID_TARGET" ip daddr "\$net" return || fail "exempt-\$net"
+          done
+          nft add rule \$TABLE nat_out meta skuid "\$UID_TARGET" ip6 daddr ::1 return || fail exempt-v6-loopback
+
+          REDSOCKS_UID=\$(id -u redsocks 2>/dev/null || echo -1)
+          VPN_UID=\$(id -u awmvpn 2>/dev/null || echo -1)
+          [ "\$REDSOCKS_UID" != "-1" ] && [ "\$REDSOCKS_UID" != "\$UID_TARGET" ] \
+            && { nft add rule \$TABLE nat_out meta skuid "\$REDSOCKS_UID" return || fail exempt-redsocks; }
+          [ "\$VPN_UID" != "-1" ] && [ "\$VPN_UID" != "\$UID_TARGET" ] \
+            && { nft add rule \$TABLE nat_out meta skuid "\$VPN_UID" return || fail exempt-vpn; }
+
+          nft add rule \$TABLE nat_out meta skuid "\$UID_TARGET" meta nfproto ipv4 meta l4proto tcp redirect to :\$REDSOCKS_PORT || fail redirect
+
+          nft add rule \$TABLE guard meta skuid "\$UID_TARGET" ip6 daddr ::1 accept || fail guard-v6-loopback
+          nft add rule \$TABLE guard meta skuid "\$UID_TARGET" meta nfproto ipv6 drop || fail guard-v6
+          nft add rule \$TABLE guard meta skuid "\$UID_TARGET" meta l4proto udp udp dport 53 accept || fail guard-dns
+          nft add rule \$TABLE guard meta skuid "\$UID_TARGET" meta l4proto udp drop || fail guard-udp
+
+          echo "rules: \$(nft list table \$TABLE | wc -l) lines"
+
+          IP=""
+          for attempt in 1 2 3; do
+            OUT=\$(sudo -u "#\$UID_TARGET" -- curl -s --max-time 30 https://1.1.1.1/cdn-cgi/trace 2>/dev/null || true)
+            IP=\$(printf '%s\n' "\$OUT" | sed -n 's/^ip=//p' | head -n1)
+            if [ -z "\$IP" ]; then
+              OUT=\$(sudo -u "#\$UID_TARGET" -- curl -s --max-time 30 https://api.ipify.org 2>/dev/null || true)
+              IP=\$(printf '%s' "\$OUT" | tr -d '[:space:]')
+              case "\$IP" in *[!0-9a-fA-F.:]*) IP="" ;; esac
+            fi
+            echo "probe \$attempt: uid=\$UID_TARGET egress=\${IP:-none} vpn=\${VPN_IP:-?}"
+            [ -n "\$IP" ] && break
+            sleep 5
+          done
+          if [ -z "\$IP" ]; then
+            echo "RESULT=failed no-egress"; nft delete table \$TABLE 2>/dev/null || true; exit 1
+          fi
+          if [ -n "\$RUNNER_IP" ] && [ "\$IP" = "\$RUNNER_IP" ]; then
+            echo "RESULT=failed still-runner-ip"; nft delete table \$TABLE 2>/dev/null || true; exit 1
+          fi
+          echo "RESULT=ok egress=\$IP"
+          LOCK
+
+          sudo bash /tmp/egress-lock.sh | tee /tmp/egress-lock.log
+          grep -q 'RESULT=ok' /tmp/egress-lock.log \
+            || { echo "::error::the egress lock could not be proven (nftables meta skuid/redirect unsupported?)"; exit 1; }
+          rm -f /tmp/egress-lock.sh
+          echo "QEMU_EGRESS_IP=$(sed -n 's/^RESULT=ok egress=//p' /tmp/egress-lock.log | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Optional DNS-over-HTTPS so lookups also leave through the VPN
+        if: env.VPN_ENABLED == 'true' && env.STRICT_DNS == 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --max-time 180 -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          rm -f /tmp/cloudflared
+          # Port 53 needs a capability; the process must be qemuuser so its
+          # TCP/443 is caught by the redirect above.
+          sudo setcap cap_net_bind_service=+ep /usr/local/bin/cloudflared
+          sudo -u "$QEMU_USER" -H setsid nohup /usr/local/bin/cloudflared proxy-dns \
+            --address 127.0.0.1 --port 53 --upstream https://1.1.1.1/dns-query \
+            > "$VM_DIR/cloudflared.log" 2>&1 &
+          sleep 5
+          if sudo ss -lunp | grep -q '127.0.0.1:53'; then
+            echo "DoH resolver is listening"
+            echo "QEMU_DNS=,dns=127.0.0.1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::the DoH resolver did not start; keeping the host resolver"
+          fi
+
+      # ------------------------------------------------------------------ iso
+      - name: Resolve ISO size
+        run: |
+          set -euo pipefail
+          URL="https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
+          EXPECT=$(curl -fsSIL --max-time 40 "$URL" \
+            | awk 'BEGIN{IGNORECASE=1} /^content-length:/{v=$2} END{gsub(/\r/,"",v); print v}')
+          if ! [[ "${EXPECT:-}" =~ ^[0-9]+$ ]]; then
+            echo "no content-length from the mirror -> using the known size"
+            EXPECT=965738496
+          fi
+          echo "ISO_EXPECT=$EXPECT" >> "$GITHUB_ENV"
+          echo "expected size: $EXPECT"
+
+      - name: Cache Android ISO
+        id: cache-iso
+        uses: actions/cache@v4
+        with:
+          path: android.iso
+          key: android-x86-64-9.0-r2-v2
+
+      - name: Download Android-x86 ISO
+        if: steps.cache-iso.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL="https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
+          for i in $(seq 1 8); do
+            echo "=== download attempt $i ==="
+            if curl -fL -C - --retry 3 --retry-delay 5 --progress-bar -o android.iso "$URL"; then
+              echo "DOWNLOAD_OK attempt=$i"
+              break
+            fi
+            echo "attempt $i cut -> resuming (partial file kept)"
+            sleep 5
+          done
+
+      - name: Verify ISO
+        run: |
+          set -euo pipefail
+          test -f android.iso || { echo "::error::android.iso is missing"; exit 1; }
+          ACTUAL=$(stat -c%s android.iso)
+          echo "size=$ACTUAL expected=${ISO_EXPECT}"
+          if [ "$ACTUAL" != "${ISO_EXPECT}" ]; then
+            echo "::error::size mismatch (partial or corrupt download)"
+            exit 1
+          fi
+          file android.iso | tee /tmp/iso.magic
+          grep -qiE 'ISO 9660|CD-ROM' /tmp/iso.magic || { echo "::error::not an ISO image"; exit 1; }
+
+      # ------------------------------------------------------------------- vm
+      - name: Boot Android VM (Live mode) + VNC
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 -o "$QEMU_USER" -g "$QEMU_USER" "$VM_DIR"
+          sudo -u "$QEMU_USER" -H qemu-img create -f qcow2 "$VM_DIR/android-disk.qcow2" 16G
+
+          if [ "${KVM:-NO}" = "YES" ]; then
+            ACCEL="-enable-kvm -cpu host -smp 4"
+          else
+            ACCEL="-accel tcg,thread=multi -smp 2"
+          fi
+
+          cat > "$VM_DIR/boot.sh" <<EOF
+          #!/bin/bash
+          exec qemu-system-x86_64 \\
+            -name android-x86 \\
+            -m 4096 $ACCEL \\
+            -cdrom "$PWD/android.iso" \\
+            -drive file=$VM_DIR/android-disk.qcow2,format=qcow2,if=ide \\
+            -boot d -no-reboot \\
+            -usb -device usb-tablet \\
+            -vga std \\
+            -display vnc=127.0.0.1:1 \\
+            -netdev user,id=n0${QEMU_DNS:-} -device virtio-net-pci,netdev=n0
+          EOF
+          sudo chown "$QEMU_USER":"$QEMU_USER" "$VM_DIR/boot.sh"
+          sudo chmod 0755 "$VM_DIR/boot.sh"
+
+          sudo -u "$QEMU_USER" -H setsid nohup "$VM_DIR/boot.sh" \
+            > "$VM_DIR/qemu.log" 2>&1 &
+          sleep 25
+          echo "--- qemu.log ---"
+          sudo tail -30 "$VM_DIR/qemu.log" || true
+          sudo ss -tlnp 2>/dev/null | grep -q ':5901' \
+            && echo "VNC listening on 127.0.0.1:5901" \
+            || echo "VNC not listening yet (still booting)"
+
+      - name: Expose VNC over Tailscale
+        run: |
+          if [ -z "${TS_IP:-}" ]; then
+            echo "no tailnet on this run -> VNC is not reachable from outside"
+            exit 0
+          fi
+          sudo tailscale serve --bg --tcp=5901 tcp://127.0.0.1:5901 \
+            || sudo tailscale serve --bg tcp:5901 tcp://127.0.0.1:5901 \
+            || echo "::warning::tailscale serve failed; VNC is still on 127.0.0.1:5901"
+          sudo tailscale serve status || true
+
+      # ------------------------------------------------------------ keep alive
+      - name: Keep alive + egress watchdog
+        run: |
+          set -uo pipefail
+          START=$(date +%s)
+          DEADLINE=$(( START + SESSION_SECONDS - 300 ))
+          echo "======================================================"
+          echo "  ANDROID VM READY"
+          echo "  Tailscale IP : ${TS_IP:-none}"
+          echo "  VNC          : ${TS_IP:-127.0.0.1}:5901"
+          echo "  VPN          : country=${FXA_ACTIVE_COUNTRY:-off} exit=${FXA_EXIT_IP:-direct}"
+          echo "  QEMU egress  : ${QEMU_EGRESS_IP:-direct}"
+          echo "  boot mode    : KVM=${KVM:-NO}"
+          echo "======================================================"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 240
+            q=$(pgrep -c qemu-system || true)
+            egress="direct"
+            if [ "$VPN_ENABLED" = "true" ]; then
+              egress=$(sudo -u "$QEMU_USER" -H curl -s --max-time 20 https://api.ipify.org || echo "down")
+              if [ "$egress" = "down" ]; then
+                echo "[$(date -u +%H:%M:%S)] egress lost -> restarting awmvpn"
+                sudo systemctl restart awmvpn
+              fi
+            fi
+            echo "[$(date -u +%H:%M:%S)] qemu=$q egress=$egress"
+          done
+
+      # ------------------------------------------------------------- teardown
+      - name: Tear down the lock and the tunnel
+        if: always()
+        run: |
+          set +e
+          sudo pkill -f qemu-system-x86_64
+          sudo nft delete table inet android_lock 2>/dev/null
+          sudo systemctl stop awmvpn redsocks 2>/dev/null
+          sudo tailscale logout 2>/dev/null
+          echo "clean"
