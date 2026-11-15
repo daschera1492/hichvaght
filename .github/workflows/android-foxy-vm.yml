@@ -157,7 +157,7 @@ jobs:
           sudo timeout 120 tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="gh-android-foxy-${{ github.run_id }}" \
-            --accept-routes --ephemeral \
+            --accept-routes \
             || { echo "::error::tailscale up failed (bad or expired key?)"; tailscale status || true; exit 1; }
           echo "TS_IP=$(tailscale ip -4 | head -n1)" >> "$GITHUB_ENV"
           tailscale status
